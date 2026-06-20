@@ -289,6 +289,7 @@ impl AsyncSink for ColumnOrientedBlockPruneSink {
                         None,
                         compression,
                         None, // TODO(Sky): sort_min_max
+                        None, // TODO: column-oriented pruning does not load cluster stats yet.
                         Some(block_meta_index),
                         create_on,
                     );

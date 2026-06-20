@@ -30,6 +30,7 @@ use databend_common_exception::Result;
 use databend_common_expression::ColumnId;
 use databend_common_expression::Scalar;
 use databend_storages_common_pruner::BlockMetaIndex;
+use databend_storages_common_table_meta::meta::ClusterStatistics;
 use databend_storages_common_table_meta::meta::ColumnMeta;
 use databend_storages_common_table_meta::meta::ColumnStatistics;
 use databend_storages_common_table_meta::meta::Compression;
@@ -54,6 +55,8 @@ pub struct FuseBlockPartInfo {
     pub compression: Compression,
 
     pub sort_min_max: Option<(Scalar, Scalar)>,
+    #[serde(default)]
+    pub cluster_stats: Option<ClusterStatistics>,
     pub block_meta_index: Option<BlockMetaIndex>,
 }
 
@@ -94,6 +97,7 @@ impl FuseBlockPartInfo {
         spatial_stats: Option<HashMap<ColumnId, SpatialStatistics>>,
         compression: Compression,
         sort_min_max: Option<(Scalar, Scalar)>,
+        cluster_stats: Option<ClusterStatistics>,
         block_meta_index: Option<BlockMetaIndex>,
         create_on: Option<DateTime<Utc>>,
     ) -> Arc<Box<dyn PartInfo>> {
@@ -108,6 +112,7 @@ impl FuseBlockPartInfo {
             nums_rows: rows_count as usize,
             compression,
             sort_min_max,
+            cluster_stats,
             block_meta_index,
             columns_stat,
             spatial_stats,

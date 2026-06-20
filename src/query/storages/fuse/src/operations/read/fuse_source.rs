@@ -19,6 +19,7 @@ use async_channel::Receiver;
 use databend_common_catalog::plan::DataSourcePlan;
 use databend_common_catalog::plan::PartInfoPtr;
 use databend_common_catalog::plan::PartInfoType;
+use databend_common_catalog::plan::PartitionsShuffleKind;
 use databend_common_catalog::plan::StealablePartitions;
 use databend_common_catalog::plan::TopK;
 use databend_common_catalog::table_context::TableContext;
@@ -72,6 +73,14 @@ pub fn build_fuse_source_pipeline(
         max_io_requests = max_io_requests.min(16);
     }
 
+    let preserve_order = plan.parts.kind == PartitionsShuffleKind::PreserveOrder;
+    if preserve_order {
+        // Keep the original scan-stream count. Each stream reads its assigned
+        // subsequence in order; downstream PresortedMerge performs the only
+        // inter-stream merge.
+        max_io_requests = max_io_requests.min(max_threads);
+    }
+
     let waker = pipeline.get_waker();
     let batch_size = ctx.get_settings().get_storage_fetch_part_num()? as usize;
     let stream: Arc<dyn PartitionStream> = match receiver {
@@ -80,7 +89,9 @@ pub fn build_fuse_source_pipeline(
             let partitions = dispatch_partitions(ctx.clone(), plan, max_io_requests);
             let mut partitions = StealablePartitions::new(partitions, ctx.clone());
 
-            if matches!(storage_format, FuseStorageFormat::Native) && topk.is_some() {
+            if preserve_order
+                || matches!(storage_format, FuseStorageFormat::Native) && topk.is_some()
+            {
                 partitions.disable_steal();
             }
 
@@ -136,7 +147,9 @@ pub fn build_fuse_source_pipeline(
         max_io_requests
     );
 
-    pipeline.try_resize(std::cmp::min(max_threads, max_io_requests))?;
+    if !preserve_order {
+        pipeline.try_resize(std::cmp::min(max_threads, max_io_requests))?;
+    }
 
     info!(
         "[FUSE-SOURCE] Block read pipeline resized from {} to {} threads",
