@@ -625,7 +625,7 @@ impl PhysicalPlanBuilder {
             return Ok(false);
         };
 
-        let Some((fuse_table, max_overlap, max_streams_limit)) = (|| {
+        let Some((fuse_table, ordering_key_len, max_overlap, max_streams_limit)) = (|| {
             let settings = self.ctx.get_settings();
             if !settings.get_enable_cluster_key_ordered_topk().ok()? {
                 return None;
@@ -644,16 +644,20 @@ impl PhysicalPlanBuilder {
             }
 
             let cluster_keys = fuse_table.linear_cluster_keys(self.ctx.clone());
-            if !cluster_keys_cover_ordering(&cluster_keys, scan, &sort_exprs) {
-                return None;
-            }
+            let ordering_key_len =
+                cluster_keys_ordering_prefix_len(&cluster_keys, scan, &sort_exprs)?;
 
             let max_overlap = settings.get_max_cluster_key_ordered_topk_overlap().ok()?;
             let max_streams = cmp::min(
                 settings.get_max_threads().ok()? as usize,
                 settings.get_max_storage_io_requests().ok()? as usize,
             );
-            Some((fuse_table.clone(), max_overlap, max_streams))
+            Some((
+                fuse_table.clone(),
+                ordering_key_len,
+                max_overlap,
+                max_streams,
+            ))
         })() else {
             return Ok(false);
         };
@@ -679,6 +683,7 @@ impl PhysicalPlanBuilder {
         let Some(ordered_partitions) = ordered_cluster_partitions(
             &partitions,
             fuse_table.cluster_key_id(),
+            ordering_key_len,
             max_overlap,
             max_streams,
         ) else {
@@ -724,39 +729,39 @@ impl PhysicalPlanBuilder {
     }
 }
 
-fn cluster_keys_cover_ordering(
+fn cluster_keys_ordering_prefix_len(
     cluster_keys: &[RemoteExpr<String>],
     scan: &TableScan,
     sort_exprs: &[(RemoteExpr<String>, bool, bool)],
-) -> bool {
+) -> Option<usize> {
     let sort_exprs = sort_exprs
         .iter()
         .filter(|(sort_expr, _, _)| !scan_cluster_key_fixed_by_filters(sort_expr, scan))
         .collect::<Vec<_>>();
     if sort_exprs.is_empty() {
-        return false;
+        return None;
     }
 
     let mut sort_index = 0;
-    for cluster_key in cluster_keys {
+    for (cluster_key_index, cluster_key) in cluster_keys.iter().enumerate() {
         if scan_cluster_key_fixed_by_filters(cluster_key, scan) {
             continue;
         }
 
         let Some((sort_expr, asc, nulls_first)) = sort_exprs.get(sort_index) else {
-            return true;
+            return Some(cluster_key_index);
         };
         if !cluster_key_matches_order_by(cluster_key, sort_expr, *asc, *nulls_first) {
-            return false;
+            return None;
         }
 
         sort_index += 1;
         if sort_index == sort_exprs.len() {
-            return true;
+            return Some(cluster_key_index + 1);
         }
     }
 
-    false
+    None
 }
 
 async fn cluster_order_partitions(
@@ -806,6 +811,7 @@ async fn cluster_order_partitions(
 fn ordered_cluster_partitions(
     partitions: &[PartInfoPtr],
     cluster_key_id: Option<u32>,
+    ordering_key_len: usize,
     max_overlap: u64,
     max_streams_limit: usize,
 ) -> Option<Vec<PartInfoPtr>> {
@@ -815,7 +821,8 @@ fn ordered_cluster_partitions(
     let cluster_key_id = cluster_key_id?;
     if partitions.len() == 1 {
         let mut fuse_part = FuseBlockPartInfo::from_part(&partitions[0]).ok()?.clone();
-        valid_cluster_stats(&fuse_part, cluster_key_id)?;
+        let stats = valid_cluster_stats(&fuse_part, cluster_key_id)?;
+        cluster_ordering_key(stats, ordering_key_len)?;
         fuse_part.preserve_order_stream = Some(0);
         return Some(vec![Arc::new(Box::new(fuse_part) as Box<dyn PartInfo>)]);
     }
@@ -825,7 +832,8 @@ fn ordered_cluster_partitions(
         .map(|part| {
             let fuse_part = FuseBlockPartInfo::from_part(part).ok()?;
             let stats = valid_cluster_stats(fuse_part, cluster_key_id)?;
-            Some((stats.min().clone(), stats.max().clone(), part.clone()))
+            let (min, max) = cluster_ordering_key(stats, ordering_key_len)?;
+            Some((min, max, part.clone()))
         })
         .collect::<Option<Vec<_>>>()?;
 
@@ -891,6 +899,19 @@ fn valid_cluster_stats(
         .as_ref()
         .filter(|stats| stats.cluster_key_id == cluster_key_id)
         .filter(|stats| !stats.min().is_empty() && stats.min().len() == stats.max().len())
+}
+
+fn cluster_ordering_key(
+    stats: &ClusterStatistics,
+    ordering_key_len: usize,
+) -> Option<(Vec<Scalar>, Vec<Scalar>)> {
+    if ordering_key_len == 0 || stats.min().len() < ordering_key_len {
+        return None;
+    }
+    Some((
+        stats.min()[..ordering_key_len].to_vec(),
+        stats.max()[..ordering_key_len].to_vec(),
+    ))
 }
 
 fn compare_cluster_values(
@@ -1402,6 +1423,10 @@ mod tests {
     }
 
     fn part(location: &str, min: i64, max: i64) -> PartInfoPtr {
+        part_with_cluster_values(location, vec![scalar(min)], vec![scalar(max)])
+    }
+
+    fn part_with_cluster_values(location: &str, min: Vec<Scalar>, max: Vec<Scalar>) -> PartInfoPtr {
         FuseBlockPartInfo::create(
             location.to_string(),
             None,
@@ -1414,13 +1439,7 @@ mod tests {
             None,
             Compression::legacy(),
             None,
-            Some(ClusterStatistics::new(
-                7,
-                vec![scalar(min)],
-                vec![scalar(max)],
-                0,
-                None,
-            )),
+            Some(ClusterStatistics::new(7, min, max, 0, None)),
             None,
             None,
         )
@@ -1442,7 +1461,7 @@ mod tests {
     fn test_ordered_cluster_partitions_uses_single_stream_for_non_overlap() {
         let parts = vec![part("b", 10, 19), part("a", 0, 8), part("c", 21, 29)];
 
-        let ordered = ordered_cluster_partitions(&parts, Some(7), 10, 8).unwrap();
+        let ordered = ordered_cluster_partitions(&parts, Some(7), 1, 10, 8).unwrap();
 
         assert_eq!(stream_ids(&ordered), vec![0, 0, 0]);
         let locations = ordered
@@ -1461,7 +1480,7 @@ mod tests {
     fn test_ordered_cluster_partitions_uses_overlap_width_streams() {
         let parts = vec![part("a", 0, 10), part("b", 5, 15), part("c", 12, 20)];
 
-        let ordered = ordered_cluster_partitions(&parts, Some(7), 10, 8).unwrap();
+        let ordered = ordered_cluster_partitions(&parts, Some(7), 1, 10, 8).unwrap();
         let stream_ids = stream_ids(&ordered);
 
         assert_eq!(stream_ids, vec![0, 1, 0]);
@@ -1469,10 +1488,28 @@ mod tests {
     }
 
     #[test]
+    fn test_ordered_cluster_partitions_ignores_extra_filter_suffix_for_overlap() {
+        let parts = vec![
+            part_with_cluster_values("a", vec![scalar(0), scalar(100)], vec![
+                scalar(9),
+                scalar(0),
+            ]),
+            part_with_cluster_values("b", vec![scalar(10), scalar(100)], vec![
+                scalar(19),
+                scalar(0),
+            ]),
+        ];
+
+        let ordered = ordered_cluster_partitions(&parts, Some(7), 1, 0, 8).unwrap();
+
+        assert_eq!(stream_ids(&ordered), vec![0, 0]);
+    }
+
+    #[test]
     fn test_ordered_cluster_partitions_treats_touching_ranges_as_overlap() {
         let parts = vec![part("a", 0, 10), part("b", 10, 20), part("c", 21, 30)];
 
-        let ordered = ordered_cluster_partitions(&parts, Some(7), 10, 8).unwrap();
+        let ordered = ordered_cluster_partitions(&parts, Some(7), 1, 10, 8).unwrap();
         let stream_ids = stream_ids(&ordered);
 
         assert_eq!(stream_ids, vec![0, 1, 0]);
@@ -1483,7 +1520,7 @@ mod tests {
     fn test_ordered_cluster_partitions_rejects_excess_overlap() {
         let parts = vec![part("a", 0, 10), part("b", 5, 15), part("c", 7, 20)];
 
-        assert!(ordered_cluster_partitions(&parts, Some(7), 1, 8).is_none());
+        assert!(ordered_cluster_partitions(&parts, Some(7), 1, 1, 8).is_none());
     }
 
     #[test]
