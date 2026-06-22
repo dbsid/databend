@@ -114,6 +114,10 @@ impl BlockPruner {
 
                         let keep = prune_result.keep;
                         block_meta_index = prune_result.apply_to_block_meta_index(block_meta_index);
+                        let (range, page_size) =
+                            Self::page_range_and_size(block_meta.as_ref(), block_meta_index.range);
+                        block_meta_index.range = range;
+                        block_meta_index.page_size = page_size;
 
                         Ok(keep.then_some((block_meta_index, block_meta)))
                     })
@@ -278,12 +282,14 @@ impl BlockPruner {
 
                 debug_assert_eq!(prune_result.block_location, block.location.0);
 
+                let (range, page_size) =
+                    Self::page_range_and_size(block.as_ref(), prune_result.range);
                 result.push((
                     BlockMetaIndex {
                         segment_idx: segment_location.segment_idx,
                         block_idx: prune_result.block_idx,
-                        range: prune_result.range,
-                        page_size: block.page_size() as usize,
+                        range,
+                        page_size,
                         block_id: block_id_in_segment(block_num, prune_result.block_idx),
                         block_location: prune_result.block_location.clone(),
                         segment_location: segment_location.location.0.clone(),
@@ -493,12 +499,13 @@ impl BlockPruner {
 
                 let (keep, range) = page_pruner.should_keep(&block_meta.cluster_stats);
                 if keep {
+                    let (range, page_size) = Self::page_range_and_size(block_meta.as_ref(), range);
                     result.push((
                         BlockMetaIndex {
                             segment_idx: segment_location.segment_idx,
                             block_idx,
                             range,
-                            page_size: block_meta.page_size() as usize,
+                            page_size,
                             block_id: block_id_in_segment(block_num, block_idx),
                             block_location: block_meta.as_ref().location.0.clone(),
                             segment_location: segment_location.location.0.clone(),
@@ -522,6 +529,68 @@ impl BlockPruner {
         info!("[FUSE-PRUNER] sync block prune elapsed: {elapsed}");
 
         Ok(result)
+    }
+
+    fn page_range_and_size(
+        block_meta: &BlockMeta,
+        range: Option<Range<usize>>,
+    ) -> (Option<Range<usize>>, usize) {
+        let default_page_size = block_meta.page_size() as usize;
+        let Some(range) = range else {
+            return (None, default_page_size);
+        };
+
+        let Some(pages) = block_meta
+            .cluster_stats
+            .as_ref()
+            .and_then(|stats| stats.pages.as_ref())
+        else {
+            return (Some(range), default_page_size);
+        };
+
+        let Some(row_range) = Self::conservative_page_range_to_row_range(
+            range,
+            pages.len(),
+            block_meta.row_count as usize,
+        ) else {
+            return (None, default_page_size);
+        };
+
+        if row_range.start == 0 && row_range.end >= block_meta.row_count as usize {
+            (None, default_page_size)
+        } else {
+            (Some(row_range), 1)
+        }
+    }
+
+    fn conservative_page_range_to_row_range(
+        range: Range<usize>,
+        pages: usize,
+        row_count: usize,
+    ) -> Option<Range<usize>> {
+        if row_count == 0 || pages == 0 {
+            return None;
+        }
+
+        let start_page = range.start.min(pages);
+        let end_page = range.end.min(pages);
+        if start_page >= end_page {
+            return Some(0..0);
+        }
+        if pages == 1 {
+            return Some(0..row_count);
+        }
+
+        let min_page_size = ((row_count - 1) / pages) + 1;
+        let max_page_size = (row_count - 1) / (pages - 1);
+        let start = start_page.saturating_mul(min_page_size).min(row_count);
+        let end = if end_page >= pages {
+            row_count
+        } else {
+            end_page.saturating_mul(max_page_size).min(row_count)
+        };
+
+        Some(start..end.max(start))
     }
 }
 
@@ -575,5 +644,31 @@ impl BlockPruneResult {
         block_meta_index.matched_scores = self.matched_scores;
         block_meta_index.virtual_block_meta = self.virtual_block_meta;
         block_meta_index
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BlockPruner;
+
+    #[test]
+    fn test_conservative_page_range_to_row_range_exact_page_size() {
+        let range = BlockPruner::conservative_page_range_to_row_range(1..2, 4, 10).unwrap();
+
+        assert_eq!(range, 3..6);
+    }
+
+    #[test]
+    fn test_conservative_page_range_to_row_range_uses_safe_bounds() {
+        let range = BlockPruner::conservative_page_range_to_row_range(1..2, 49, 50_000).unwrap();
+
+        assert_eq!(range, 1021..2082);
+    }
+
+    #[test]
+    fn test_conservative_page_range_to_row_range_caps_last_page() {
+        let range = BlockPruner::conservative_page_range_to_row_range(48..49, 49, 50_000).unwrap();
+
+        assert_eq!(range, 49_008..50_000);
     }
 }

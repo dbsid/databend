@@ -906,11 +906,13 @@ impl FuseTable {
         let spatial_index_columns =
             Self::create_spatial_index_columns(&self.table_info.meta.indexes);
 
-        let pruner = FusePruner::create(
+        let pruner = FusePruner::create_with_pages(
             &ctx,
             dal,
             table_schema.clone(),
             &push_downs,
+            self.cluster_key_meta(),
+            self.linear_cluster_keys(ctx.clone()),
             self.bloom_index_cols(),
             ngram_args,
             spatial_index_columns,

@@ -242,7 +242,7 @@ impl FuseTable {
             self.cluster_key_id().unwrap(),
             cluster_key_index,
             extra_key_num,
-            None,
+            self.get_write_settings().data_page_rows,
             level,
             block_thresholds,
             operators,
