@@ -28,6 +28,7 @@ use databend_storages_common_pruner::BlockMetaIndex;
 use databend_storages_common_pruner::RangeIndexInput;
 use databend_storages_common_pruner::VirtualBlockMetaIndex;
 use databend_storages_common_table_meta::meta::BlockMeta;
+use databend_storages_common_table_meta::meta::ClusterStatistics;
 use futures_util::future;
 use log::info;
 use tokio::sync::OwnedSemaphorePermit;
@@ -535,28 +536,37 @@ impl BlockPruner {
         block_meta: &BlockMeta,
         range: Option<Range<usize>>,
     ) -> (Option<Range<usize>>, usize) {
-        let default_page_size = block_meta.page_size() as usize;
+        Self::page_range_and_size_for_stats(
+            block_meta.row_count as usize,
+            &block_meta.cluster_stats,
+            range,
+        )
+    }
+
+    pub(crate) fn page_range_and_size_for_stats(
+        row_count: usize,
+        cluster_stats: &Option<ClusterStatistics>,
+        range: Option<Range<usize>>,
+    ) -> (Option<Range<usize>>, usize) {
+        let default_page_size = row_count;
         let Some(range) = range else {
             return (None, default_page_size);
         };
 
-        let Some(pages) = block_meta
-            .cluster_stats
+        let Some(pages) = cluster_stats
             .as_ref()
             .and_then(|stats| stats.pages.as_ref())
         else {
             return (Some(range), default_page_size);
         };
 
-        let Some(row_range) = Self::conservative_page_range_to_row_range(
-            range,
-            pages.len(),
-            block_meta.row_count as usize,
-        ) else {
+        let Some(row_range) =
+            Self::conservative_page_range_to_row_range(range, pages.len(), row_count)
+        else {
             return (None, default_page_size);
         };
 
-        if row_range.start == 0 && row_range.end >= block_meta.row_count as usize {
+        if row_range.start == 0 && row_range.end >= row_count {
             (None, default_page_size)
         } else {
             (Some(row_range), 1)
@@ -649,6 +659,9 @@ impl BlockPruneResult {
 
 #[cfg(test)]
 mod tests {
+    use databend_common_expression::Scalar;
+    use databend_storages_common_table_meta::meta::ClusterStatistics;
+
     use super::BlockPruner;
 
     #[test]
@@ -670,5 +683,27 @@ mod tests {
         let range = BlockPruner::conservative_page_range_to_row_range(48..49, 49, 50_000).unwrap();
 
         assert_eq!(range, 49_008..50_000);
+    }
+
+    #[test]
+    fn test_page_range_and_size_for_stats_converts_page_range_to_row_range() {
+        let cluster_stats = Some(ClusterStatistics::new(
+            0,
+            vec![Scalar::Number(0u8.into())],
+            vec![Scalar::Number(9u8.into())],
+            0,
+            Some(vec![
+                Scalar::Tuple(vec![Scalar::Number(0u8.into())]),
+                Scalar::Tuple(vec![Scalar::Number(3u8.into())]),
+                Scalar::Tuple(vec![Scalar::Number(6u8.into())]),
+                Scalar::Tuple(vec![Scalar::Number(9u8.into())]),
+            ]),
+        ));
+
+        let (range, page_size) =
+            BlockPruner::page_range_and_size_for_stats(10, &cluster_stats, Some(1..2));
+
+        assert_eq!(range, Some(3..6));
+        assert_eq!(page_size, 1);
     }
 }

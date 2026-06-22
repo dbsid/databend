@@ -96,6 +96,7 @@ impl AsyncSink for ColumnOrientedBlockPruneSink {
 
         let range_pruner = &self.block_pruner.pruning_ctx.range_pruner;
         let bloom_pruner = &self.block_pruner.pruning_ctx.bloom_pruner;
+        let page_pruner = &self.block_pruner.pruning_ctx.page_pruner;
         let runtime_stats_pruner = match self.runtime_filter_prune_context.as_ref() {
             Some(context) => context.runtime_stats_pruner().await?,
             None => None,
@@ -136,6 +137,7 @@ impl AsyncSink for ColumnOrientedBlockPruneSink {
             let segment_location = segment_location.clone();
             let range_pruner = range_pruner.clone();
             let bloom_pruner = bloom_pruner.clone();
+            let page_pruner = page_pruner.clone();
             let sender = self.sender.as_ref().unwrap().clone();
             let location_path = location_path.clone();
             let compression_col = compression_col.clone();
@@ -194,6 +196,27 @@ impl AsyncSink for ColumnOrientedBlockPruneSink {
                         return Ok(());
                     }
 
+                    let cluster_stats = match cluster_stats_col
+                        .as_ref()
+                        .and_then(|col| col.index(block_idx))
+                    {
+                        Some(ScalarRef::Binary(bytes)) => Some(decode::<ClusterStatistics>(
+                            &MetaEncoding::MessagePack,
+                            bytes,
+                        )?),
+                        Some(ScalarRef::Null) | None => None,
+                        _ => unreachable!(),
+                    };
+                    let (keep, page_range) = page_pruner.should_keep(&cluster_stats);
+                    if !keep {
+                        return Ok(());
+                    }
+                    let (range, page_size) = BlockPruner::page_range_and_size_for_stats(
+                        row_count as usize,
+                        &cluster_stats,
+                        page_range,
+                    );
+
                     let compression = Compression::from_u8(compression_col[block_idx]);
                     let block_size = block_size_col[block_idx];
                     let location_scalar = bloom_index_location_col.index(block_idx).unwrap();
@@ -211,17 +234,6 @@ impl AsyncSink for ColumnOrientedBlockPruneSink {
                         _ => unreachable!(),
                     };
                     let bloom_filter_index_size = bloom_index_size_col[block_idx];
-                    let cluster_stats = match cluster_stats_col
-                        .as_ref()
-                        .and_then(|col| col.index(block_idx))
-                    {
-                        Some(ScalarRef::Binary(bytes)) => Some(decode::<ClusterStatistics>(
-                            &MetaEncoding::MessagePack,
-                            bytes,
-                        )?),
-                        Some(ScalarRef::Null) | None => None,
-                        _ => unreachable!(),
-                    };
 
                     // Bloom filter pruning
                     if let Some(bloom_pruner) = bloom_pruner {
@@ -262,8 +274,8 @@ impl AsyncSink for ColumnOrientedBlockPruneSink {
                     let block_meta_index = BlockMetaIndex {
                         segment_idx: segment_location.segment_idx,
                         block_idx,
-                        range: None,
-                        page_size: row_count as usize,
+                        range,
+                        page_size,
                         block_id: block_id_in_segment(block_num, block_idx),
                         block_location: location_path.clone(),
                         segment_location: segment_location.location.0.clone(),
