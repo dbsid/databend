@@ -25,6 +25,7 @@ use databend_common_expression::BLOCK_NAME_COL_NAME;
 use databend_common_expression::types::F32;
 use databend_common_metrics::storage::*;
 use databend_storages_common_pruner::BlockMetaIndex;
+use databend_storages_common_pruner::PagePruner;
 use databend_storages_common_pruner::RangeIndexInput;
 use databend_storages_common_pruner::VirtualBlockMetaIndex;
 use databend_storages_common_table_meta::meta::BlockMeta;
@@ -103,6 +104,11 @@ impl BlockPruner {
                         let _permit = permit;
                         let prune_result =
                             BlockPruneResult::from_block_meta_index(&block_meta_index);
+                        let prune_result = Self::prune_by_page(
+                            pruning_ctx.page_pruner.clone(),
+                            prune_result,
+                            &block_meta,
+                        );
                         let prune_result = Self::prune_after_range(
                             pruning_ctx,
                             prune_result,
@@ -185,6 +191,7 @@ impl BlockPruner {
         let pruning_semaphore = &self.pruning_ctx.pruning_semaphore;
         let limit_pruner = self.pruning_ctx.limit_pruner.clone();
         let range_pruner = self.pruning_ctx.range_pruner.clone();
+        let page_pruner = self.pruning_ctx.page_pruner.clone();
         let pruning_ctx = self.pruning_ctx.clone();
 
         let mut block_meta_indexes = block_meta_indexes.into_iter();
@@ -202,6 +209,20 @@ impl BlockPruner {
             let pruning_stats = pruning_stats.clone();
             let runtime_stats_pruner = runtime_stats_pruner.clone();
             block_meta_indexes.next().map(|(block_idx, block_meta)| {
+                let mut prune_result =
+                    BlockPruneResult::new(block_idx, block_meta.location.0.clone());
+                prune_result.keep = true;
+                prune_result = Self::prune_by_page(page_pruner.clone(), prune_result, &block_meta);
+                if !prune_result.keep {
+                    let v: BlockPruningFuture = Box::new(move |permit: OwnedSemaphorePermit| {
+                        Box::pin(async move {
+                            let _permit = permit;
+                            Ok(prune_result)
+                        })
+                    });
+                    return v;
+                }
+
                 // Perf.
                 {
                     metrics_inc_blocks_range_pruning_before(1);
@@ -210,8 +231,6 @@ impl BlockPruner {
                     pruning_stats.set_blocks_range_pruning_before(1);
                 }
 
-                let mut prune_result =
-                    BlockPruneResult::new(block_idx, block_meta.location.0.clone());
                 let block_meta = block_meta.clone();
                 let row_count = block_meta.row_count;
                 let range_input = RangeIndexInput::from_block_meta(block_meta.as_ref());
@@ -245,7 +264,7 @@ impl BlockPruner {
                                 prune_result,
                                 block_meta,
                                 row_count,
-                                true,
+                                false,
                                 false,
                             )
                             .await
@@ -466,6 +485,22 @@ impl BlockPruner {
         let mut result = Vec::with_capacity(block_meta_indexes.len());
         let block_num = block_metas.len();
         for (block_idx, block_meta) in block_meta_indexes {
+            // check limit speculatively
+            if limit_pruner.exceeded() {
+                break;
+            }
+            let page_prune_result = Self::prune_by_page(
+                page_pruner.clone(),
+                BlockPruneResult {
+                    keep: true,
+                    ..BlockPruneResult::new(block_idx, block_meta.location.0.clone())
+                },
+                &block_meta,
+            );
+            if !page_prune_result.keep {
+                continue;
+            }
+
             // Perf.
             {
                 metrics_inc_blocks_range_pruning_before(1);
@@ -474,10 +509,6 @@ impl BlockPruner {
                 pruning_stats.set_blocks_range_pruning_before(1);
             }
 
-            // check limit speculatively
-            if limit_pruner.exceeded() {
-                break;
-            }
             let row_count = block_meta.row_count;
             let range_input = RangeIndexInput::from_block_meta(block_meta.as_ref());
             let keep_by_range = pruning_cost.measure(PruningCostKind::BlocksRange, || {
@@ -498,9 +529,9 @@ impl BlockPruner {
                     continue;
                 }
 
-                let (keep, range) = page_pruner.should_keep(&block_meta.cluster_stats);
-                if keep {
-                    let (range, page_size) = Self::page_range_and_size(block_meta.as_ref(), range);
+                if page_prune_result.keep {
+                    let (range, page_size) =
+                        Self::page_range_and_size(block_meta.as_ref(), page_prune_result.range);
                     result.push((
                         BlockMetaIndex {
                             segment_idx: segment_location.segment_idx,
@@ -530,6 +561,19 @@ impl BlockPruner {
         info!("[FUSE-PRUNER] sync block prune elapsed: {elapsed}");
 
         Ok(result)
+    }
+
+    fn prune_by_page(
+        page_pruner: Arc<dyn PagePruner + Send + Sync>,
+        mut prune_result: BlockPruneResult,
+        block_meta: &BlockMeta,
+    ) -> BlockPruneResult {
+        if prune_result.keep {
+            let (keep, range) = page_pruner.should_keep(&block_meta.cluster_stats);
+            prune_result.keep = keep;
+            prune_result.range = range;
+        }
+        prune_result
     }
 
     fn page_range_and_size(

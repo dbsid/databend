@@ -167,7 +167,7 @@ impl PageIndex {
         };
         let min_values: Vec<Scalar> = match stats.pages {
             Some(ref pages) => pages.clone(),
-            None => return Ok((true, None)),
+            None => vec![Scalar::Tuple(stats.min().clone())],
         };
 
         let max_value = Scalar::Tuple(stats.max().clone());

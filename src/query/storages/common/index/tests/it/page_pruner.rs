@@ -68,6 +68,8 @@ fn test_page_index() -> anyhow::Result<()> {
     run_text(file, "to_uint8(a) = 2::int64", stats);
     run_text(file, "to_int16(a::int8) = 1+2", stats);
     run_empty_pages_text(file, "a = 2");
+    run_no_pages_text(file, "a = 4");
+    run_no_pages_text(file, "a = 11");
     run_expr_text(file, "a = 2", stats);
     run_expr_text(file, "a = 2 and b = -40", stats);
     run_negated_expr_text(file, "a = 2 and b > 55");
@@ -126,6 +128,35 @@ fn run_empty_pages_text(file: &mut impl Write, text: &str) {
 
     writeln!(file, "text      : {text}").unwrap();
     writeln!(file, "pages     : []").unwrap();
+
+    match create_column_page_index(text).apply(&stats) {
+        Err(err) => {
+            writeln!(file, "err       : {err}").unwrap();
+        }
+
+        Ok((keep, range)) => {
+            writeln!(file, "keep      : {keep}").unwrap();
+            writeln!(file, "range     : {range:?}").unwrap();
+        }
+    };
+    writeln!(file).unwrap();
+}
+
+fn run_no_pages_text(file: &mut impl Write, text: &str) {
+    fn n(n: i32) -> Scalar {
+        Scalar::Number(n.into())
+    }
+
+    let stats = Some(ClusterStatistics {
+        cluster_key_id: 0,
+        min: vec![n(1), n(10)],
+        max: vec![n(5), n(50)],
+        level: 0,
+        pages: None,
+    });
+
+    writeln!(file, "text      : {text}").unwrap();
+    writeln!(file, "pages     : None").unwrap();
 
     match create_column_page_index(text).apply(&stats) {
         Err(err) => {

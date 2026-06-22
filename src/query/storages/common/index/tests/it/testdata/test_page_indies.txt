@@ -43,6 +43,16 @@ pages     : []
 keep      : true
 range     : None
 
+text      : a = 4
+pages     : None
+keep      : true
+range     : None
+
+text      : a = 11
+pages     : None
+keep      : false
+range     : None
+
 text      : a = 2
 expr      : eq<Int32, Int32>(a, 2_i32)
 cluster   : ["a", "- b"]
