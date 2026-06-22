@@ -224,12 +224,16 @@ where A: SortAlgorithm
             .num_rows()
             .min(start + max_rows - self.buffers.output_len());
 
-        if self.row_by_row {
-            return 1;
-        }
-
         if self.sorted_cursors.len() == 1 || cursor.current() == cursor.last() {
             return row_index_limit - start;
+        }
+
+        if self.row_by_row {
+            let next_cursor = &self.sorted_cursors.peek_top2().0;
+            if cursor.last() <= next_cursor.current() {
+                return row_index_limit - start;
+            }
+            return 1;
         }
 
         if !A::SHOULD_PEEK_TOP2 {
@@ -266,6 +270,14 @@ where A: SortAlgorithm
         let block = self.buffers.build_output();
         debug_assert!(block.num_rows() <= self.batch_rows);
         Ok(block)
+    }
+
+    fn build_output_if_ready(&mut self) -> Result<Option<DataBlock>> {
+        if self.buffers.has_output() {
+            Ok(Some(self.build_output()?))
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn streams(self) -> Vec<S> {
@@ -311,7 +323,7 @@ where
         if self.has_pending_stream() {
             self.poll_pending_stream()?;
             if self.has_pending_stream() {
-                return Ok(None);
+                return self.build_output_if_ready();
             }
         }
 
@@ -328,7 +340,7 @@ where
             if self.has_pending_stream() {
                 self.poll_pending_stream()?;
                 if self.has_pending_stream() {
-                    return Ok(None);
+                    return self.build_output_if_ready();
                 }
             }
         }
@@ -373,7 +385,7 @@ where
         if self.has_pending_stream() {
             self.async_poll_pending_stream().await?;
             if self.has_pending_stream() {
-                return Ok(None);
+                return self.build_output_if_ready();
             }
         }
 
@@ -390,7 +402,7 @@ where
             if self.has_pending_stream() {
                 self.async_poll_pending_stream().await?;
                 if self.has_pending_stream() {
-                    return Ok(None);
+                    return self.build_output_if_ready();
                 }
             }
         }
@@ -419,6 +431,7 @@ mod tests {
     use databend_common_expression::types::NumberDataType;
 
     use super::super::FixedRows;
+    use super::super::SimpleRowsAsc;
     use super::super::convert_rows;
     use super::*;
 
@@ -430,6 +443,68 @@ mod tests {
         fn next(&mut self) -> Result<(Option<(DataBlock, Column)>, bool)> {
             Ok((self.blocks.pop_front(), false))
         }
+    }
+
+    enum StreamStep {
+        Block(Vec<i32>),
+        Pending,
+        Finished,
+    }
+
+    struct PendingTestStream {
+        steps: VecDeque<StreamStep>,
+    }
+
+    impl PendingTestStream {
+        fn new(steps: Vec<StreamStep>) -> Self {
+            Self {
+                steps: VecDeque::from(steps),
+            }
+        }
+    }
+
+    fn int32_block(values: Vec<i32>) -> (DataBlock, Column) {
+        let block = DataBlock::new_from_columns(vec![Int32Type::from_data(values)]);
+        let order_col = block.get_last_column().clone();
+        (block, order_col)
+    }
+
+    impl SortedStream for PendingTestStream {
+        fn next(&mut self) -> Result<(Option<(DataBlock, Column)>, bool)> {
+            match self.steps.pop_front().unwrap_or(StreamStep::Finished) {
+                StreamStep::Block(values) => Ok((Some(int32_block(values)), false)),
+                StreamStep::Pending => Ok((None, true)),
+                StreamStep::Finished => Ok((None, false)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncSortedStream for PendingTestStream {
+        async fn async_next(&mut self) -> Result<(Option<(DataBlock, Column)>, bool)> {
+            self.next()
+        }
+    }
+
+    fn pending_streams() -> Vec<PendingTestStream> {
+        vec![
+            PendingTestStream::new(vec![
+                StreamStep::Block(vec![1, 2]),
+                StreamStep::Pending,
+                StreamStep::Block(vec![4, 5]),
+            ]),
+            PendingTestStream::new(vec![StreamStep::Block(vec![10, 11])]),
+        ]
+    }
+
+    fn first_column_values(block: DataBlock) -> Vec<i32> {
+        let databend_common_expression::Column::Number(
+            databend_common_expression::types::NumberColumn::Int32(values),
+        ) = block.get_by_offset(0).to_column()
+        else {
+            unreachable!("expected Int32 column")
+        };
+        values.into_iter().collect()
     }
 
     fn make_compound_streams() -> Result<Vec<TestStream>> {
@@ -485,6 +560,65 @@ mod tests {
             unreachable!("expected Int32 b column")
         };
         Ok(values.into_iter().collect())
+    }
+
+    #[test]
+    fn test_merge_outputs_ready_rows_before_pending_stream_returns() -> Result<()> {
+        let mut merger =
+            Merger::<HeapSort<SimpleRowsAsc<Int32Type>>, _>::new(pending_streams(), 4, None);
+
+        let block = merger
+            .next_block()?
+            .expect("ready output should not wait for a pending replacement block");
+        assert_eq!(first_column_values(block), vec![1, 2]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_row_by_row_merge_outputs_ready_rows_before_pending_stream_returns() -> Result<()> {
+        let mut merger = Merger::<HeapSort<SimpleRowsAsc<Int32Type>>, _>::new_row_by_row(
+            pending_streams(),
+            4,
+            None,
+        );
+
+        let block = merger
+            .next_block()?
+            .expect("ready output should not wait for a pending replacement block");
+        assert_eq!(first_column_values(block), vec![1, 2]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_row_by_row_loser_tree_outputs_ready_rows_before_pending_stream_returns() -> Result<()> {
+        let mut merger = Merger::<LoserTreeSort<SimpleRowsAsc<Int32Type>>, _>::new_row_by_row(
+            pending_streams(),
+            4,
+            None,
+        );
+
+        let block = merger
+            .next_block()?
+            .expect("ready output should not wait for a pending replacement block");
+        assert_eq!(first_column_values(block), vec![1, 2]);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_async_merge_outputs_ready_rows_before_pending_stream_returns() -> Result<()> {
+        let mut merger =
+            Merger::<HeapSort<SimpleRowsAsc<Int32Type>>, _>::new(pending_streams(), 4, None);
+
+        let block = merger
+            .async_next_block()
+            .await?
+            .expect("ready output should not wait for a pending replacement block");
+        assert_eq!(first_column_values(block), vec![1, 2]);
+
+        Ok(())
     }
 
     #[test]
