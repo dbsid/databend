@@ -625,7 +625,7 @@ impl PhysicalPlanBuilder {
             return Ok(false);
         };
 
-        let Some((fuse_table, ordering_key_len, max_overlap, max_streams_limit)) = (|| {
+        let ordering_candidate = (|| {
             let settings = self.ctx.get_settings();
             if !settings.get_enable_cluster_key_ordered_topk().ok()? {
                 return None;
@@ -644,8 +644,8 @@ impl PhysicalPlanBuilder {
             }
 
             let cluster_keys = fuse_table.linear_cluster_keys(self.ctx.clone());
-            let ordering_key_len =
-                cluster_keys_ordering_prefix_len(&cluster_keys, scan, &sort_exprs)?;
+            let ordering_key_projection =
+                cluster_keys_ordering_projection(&cluster_keys, scan, &sort_exprs)?;
 
             let max_overlap = settings.get_max_cluster_key_ordered_topk_overlap().ok()?;
             let max_streams = cmp::min(
@@ -654,11 +654,14 @@ impl PhysicalPlanBuilder {
             );
             Some((
                 fuse_table.clone(),
-                ordering_key_len,
+                ordering_key_projection,
                 max_overlap,
                 max_streams,
             ))
-        })() else {
+        })();
+        let Some((fuse_table, ordering_key_projection, max_overlap, max_streams_limit)) =
+            ordering_candidate
+        else {
             return Ok(false);
         };
 
@@ -683,7 +686,7 @@ impl PhysicalPlanBuilder {
         let Some(ordered_partitions) = ordered_cluster_partitions(
             &partitions,
             fuse_table.cluster_key_id(),
-            ordering_key_len,
+            &ordering_key_projection,
             max_overlap,
             max_streams,
         ) else {
@@ -729,11 +732,11 @@ impl PhysicalPlanBuilder {
     }
 }
 
-fn cluster_keys_ordering_prefix_len(
+fn cluster_keys_ordering_projection(
     cluster_keys: &[RemoteExpr<String>],
     scan: &TableScan,
     sort_exprs: &[(RemoteExpr<String>, bool, bool)],
-) -> Option<usize> {
+) -> Option<Vec<usize>> {
     let sort_exprs = sort_exprs
         .iter()
         .filter(|(sort_expr, _, _)| !scan_cluster_key_fixed_by_filters(sort_expr, scan))
@@ -743,21 +746,23 @@ fn cluster_keys_ordering_prefix_len(
     }
 
     let mut sort_index = 0;
+    let mut ordering_key_projection = Vec::with_capacity(sort_exprs.len());
     for (cluster_key_index, cluster_key) in cluster_keys.iter().enumerate() {
         if scan_cluster_key_fixed_by_filters(cluster_key, scan) {
             continue;
         }
 
         let Some((sort_expr, asc, nulls_first)) = sort_exprs.get(sort_index) else {
-            return Some(cluster_key_index);
+            return Some(ordering_key_projection);
         };
         if !cluster_key_matches_order_by(cluster_key, sort_expr, *asc, *nulls_first) {
             return None;
         }
 
+        ordering_key_projection.push(cluster_key_index);
         sort_index += 1;
         if sort_index == sort_exprs.len() {
-            return Some(cluster_key_index + 1);
+            return Some(ordering_key_projection);
         }
     }
 
@@ -811,7 +816,7 @@ async fn cluster_order_partitions(
 fn ordered_cluster_partitions(
     partitions: &[PartInfoPtr],
     cluster_key_id: Option<u32>,
-    ordering_key_len: usize,
+    ordering_key_projection: &[usize],
     max_overlap: u64,
     max_streams_limit: usize,
 ) -> Option<Vec<PartInfoPtr>> {
@@ -822,7 +827,7 @@ fn ordered_cluster_partitions(
     if partitions.len() == 1 {
         let mut fuse_part = FuseBlockPartInfo::from_part(&partitions[0]).ok()?.clone();
         let stats = valid_cluster_stats(&fuse_part, cluster_key_id)?;
-        cluster_ordering_key(stats, ordering_key_len)?;
+        cluster_ordering_key(stats, ordering_key_projection)?;
         fuse_part.preserve_order_stream = Some(0);
         return Some(vec![Arc::new(Box::new(fuse_part) as Box<dyn PartInfo>)]);
     }
@@ -832,7 +837,7 @@ fn ordered_cluster_partitions(
         .map(|part| {
             let fuse_part = FuseBlockPartInfo::from_part(part).ok()?;
             let stats = valid_cluster_stats(fuse_part, cluster_key_id)?;
-            let (min, max) = cluster_ordering_key(stats, ordering_key_len)?;
+            let (min, max) = cluster_ordering_key(stats, ordering_key_projection)?;
             Some((min, max, part.clone()))
         })
         .collect::<Option<Vec<_>>>()?;
@@ -903,15 +908,18 @@ fn valid_cluster_stats(
 
 fn cluster_ordering_key(
     stats: &ClusterStatistics,
-    ordering_key_len: usize,
+    ordering_key_projection: &[usize],
 ) -> Option<(Vec<Scalar>, Vec<Scalar>)> {
-    if ordering_key_len == 0 || stats.min().len() < ordering_key_len {
+    if ordering_key_projection.is_empty() {
         return None;
     }
-    Some((
-        stats.min()[..ordering_key_len].to_vec(),
-        stats.max()[..ordering_key_len].to_vec(),
-    ))
+    let mut min = Vec::with_capacity(ordering_key_projection.len());
+    let mut max = Vec::with_capacity(ordering_key_projection.len());
+    for index in ordering_key_projection {
+        min.push(stats.min().get(*index)?.clone());
+        max.push(stats.max().get(*index)?.clone());
+    }
+    Some((min, max))
 }
 
 fn compare_cluster_values(
@@ -982,15 +990,21 @@ fn expr_fixed_by_filter_expr(expr: &RemoteExpr<String>, filter: &RemoteExpr<Stri
         "is_null" if args.len() == 1 => {
             remote_expr_semantic_eq(expr, filter) || expr_matches_filter_arg(expr, &args[0])
         }
+        "is_not_null" if args.len() == 1 => is_null_cluster_key_matches_expr(expr, &args[0]),
         "not" if args.len() == 1 => {
             remote_expr_semantic_eq(expr, filter)
                 || expr_fixed_by_is_not_null_negation(expr, &args[0])
         }
         "contains" if args.len() == 2 => {
-            single_constant_array_expr(&args[0]) && expr_matches_filter_arg(expr, &args[1])
+            (single_constant_array_expr(&args[0]) && expr_matches_filter_arg(expr, &args[1]))
+                || (single_non_null_constant_array_expr(&args[0])
+                    && is_null_cluster_key_matches_expr(expr, &args[1]))
         }
         "eq" if args.len() == 2 => {
-            expr_eq_constant(expr, &args[0], &args[1]) || expr_eq_constant(expr, &args[1], &args[0])
+            expr_eq_constant(expr, &args[0], &args[1])
+                || expr_eq_constant(expr, &args[1], &args[0])
+                || expr_eq_non_null_constant(expr, &args[0], &args[1])
+                || expr_eq_non_null_constant(expr, &args[1], &args[0])
         }
         _ => false,
     }
@@ -1030,10 +1044,26 @@ fn expr_eq_constant(
     expr_is_constant(maybe_constant) && expr_matches_filter_arg(expr, maybe_expr)
 }
 
+fn expr_eq_non_null_constant(
+    expr: &RemoteExpr<String>,
+    maybe_expr: &RemoteExpr<String>,
+    maybe_constant: &RemoteExpr<String>,
+) -> bool {
+    expr_is_non_null_constant(maybe_constant) && is_null_cluster_key_matches_expr(expr, maybe_expr)
+}
+
 fn expr_is_constant(expr: &RemoteExpr<String>) -> bool {
     match expr {
         RemoteExpr::Constant { .. } => true,
         RemoteExpr::Cast { is_try, expr, .. } if !*is_try => expr_is_constant(expr),
+        _ => false,
+    }
+}
+
+fn expr_is_non_null_constant(expr: &RemoteExpr<String>) -> bool {
+    match expr {
+        RemoteExpr::Constant { scalar, .. } => !scalar.is_null(),
+        RemoteExpr::Cast { is_try, expr, .. } if !*is_try => expr_is_non_null_constant(expr),
         _ => false,
     }
 }
@@ -1051,6 +1081,25 @@ fn single_constant_array_expr(expr: &RemoteExpr<String>) -> bool {
             matches!(args.as_slice(), [arg] if single_constant_array_expr(arg))
         }
         RemoteExpr::Cast { is_try, expr, .. } if !*is_try => single_constant_array_expr(expr),
+        _ => false,
+    }
+}
+
+fn single_non_null_constant_array_expr(expr: &RemoteExpr<String>) -> bool {
+    match expr {
+        RemoteExpr::Constant {
+            scalar: Scalar::Array(array),
+            ..
+        } => array.len() == 1 && array.index(0).is_some_and(|value| !value.is_null()),
+        RemoteExpr::FunctionCall { id, args, .. } if id.name().as_ref() == "array" => {
+            matches!(args.as_slice(), [arg] if expr_is_non_null_constant(arg))
+        }
+        RemoteExpr::FunctionCall { id, args, .. } if id.name().as_ref() == "array_distinct" => {
+            matches!(args.as_slice(), [arg] if single_non_null_constant_array_expr(arg))
+        }
+        RemoteExpr::Cast { is_try, expr, .. } if !*is_try => {
+            single_non_null_constant_array_expr(expr)
+        }
         _ => false,
     }
 }
@@ -1461,7 +1510,7 @@ mod tests {
     fn test_ordered_cluster_partitions_uses_single_stream_for_non_overlap() {
         let parts = vec![part("b", 10, 19), part("a", 0, 8), part("c", 21, 29)];
 
-        let ordered = ordered_cluster_partitions(&parts, Some(7), 1, 10, 8).unwrap();
+        let ordered = ordered_cluster_partitions(&parts, Some(7), &[0], 10, 8).unwrap();
 
         assert_eq!(stream_ids(&ordered), vec![0, 0, 0]);
         let locations = ordered
@@ -1480,7 +1529,7 @@ mod tests {
     fn test_ordered_cluster_partitions_uses_overlap_width_streams() {
         let parts = vec![part("a", 0, 10), part("b", 5, 15), part("c", 12, 20)];
 
-        let ordered = ordered_cluster_partitions(&parts, Some(7), 1, 10, 8).unwrap();
+        let ordered = ordered_cluster_partitions(&parts, Some(7), &[0], 10, 8).unwrap();
         let stream_ids = stream_ids(&ordered);
 
         assert_eq!(stream_ids, vec![0, 1, 0]);
@@ -1500,7 +1549,27 @@ mod tests {
             ]),
         ];
 
-        let ordered = ordered_cluster_partitions(&parts, Some(7), 1, 0, 8).unwrap();
+        let ordered = ordered_cluster_partitions(&parts, Some(7), &[0], 0, 8).unwrap();
+
+        assert_eq!(stream_ids(&ordered), vec![0, 0]);
+    }
+
+    #[test]
+    fn test_ordered_cluster_partitions_projects_actual_ordering_key_for_overlap() {
+        let parts = vec![
+            part_with_cluster_values("a", vec![scalar(0), scalar(0)], vec![
+                scalar(100),
+                scalar(9),
+            ]),
+            part_with_cluster_values("b", vec![scalar(0), scalar(10)], vec![
+                scalar(100),
+                scalar(19),
+            ]),
+        ];
+
+        assert!(ordered_cluster_partitions(&parts, Some(7), &[0, 1], 0, 8).is_none());
+
+        let ordered = ordered_cluster_partitions(&parts, Some(7), &[1], 0, 8).unwrap();
 
         assert_eq!(stream_ids(&ordered), vec![0, 0]);
     }
@@ -1509,7 +1578,7 @@ mod tests {
     fn test_ordered_cluster_partitions_treats_touching_ranges_as_overlap() {
         let parts = vec![part("a", 0, 10), part("b", 10, 20), part("c", 21, 30)];
 
-        let ordered = ordered_cluster_partitions(&parts, Some(7), 1, 10, 8).unwrap();
+        let ordered = ordered_cluster_partitions(&parts, Some(7), &[0], 10, 8).unwrap();
         let stream_ids = stream_ids(&ordered);
 
         assert_eq!(stream_ids, vec![0, 1, 0]);
@@ -1520,7 +1589,7 @@ mod tests {
     fn test_ordered_cluster_partitions_rejects_excess_overlap() {
         let parts = vec![part("a", 0, 10), part("b", 5, 15), part("c", 7, 20)];
 
-        assert!(ordered_cluster_partitions(&parts, Some(7), 1, 1, 8).is_none());
+        assert!(ordered_cluster_partitions(&parts, Some(7), &[0], 1, 8).is_none());
     }
 
     #[test]
@@ -1535,6 +1604,14 @@ mod tests {
 
         assert!(expr_fixed_by_filter_expr(&int_column("a"), &filter));
         assert!(expr_fixed_by_filter_expr(&int_column("b"), &filter));
+        assert!(expr_fixed_by_filter_expr(
+            &is_null(int_column("a")),
+            &filter
+        ));
+        assert!(expr_fixed_by_filter_expr(
+            &is_null(int_column("b")),
+            &filter
+        ));
         assert!(expr_fixed_by_filter_expr(&is_null(tag.clone()), &filter));
         assert!(expr_fixed_by_filter_expr(
             &not(is_not_null(tag.clone())),
@@ -1549,6 +1626,13 @@ mod tests {
                 int_column("b")
             )
         ));
+
+        let not_null_filter = is_not_null(tag.clone());
+        assert!(expr_fixed_by_filter_expr(
+            &is_null(tag.clone()),
+            &not_null_filter
+        ));
+        assert!(!expr_fixed_by_filter_expr(&tag, &not_null_filter));
     }
 
     #[test]
