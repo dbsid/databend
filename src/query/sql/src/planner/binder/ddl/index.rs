@@ -1163,6 +1163,7 @@ impl Binder {
                 | AstTableIndexType::Ngram
                 | AstTableIndexType::Vector
                 | AstTableIndexType::Spatial
+                | AstTableIndexType::Btree
         ) {
             return Err(ErrorCode::UnsupportedIndex(format!(
                 "Table index {} does not support refresh",

@@ -62,4 +62,39 @@ LIMIT 1
 14 wallet-a 20
 
 statement ok
+CREATE TABLE t_refresh (
+    platform_id INT,
+    wallet_address VARCHAR,
+    last_active_time BIGINT,
+    balance DECIMAL(10, 2),
+    tag_black_hole TINYINT
+) ENGINE = FUSE
+
+statement ok
+INSERT INTO t_refresh VALUES
+(14, 'wallet-a', 10, 1.00, NULL),
+(14, 'wallet-a', 20, 2.00, NULL),
+(14, 'wallet-b', 30, 3.00, NULL)
+
+statement ok
+CREATE BTREE INDEX idx_wallet_refresh_all
+ON t_refresh(platform_id, wallet_address, last_active_time DESC)
+WITH (
+    COMPRESSION = 'ZSTD',
+    INDEX_COVERED_TYPE = 'COVERED_ALL_COLUMNS_IN_SCHEMA'
+)
+
+statement ok
+REFRESH BTREE INDEX idx_wallet_refresh_all ON t_refresh
+
+query IRI
+SELECT platform_id, wallet_address, last_active_time
+FROM t_refresh
+WHERE platform_id = 14 AND wallet_address = 'wallet-a' AND tag_black_hole IS NULL
+ORDER BY last_active_time DESC
+LIMIT 1
+----
+14 wallet-a 20
+
+statement ok
 DROP DATABASE test_btree_index
