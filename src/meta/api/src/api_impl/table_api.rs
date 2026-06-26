@@ -75,6 +75,7 @@ use databend_common_meta_app::schema::TableIdHistoryIdent;
 use databend_common_meta_app::schema::TableIdList;
 use databend_common_meta_app::schema::TableIdToName;
 use databend_common_meta_app::schema::TableIdent;
+use databend_common_meta_app::schema::TableIndexType;
 use databend_common_meta_app::schema::TableInfo;
 use databend_common_meta_app::schema::TableMeta;
 use databend_common_meta_app::schema::TableNameIdent;
@@ -176,7 +177,9 @@ fn validate_index_columns(meta: &TableMeta) -> Result<(), KVAppError> {
                     IndexColumnIdNotFound::new(column_id, &index.name),
                 )));
             }
-            if !seen.insert((column_id, index.index_type.clone())) {
+            if !matches!(index.index_type, TableIndexType::Btree)
+                && !seen.insert((column_id, index.index_type.clone()))
+            {
                 return Err(KVAppError::AppError(AppError::DuplicatedIndexColumnId(
                     DuplicatedIndexColumnId::new(column_id, &index.name),
                 )));

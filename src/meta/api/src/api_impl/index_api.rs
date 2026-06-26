@@ -32,6 +32,7 @@ use databend_common_meta_app::schema::IndexNameIdentRaw;
 use databend_common_meta_app::schema::ListIndexesReq;
 use databend_common_meta_app::schema::TableId;
 use databend_common_meta_app::schema::TableIndex;
+use databend_common_meta_app::schema::TableIndexType;
 use databend_common_meta_app::schema::index_id_ident::IndexId;
 use databend_common_meta_app::schema::index_id_ident::IndexIdIdent;
 use databend_common_meta_app::schema::index_id_to_name_ident::IndexIdToNameIdent;
@@ -343,16 +344,20 @@ where
                 }
             }
 
-            // column_id can not be duplicated
-            for (name, index) in indexes.iter() {
-                if *name == req.name || index.index_type != req.index_type {
-                    continue;
-                }
-                for column_id in &req.column_ids {
-                    if index.column_ids.contains(column_id) {
-                        return Err(KVAppError::AppError(AppError::DuplicatedIndexColumnId(
-                            DuplicatedIndexColumnId::new(*column_id, &req.name),
-                        )));
+            // Most table index types map one index implementation to one set of
+            // columns. BTREE indexes are different: alternate key orderings over
+            // overlapping columns are valid access paths.
+            if !matches!(req.index_type, TableIndexType::Btree) {
+                for (name, index) in indexes.iter() {
+                    if *name == req.name || index.index_type != req.index_type {
+                        continue;
+                    }
+                    for column_id in &req.column_ids {
+                        if index.column_ids.contains(column_id) {
+                            return Err(KVAppError::AppError(AppError::DuplicatedIndexColumnId(
+                                DuplicatedIndexColumnId::new(*column_id, &req.name),
+                            )));
+                        }
                     }
                 }
             }
