@@ -960,9 +960,9 @@ impl PhysicalPlanBuilder {
             .values()
             .filter(|index| matches!(index.index_type, TableIndexType::Btree))
             .count();
-        let mut equality_by_column = HashMap::new();
+        let mut prefix_constants_by_column = HashMap::new();
         for predicate in scan.push_down_predicates.as_deref().unwrap_or_default() {
-            collect_eq_column_constants(predicate, &mut equality_by_column);
+            collect_btree_prefix_column_constants(predicate, &mut prefix_constants_by_column);
         }
 
         for index in table_meta.indexes.values() {
@@ -1008,7 +1008,7 @@ impl PhysicalPlanBuilder {
                     prefix_values.clear();
                     break;
                 };
-                let Some(value) = equality_by_column.get(&column_index) else {
+                let Some(value) = prefix_constants_by_column.get(&column_index) else {
                     break;
                 };
                 prefix_values.push(value.clone());
@@ -1440,25 +1440,29 @@ fn table_symbol_for_field(
     })
 }
 
-fn collect_eq_column_constants(
+fn collect_btree_prefix_column_constants(
     expr: &ScalarExpr,
-    equality_by_column: &mut HashMap<Symbol, Scalar>,
+    constants_by_column: &mut HashMap<Symbol, Scalar>,
 ) {
     if let ScalarExpr::FunctionCall(func) = expr
         && matches!(func.func_name.as_str(), "and" | "and_filters")
     {
         for argument in &func.arguments {
-            collect_eq_column_constants(argument, equality_by_column);
+            collect_btree_prefix_column_constants(argument, constants_by_column);
         }
         return;
     }
 
-    if let Some((column, value)) = extract_eq_column_constant(expr) {
-        equality_by_column.insert(column, value);
+    if let Some((column, value)) = extract_btree_prefix_column_constant(expr) {
+        constants_by_column.insert(column, value);
     }
 }
 
-fn extract_eq_column_constant(expr: &ScalarExpr) -> Option<(Symbol, Scalar)> {
+fn extract_btree_prefix_column_constant(expr: &ScalarExpr) -> Option<(Symbol, Scalar)> {
+    if let Some(column) = extract_is_null_column(expr) {
+        return Some((column, Scalar::Null));
+    }
+
     let ScalarExpr::FunctionCall(func) = expr else {
         return None;
     };
@@ -1475,5 +1479,146 @@ fn extract_eq_column_constant(expr: &ScalarExpr) -> Option<(Symbol, Scalar)> {
             Some((column.column.index, constant.value.clone()))
         }
         _ => None,
+    }
+}
+
+fn extract_is_null_column(expr: &ScalarExpr) -> Option<Symbol> {
+    let ScalarExpr::FunctionCall(func) = expr else {
+        return None;
+    };
+    if func.func_name != "not" || func.arguments.len() != 1 {
+        return None;
+    }
+
+    let ScalarExpr::FunctionCall(inner) = &func.arguments[0] else {
+        return None;
+    };
+    if inner.func_name != "is_not_null" || inner.arguments.len() != 1 {
+        return None;
+    }
+
+    let ScalarExpr::BoundColumnRef(column) = &inner.arguments[0] else {
+        return None;
+    };
+    Some(column.column.index)
+}
+
+#[cfg(test)]
+mod tests {
+    use databend_common_expression::types::DataType;
+    use databend_common_expression::types::NumberDataType;
+    use databend_common_expression::types::NumberScalar;
+    use databend_common_sql::ColumnBindingBuilder;
+    use databend_common_sql::Visibility;
+    use databend_common_sql::plans::BoundColumnRef;
+    use databend_common_sql::plans::ConstantExpr;
+
+    use super::*;
+
+    #[test]
+    fn test_btree_prefix_constants_collect_eq_and_is_null() {
+        let platform = Symbol::new(0);
+        let tag = Symbol::new(1);
+        let expr = and(
+            eq(
+                test_column("platform_id", platform),
+                ConstantExpr {
+                    span: None,
+                    value: Scalar::Number(NumberScalar::Int64(14)),
+                }
+                .into(),
+            ),
+            is_null(test_column("tag_sniper", tag)),
+        );
+
+        let mut constants_by_column = HashMap::new();
+        collect_btree_prefix_column_constants(&expr, &mut constants_by_column);
+
+        assert_eq!(
+            constants_by_column.get(&platform),
+            Some(&Scalar::Number(NumberScalar::Int64(14)))
+        );
+        assert_eq!(constants_by_column.get(&tag), Some(&Scalar::Null));
+    }
+
+    #[test]
+    fn test_btree_prefix_constant_extracts_reversed_eq() {
+        let wallet = Symbol::new(0);
+        let expr = eq(
+            ConstantExpr {
+                span: None,
+                value: Scalar::String("wallet-a".to_string()),
+            }
+            .into(),
+            test_column("wallet_address", wallet),
+        );
+
+        assert_eq!(
+            extract_btree_prefix_column_constant(&expr),
+            Some((wallet, Scalar::String("wallet-a".to_string())))
+        );
+    }
+
+    #[test]
+    fn test_btree_prefix_constant_ignores_is_not_null() {
+        let tag = Symbol::new(0);
+        assert_eq!(
+            extract_btree_prefix_column_constant(&is_not_null(test_column("tag_sniper", tag))),
+            None
+        );
+    }
+
+    fn test_column(name: &str, index: Symbol) -> ScalarExpr {
+        BoundColumnRef {
+            span: None,
+            column: ColumnBindingBuilder::new(
+                name.to_string(),
+                index,
+                Box::new(DataType::Number(NumberDataType::Int64).wrap_nullable()),
+                Visibility::Visible,
+            )
+            .build(),
+        }
+        .into()
+    }
+
+    fn and(left: ScalarExpr, right: ScalarExpr) -> ScalarExpr {
+        FunctionCall {
+            span: None,
+            func_name: "and_filters".to_string(),
+            params: vec![],
+            arguments: vec![left, right],
+        }
+        .into()
+    }
+
+    fn eq(left: ScalarExpr, right: ScalarExpr) -> ScalarExpr {
+        FunctionCall {
+            span: None,
+            func_name: "eq".to_string(),
+            params: vec![],
+            arguments: vec![left, right],
+        }
+        .into()
+    }
+
+    fn is_null(expr: ScalarExpr) -> ScalarExpr {
+        FunctionCall {
+            span: None,
+            func_name: "not".to_string(),
+            params: vec![],
+            arguments: vec![is_not_null(expr)],
+        }
+        .into()
+    }
+
+    fn is_not_null(expr: ScalarExpr) -> ScalarExpr {
+        FunctionCall {
+            span: None,
+            func_name: "is_not_null".to_string(),
+            params: vec![],
+            arguments: vec![expr],
+        }
+        .into()
     }
 }
