@@ -426,20 +426,26 @@ impl BtreeIndexSource {
         filter: &BtreeIndexFilter,
         limit: Option<usize>,
     ) -> Result<Vec<BtreeIndexRow>> {
+        let row_refs = rows.iter().collect::<Vec<_>>();
+        self.filter_index_row_refs(&row_refs, filter, limit)
+    }
+
+    fn filter_index_row_refs(
+        &self,
+        rows: &[&BtreeIndexRow],
+        filter: &BtreeIndexFilter,
+        limit: Option<usize>,
+    ) -> Result<Vec<BtreeIndexRow>> {
         if rows.is_empty() {
-            return Ok(rows);
+            return Ok(Vec::new());
         }
 
         let start = Instant::now();
         if let Some(predicates) = &filter.fast_predicates {
             let filtered_rows = if predicates.is_empty() {
-                let rows = rows
-                    .into_iter()
-                    .filter(|row| {
-                        evaluate_btree_key_predicates(&filter.key_predicates, &row.encoded_key)
-                    })
-                    .collect();
-                truncate_rows(rows, limit)
+                clone_matching_row_refs(rows, limit, |row| {
+                    evaluate_btree_key_predicates(&filter.key_predicates, &row.encoded_key)
+                })
             } else {
                 let mut filtered_rows = Vec::new();
                 for row in rows {
@@ -451,7 +457,7 @@ impl BtreeIndexSource {
                         &filter.payload_field_indexes,
                     )?;
                     if evaluate_btree_fast_predicates(predicates, &payload_row) {
-                        filtered_rows.push(row);
+                        filtered_rows.push((*row).clone());
                         if limit.is_some_and(|limit| filtered_rows.len() >= limit) {
                             break;
                         }
@@ -482,15 +488,20 @@ impl BtreeIndexSource {
             .unwrap();
 
         let filtered_rows = match filter {
-            databend_common_expression::Value::Scalar(true) => truncate_rows(rows, limit),
+            databend_common_expression::Value::Scalar(true) => clone_row_refs(rows, limit),
             databend_common_expression::Value::Scalar(false) => Vec::new(),
-            databend_common_expression::Value::Column(bitmap) => truncate_rows(
-                rows.into_iter()
-                    .enumerate()
-                    .filter_map(|(idx, row)| bitmap.get_bit(idx).then_some(row))
-                    .collect(),
-                limit,
-            ),
+            databend_common_expression::Value::Column(bitmap) => {
+                let mut filtered_rows = Vec::new();
+                for (idx, row) in rows.iter().enumerate() {
+                    if bitmap.get_bit(idx) {
+                        filtered_rows.push((*row).clone());
+                        if limit.is_some_and(|limit| filtered_rows.len() >= limit) {
+                            break;
+                        }
+                    }
+                }
+                filtered_rows
+            }
         };
         record_elapsed(ProfileStatisticsName::BtreeIndexFilterTime, start);
         Ok(filtered_rows)
@@ -700,7 +711,7 @@ impl BtreeIndexSource {
         filter: Option<&BtreeIndexFilter>,
         limit: Option<usize>,
     ) -> Result<Vec<BtreeIndexRow>> {
-        let mut rows = load_btree_index_data_block(
+        let rows = load_btree_index_data_block(
             self.operator.clone(),
             &candidate.index_location,
             &candidate.meta,
@@ -708,11 +719,14 @@ impl BtreeIndexSource {
         )
         .await?;
         Profile::record_usize_profile(ProfileStatisticsName::BtreeIndexRowsDecoded, rows.len());
-        rows.retain(|row| row.encoded_key.starts_with(prefix));
+        let rows = rows
+            .iter()
+            .filter(|row| row.encoded_key.starts_with(prefix))
+            .collect::<Vec<_>>();
         let rows = if let Some(filter) = filter {
-            self.filter_index_rows(rows, filter, limit)?
+            self.filter_index_row_refs(&rows, filter, limit)?
         } else {
-            truncate_rows(rows, limit)
+            clone_row_refs(&rows, limit)
         };
         Profile::record_usize_profile(ProfileStatisticsName::BtreeIndexRowsMatched, rows.len());
         Ok(rows)
@@ -936,13 +950,28 @@ fn record_elapsed(name: ProfileStatisticsName, start: Instant) {
     Profile::record_usize_profile(name, start.elapsed().as_nanos() as usize);
 }
 
-fn truncate_rows(mut rows: Vec<BtreeIndexRow>, limit: Option<usize>) -> Vec<BtreeIndexRow> {
-    if let Some(limit) = limit
-        && rows.len() > limit
-    {
-        rows.truncate(limit);
+fn clone_row_refs(rows: &[&BtreeIndexRow], limit: Option<usize>) -> Vec<BtreeIndexRow> {
+    rows.iter()
+        .take(limit.unwrap_or(usize::MAX))
+        .map(|row| (*row).clone())
+        .collect()
+}
+
+fn clone_matching_row_refs(
+    rows: &[&BtreeIndexRow],
+    limit: Option<usize>,
+    mut predicate: impl FnMut(&BtreeIndexRow) -> bool,
+) -> Vec<BtreeIndexRow> {
+    let mut result = Vec::new();
+    for row in rows {
+        if predicate(row) {
+            result.push((*row).clone());
+            if limit.is_some_and(|limit| result.len() >= limit) {
+                break;
+            }
+        }
     }
-    rows
+    result
 }
 
 fn sort_and_truncate_rows(rows: &mut Vec<BtreeIndexRow>, limit: usize) {

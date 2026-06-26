@@ -45,7 +45,7 @@ static BTREE_DECODED_DATA_BLOCK_CACHE: LazyLock<InMemoryLruCache<BtreeIndexDecod
 
 #[derive(Clone)]
 struct BtreeIndexDecodedDataBlock {
-    rows: Vec<BtreeIndexRow>,
+    rows: Arc<Vec<BtreeIndexRow>>,
 }
 
 impl From<BtreeIndexDecodedDataBlock> for CacheValue<BtreeIndexDecodedDataBlock> {
@@ -222,7 +222,7 @@ pub async fn load_btree_index_data_block(
     location: &str,
     meta: &BtreeIndexFileMeta,
     block_meta: &databend_storages_common_index::BtreeIndexDataBlockMeta,
-) -> Result<Vec<BtreeIndexRow>> {
+) -> Result<Arc<Vec<BtreeIndexRow>>> {
     let cache_key = format!("{}#{}+{}", location, block_meta.offset, block_meta.length);
     let decoded_cache_key = format!("decoded#{cache_key}");
     if let Some(block) = BTREE_DECODED_DATA_BLOCK_CACHE.get(&decoded_cache_key) {
@@ -234,6 +234,7 @@ pub async fn load_btree_index_data_block(
         let start = Instant::now();
         let rows = meta.decode_data_block(block_meta, block.data.as_ref())?;
         record_elapsed(ProfileStatisticsName::BtreeIndexDataBlockDecodeTime, start);
+        let rows = Arc::new(rows);
         BTREE_DECODED_DATA_BLOCK_CACHE.insert(decoded_cache_key, BtreeIndexDecodedDataBlock {
             rows: rows.clone(),
         });
@@ -260,6 +261,7 @@ pub async fn load_btree_index_data_block(
         ProfileStatisticsName::BtreeIndexDataBlockDecodeTime,
         decode_start,
     );
+    let rows = Arc::new(rows);
     BTREE_DECODED_DATA_BLOCK_CACHE.insert(decoded_cache_key, BtreeIndexDecodedDataBlock {
         rows: rows.clone(),
     });
@@ -338,9 +340,9 @@ mod tests {
 
         let mut rows = Vec::new();
         for block_meta in &block_metas {
-            rows.extend(
-                load_btree_index_data_block(operator.clone(), location, &meta, block_meta).await?,
-            );
+            let block_rows =
+                load_btree_index_data_block(operator.clone(), location, &meta, block_meta).await?;
+            rows.extend(block_rows.iter().cloned());
         }
         rows.retain(|row| row.encoded_key.starts_with(b"wallet-1|"));
         assert_eq!(rows.len(), 4);
