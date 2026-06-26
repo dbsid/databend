@@ -69,7 +69,9 @@ pub fn build_btree_index_source_pipeline(
     max_threads: usize,
     receiver: Option<Receiver<Result<PartInfoPtr>>>,
 ) -> Result<()> {
-    let max_threads = max_threads.max(1);
+    let _ = max_threads;
+    // BTREE scans merge candidates globally to preserve ordered limit semantics.
+    let max_threads = 1;
     let partitions =
         crate::operations::read::fuse_source::dispatch_partitions(ctx.clone(), plan, max_threads);
     let partitions = StealablePartitions::new(partitions, ctx.clone());
