@@ -203,23 +203,23 @@ impl AsyncSource for BtreeIndexSource {
         let prefix = encode_prefix(&self.btree_index)?;
         let filter = self.build_filter_expr(self.btree_index.filters.as_ref())?;
         let candidate_read_start = Instant::now();
-        let candidate_collect_start = Instant::now();
         let mut candidates = Vec::new();
         while let Some(parts) = self.fetch_parts().await? {
             if parts.is_empty() {
                 continue;
             }
 
+            let candidate_collect_start = Instant::now();
             candidates.append(
                 &mut self
                     .load_candidate_blocks(parts, &prefix, filter.as_ref())
                     .await?,
             );
+            record_elapsed(
+                ProfileStatisticsName::BtreeIndexCandidateCollectTime,
+                candidate_collect_start,
+            );
         }
-        record_elapsed(
-            ProfileStatisticsName::BtreeIndexCandidateCollectTime,
-            candidate_collect_start,
-        );
 
         let rows = self
             .read_candidate_rows(candidates, &prefix, filter.as_ref())
