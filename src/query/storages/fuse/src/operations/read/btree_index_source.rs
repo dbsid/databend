@@ -14,6 +14,7 @@
 
 use std::cmp::Ordering;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Instant;
 
 use async_channel::Receiver;
@@ -51,6 +52,9 @@ use databend_common_pipeline::core::Pipeline;
 use databend_common_pipeline::core::SourcePipeBuilder;
 use databend_common_pipeline::sources::AsyncSource;
 use databend_common_pipeline::sources::AsyncSourcer;
+use databend_storages_common_cache::CacheAccessor;
+use databend_storages_common_cache::CacheValue;
+use databend_storages_common_cache::InMemoryLruCache;
 use databend_storages_common_index::BtreeIndexDataBlockMeta;
 use databend_storages_common_index::BtreeIndexFileMeta;
 use databend_storages_common_index::BtreeIndexKeyOrder;
@@ -61,6 +65,7 @@ use databend_storages_common_index::decode_btree_payload_projection;
 use databend_storages_common_index::encode_btree_key_component;
 use futures::future;
 use opendal::Operator;
+use sha2::Digest;
 
 use crate::fuse_part::FuseBlockPartInfo;
 use crate::io::TableMetaLocationGenerator;
@@ -68,6 +73,28 @@ use crate::io::load_btree_index_data_block;
 use crate::io::load_btree_index_meta;
 
 const BTREE_INDEX_DATA_BLOCK_READ_BATCH_SIZE: usize = 32;
+const BTREE_DECODED_PAYLOAD_ROW_CACHE_ITEMS: usize = 65536;
+
+static BTREE_DECODED_PAYLOAD_ROW_CACHE: LazyLock<InMemoryLruCache<BtreeIndexDecodedPayloadRow>> =
+    LazyLock::new(|| {
+        InMemoryLruCache::with_items_capacity(
+            "btree_index_decoded_payload_row".to_string(),
+            BTREE_DECODED_PAYLOAD_ROW_CACHE_ITEMS,
+        )
+    });
+
+#[derive(Clone)]
+struct BtreeIndexDecodedPayloadRow {
+    row: Vec<Scalar>,
+}
+
+impl From<BtreeIndexDecodedPayloadRow> for CacheValue<BtreeIndexDecodedPayloadRow> {
+    fn from(value: BtreeIndexDecodedPayloadRow) -> Self {
+        let mem_bytes =
+            std::mem::size_of::<BtreeIndexDecodedPayloadRow>() + scalar_rows_mem_bytes(&value.row);
+        CacheValue::new(value, mem_bytes)
+    }
+}
 
 pub fn build_btree_index_source_pipeline(
     ctx: Arc<dyn TableContext>,
@@ -197,7 +224,7 @@ impl AsyncSource for BtreeIndexSource {
         let decode_start = Instant::now();
         let mut decoded_rows = Vec::with_capacity(rows.len());
         for row in rows {
-            decoded_rows.push(decode_btree_payload(&row.encoded_row_payload)?);
+            decoded_rows.push(decode_btree_payload_cached(&row.encoded_row_payload)?);
         }
         record_elapsed(
             ProfileStatisticsName::BtreeIndexPayloadDecodeTime,
@@ -1020,6 +1047,40 @@ fn key_component_range_may_match_predicate(
 
 fn component_in_range(component: &[u8], first_component: &[u8], last_component: &[u8]) -> bool {
     first_component <= component && component <= last_component
+}
+
+fn decode_btree_payload_cached(payload: &[u8]) -> Result<Vec<Scalar>> {
+    let cache_key = decoded_payload_cache_key(payload);
+    if let Some(cached) = BTREE_DECODED_PAYLOAD_ROW_CACHE.get(&cache_key) {
+        return Ok(cached.row.clone());
+    }
+
+    let row = decode_btree_payload(payload)?;
+    BTREE_DECODED_PAYLOAD_ROW_CACHE
+        .insert(cache_key, BtreeIndexDecodedPayloadRow { row: row.clone() });
+    Ok(row)
+}
+
+fn decoded_payload_cache_key(payload: &[u8]) -> String {
+    let digest = sha2::Sha256::digest(payload);
+    format!("{}:{digest:x}", payload.len())
+}
+
+fn scalar_rows_mem_bytes(row: &[Scalar]) -> usize {
+    row.iter().map(scalar_mem_bytes).sum::<usize>() + std::mem::size_of_val(row)
+}
+
+fn scalar_mem_bytes(scalar: &Scalar) -> usize {
+    std::mem::size_of::<Scalar>()
+        + match scalar {
+            Scalar::String(value) => value.len(),
+            Scalar::Binary(value)
+            | Scalar::Bitmap(value)
+            | Scalar::Variant(value)
+            | Scalar::Geometry(value) => value.len(),
+            Scalar::Tuple(values) => values.iter().map(scalar_mem_bytes).sum(),
+            _ => 0,
+        }
 }
 
 fn compile_btree_fast_predicates(
