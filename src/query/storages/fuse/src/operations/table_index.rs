@@ -1199,7 +1199,7 @@ impl AsyncTransform for SpatialIndexTransform {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RefreshIndexMeta {
     index: BlockMetaIndex,
     block_meta: Arc<BlockMeta>,
@@ -1217,7 +1217,15 @@ impl Debug for RefreshIndexMeta {
 local_block_meta_serde!(RefreshIndexMeta);
 
 #[typetag::serde(name = "refresh_index")]
-impl BlockMetaInfo for RefreshIndexMeta {}
+impl BlockMetaInfo for RefreshIndexMeta {
+    fn equals(&self, info: &Box<dyn BlockMetaInfo>) -> bool {
+        Self::downcast_ref_from(info).is_some_and(|other| self == other)
+    }
+
+    fn clone_self(&self) -> Box<dyn BlockMetaInfo> {
+        Box::new(self.clone())
+    }
+}
 
 enum RefreshIndexArg {
     Ngram(RefreshNgramIndexArg),
