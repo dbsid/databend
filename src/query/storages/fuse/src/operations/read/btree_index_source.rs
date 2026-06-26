@@ -60,13 +60,14 @@ use databend_storages_common_index::BtreeIndexFileMeta;
 use databend_storages_common_index::BtreeIndexKeyOrder;
 use databend_storages_common_index::BtreeIndexRow;
 use databend_storages_common_index::btree_equality_prefix;
+use databend_storages_common_index::decode_btree_payload;
 use databend_storages_common_index::decode_btree_payload_projection;
 use databend_storages_common_index::encode_btree_key_component;
 use databend_storages_common_index::filters::BloomFilter;
 use databend_storages_common_index::filters::Filter as _;
-use databend_storages_common_index::visit_btree_payload;
 use futures::future;
 use opendal::Operator;
+use sha2::Digest;
 
 use crate::fuse_part::FuseBlockPartInfo;
 use crate::io::TableMetaLocationGenerator;
@@ -74,7 +75,16 @@ use crate::io::load_btree_index_data_block;
 use crate::io::load_btree_index_meta;
 
 const BTREE_INDEX_DATA_BLOCK_READ_BATCH_SIZE: usize = 32;
+const BTREE_DECODED_PAYLOAD_ROW_CACHE_ITEMS: usize = 65536;
 const BTREE_DECODED_EQUALITY_PREFIX_BLOOM_CACHE_ITEMS: usize = 8192;
+
+static BTREE_DECODED_PAYLOAD_ROW_CACHE: LazyLock<InMemoryLruCache<BtreeIndexDecodedPayloadRow>> =
+    LazyLock::new(|| {
+        InMemoryLruCache::with_items_capacity(
+            "btree_index_decoded_payload_row".to_string(),
+            BTREE_DECODED_PAYLOAD_ROW_CACHE_ITEMS,
+        )
+    });
 
 static BTREE_DECODED_EQUALITY_PREFIX_BLOOM_CACHE: LazyLock<
     InMemoryLruCache<BtreeIndexDecodedEqualityPrefixBloom>,
@@ -84,6 +94,19 @@ static BTREE_DECODED_EQUALITY_PREFIX_BLOOM_CACHE: LazyLock<
         BTREE_DECODED_EQUALITY_PREFIX_BLOOM_CACHE_ITEMS,
     )
 });
+
+#[derive(Clone)]
+struct BtreeIndexDecodedPayloadRow {
+    row: Vec<Scalar>,
+}
+
+impl From<BtreeIndexDecodedPayloadRow> for CacheValue<BtreeIndexDecodedPayloadRow> {
+    fn from(value: BtreeIndexDecodedPayloadRow) -> Self {
+        let mem_bytes =
+            std::mem::size_of::<BtreeIndexDecodedPayloadRow>() + scalar_rows_mem_bytes(&value.row);
+        CacheValue::new(value, mem_bytes)
+    }
+}
 
 #[derive(Clone)]
 struct BtreeIndexDecodedEqualityPrefixBloom {
@@ -237,13 +260,17 @@ impl AsyncSource for BtreeIndexSource {
             return Ok(None);
         }
         let decode_start = Instant::now();
-        let mut block = payload_rows_to_block_direct(&self.btree_index.payload_fields, rows)?;
+        let mut decoded_rows = Vec::with_capacity(rows.len());
+        for row in rows {
+            decoded_rows.push(decode_btree_payload_cached(&row.encoded_row_payload)?);
+        }
         record_elapsed(
             ProfileStatisticsName::BtreeIndexPayloadDecodeTime,
             decode_start,
         );
 
         let output_build_start = Instant::now();
+        let mut block = payload_rows_to_block(&self.btree_index.payload_fields, decoded_rows)?;
         block = block.resort(&self.payload_schema, &self.output_schema)?;
         record_elapsed(
             ProfileStatisticsName::BtreeIndexOutputBuildTime,
@@ -1247,6 +1274,40 @@ fn component_in_range(component: &[u8], first_component: &[u8], last_component: 
     first_component <= component && component <= last_component
 }
 
+fn decode_btree_payload_cached(payload: &[u8]) -> Result<Vec<Scalar>> {
+    let cache_key = decoded_payload_cache_key(payload);
+    if let Some(cached) = BTREE_DECODED_PAYLOAD_ROW_CACHE.get(&cache_key) {
+        return Ok(cached.row.clone());
+    }
+
+    let row = decode_btree_payload(payload)?;
+    BTREE_DECODED_PAYLOAD_ROW_CACHE
+        .insert(cache_key, BtreeIndexDecodedPayloadRow { row: row.clone() });
+    Ok(row)
+}
+
+fn decoded_payload_cache_key(payload: &[u8]) -> String {
+    let digest = sha2::Sha256::digest(payload);
+    format!("{}:{digest:x}", payload.len())
+}
+
+fn scalar_rows_mem_bytes(row: &[Scalar]) -> usize {
+    row.iter().map(scalar_mem_bytes).sum::<usize>() + std::mem::size_of_val(row)
+}
+
+fn scalar_mem_bytes(scalar: &Scalar) -> usize {
+    std::mem::size_of::<Scalar>()
+        + match scalar {
+            Scalar::String(value) => value.len(),
+            Scalar::Binary(value)
+            | Scalar::Bitmap(value)
+            | Scalar::Variant(value)
+            | Scalar::Geometry(value) => value.len(),
+            Scalar::Tuple(values) => values.iter().map(scalar_mem_bytes).sum(),
+            _ => 0,
+        }
+}
+
 fn compile_btree_fast_predicates(
     expr: &Expr<usize>,
     prefix_equalities: &[(usize, Scalar)],
@@ -1618,60 +1679,6 @@ fn payload_rows_to_block(
     ))
 }
 
-fn payload_rows_to_block_direct(
-    payload_fields: &[TableField],
-    rows: Vec<BtreeIndexRow>,
-) -> Result<DataBlock> {
-    let num_rows = rows.len();
-    let expected_width = payload_fields.len();
-    if payload_fields.is_empty() {
-        for row in rows {
-            let column_count = visit_btree_payload(&row.encoded_row_payload, |index, _| {
-                Err(ErrorCode::StorageOther(format!(
-                    "btree row payload has too many columns, saw column {}, expected 0",
-                    index
-                )))
-            })?;
-            if column_count != 0 {
-                return Err(ErrorCode::StorageOther(format!(
-                    "invalid btree payload width {}, expected 0",
-                    column_count
-                )));
-            }
-        }
-        return Ok(DataBlock::empty_with_rows(num_rows));
-    }
-
-    let mut builders = payload_fields
-        .iter()
-        .map(|field| ColumnBuilder::with_capacity(&DataType::from(field.data_type()), num_rows))
-        .collect::<Vec<_>>();
-    for row in rows {
-        let column_count = visit_btree_payload(&row.encoded_row_payload, |index, scalar| {
-            let Some(builder) = builders.get_mut(index) else {
-                return Err(ErrorCode::StorageOther(format!(
-                    "btree row payload has too many columns, saw column {}, expected {}",
-                    index, expected_width
-                )));
-            };
-            builder.push(scalar.as_ref());
-            Ok(())
-        })?;
-        if column_count != expected_width {
-            return Err(ErrorCode::StorageOther(format!(
-                "invalid btree payload width {}, expected {}",
-                column_count, expected_width
-            )));
-        }
-    }
-    Ok(DataBlock::new_from_columns(
-        builders
-            .into_iter()
-            .map(|builder| builder.build())
-            .collect(),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use databend_common_catalog::plan::BtreeIndexKeyColumn;
@@ -1706,35 +1713,6 @@ mod tests {
             Scalar::String("wallet-a".to_string()),
             Scalar::Number(NumberScalar::UInt64(42)),
         ]])?;
-
-        assert_eq!(block.num_rows(), 1);
-        assert_eq!(
-            block.get_by_offset(0).index(0),
-            Some(ScalarRef::String("wallet-a"))
-        );
-        assert_eq!(
-            block.get_by_offset(1).index(0),
-            Some(ScalarRef::Number(NumberScalar::UInt64(42)))
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_payload_rows_to_block_direct() -> Result<()> {
-        let wallet = TableField::new_from_column_id("wallet_address", TableDataType::String, 0);
-        let balance = TableField::new_from_column_id(
-            "balance",
-            TableDataType::Number(NumberDataType::UInt64),
-            1,
-        );
-        let rows = vec![BtreeIndexRow {
-            encoded_key: b"k1".to_vec(),
-            encoded_row_payload: encode_btree_payload(&[
-                Scalar::String("wallet-a".to_string()),
-                Scalar::Number(NumberScalar::UInt64(42)),
-            ])?,
-        }];
-        let block = payload_rows_to_block_direct(&[wallet, balance], rows)?;
 
         assert_eq!(block.num_rows(), 1);
         assert_eq!(
