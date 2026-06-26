@@ -15,7 +15,9 @@
 use std::sync::Arc;
 
 use databend_common_exception::Result;
+use databend_common_meta_app::schema::TableIndexType;
 
+use crate::MetadataRef;
 use crate::match_op;
 use crate::optimizer::ir::Matcher;
 use crate::optimizer::ir::SExpr;
@@ -42,10 +44,11 @@ use crate::plans::Visitor;
 pub struct RulePushDownSortFilterScan {
     id: RuleID,
     matchers: Vec<Matcher>,
+    metadata: MetadataRef,
 }
 
 impl RulePushDownSortFilterScan {
-    pub fn new() -> Self {
+    pub fn new(metadata: MetadataRef) -> Self {
         Self {
             id: RuleID::PushDownSortFilterScan,
             matchers: vec![
@@ -54,6 +57,7 @@ impl RulePushDownSortFilterScan {
                 // Sort -> EvalScalar -> Filter -> Scan
                 match_op!(Sort -> EvalScalar -> Filter -> Scan),
             ],
+            metadata,
         }
     }
 }
@@ -95,10 +99,25 @@ impl Rule for RulePushDownSortFilterScan {
         let push_down_predicates = scan.push_down_predicates.clone().unwrap_or_default();
         let has_inverted_index = scan.inverted_index.is_some();
         let has_vector_index = scan.vector_index.is_some();
-        if (!has_inverted_index && !has_vector_index)
+        let has_btree_index = self
+            .metadata
+            .read()
+            .table(scan.table_index)
+            .table()
+            .get_table_info()
+            .meta
+            .indexes
+            .values()
+            .any(|index| matches!(index.index_type, TableIndexType::Btree));
+        if (!has_inverted_index && !has_vector_index && !has_btree_index)
             || push_down_predicates.len() != filter.predicates.len()
             || sort.limit.is_none()
-            || !filter_contains_only_index_predicates(&filter, has_inverted_index, has_vector_index)
+            || (!has_btree_index
+                && !filter_contains_only_index_predicates(
+                    &filter,
+                    has_inverted_index,
+                    has_vector_index,
+                ))
             || scan.has_secure_predicates_not_applied_by_prewhere()
         {
             return Ok(());
@@ -130,7 +149,7 @@ impl Rule for RulePushDownSortFilterScan {
 
 impl Default for RulePushDownSortFilterScan {
     fn default() -> Self {
-        Self::new()
+        Self::new(Default::default())
     }
 }
 
