@@ -181,7 +181,11 @@ impl AsyncSource for BtreeIndexSource {
                 continue;
             }
 
-            candidates.append(&mut self.load_candidate_blocks(parts, &prefix).await?);
+            candidates.append(
+                &mut self
+                    .load_candidate_blocks(parts, &prefix, filter.as_ref())
+                    .await?,
+            );
         }
 
         let rows = self
@@ -469,7 +473,12 @@ impl BtreeIndexSource {
         &self,
         parts: Vec<PartInfoPtr>,
         prefix: &[u8],
+        filter: Option<&BtreeIndexFilter>,
     ) -> Result<Vec<BtreeIndexCandidateBlock>> {
+        let key_predicates = filter
+            .map(|filter| filter.key_predicates.clone())
+            .unwrap_or_default();
+        let prefix_component_count = self.btree_index.equality_prefix.len();
         let futures = parts.into_iter().map(|part| {
             Self::load_candidate_blocks_for_part(
                 self.operator.clone(),
@@ -478,6 +487,8 @@ impl BtreeIndexSource {
                 self.btree_index.index_version.clone(),
                 self.btree_index.use_block_btree_index_size_hint,
                 prefix.to_vec(),
+                prefix_component_count,
+                key_predicates.clone(),
             )
         });
         let candidate_batches = future::try_join_all(futures).await?;
@@ -496,6 +507,8 @@ impl BtreeIndexSource {
         index_version: String,
         use_block_btree_index_size_hint: bool,
         prefix: Vec<u8>,
+        prefix_component_count: usize,
+        key_predicates: Vec<BtreeIndexKeyPredicate>,
     ) -> Result<Vec<BtreeIndexCandidateBlock>> {
         let fuse_part = FuseBlockPartInfo::from_part(&part)?;
         let index_location =
@@ -514,6 +527,14 @@ impl BtreeIndexSource {
         Ok(meta
             .blocks_for_prefix(&prefix)
             .into_iter()
+            .filter(|block_meta| {
+                candidate_block_may_match_key_predicates(
+                    block_meta,
+                    &prefix,
+                    prefix_component_count,
+                    &key_predicates,
+                )
+            })
             .map(|block_meta| BtreeIndexCandidateBlock {
                 index_location: index_location.clone(),
                 meta: meta.clone(),
@@ -908,6 +929,97 @@ fn candidate_blocks_are_disjoint(candidates: &[BtreeIndexCandidateBlock]) -> boo
     candidates
         .windows(2)
         .all(|blocks| blocks[0].block_meta.last_key < blocks[1].block_meta.first_key)
+}
+
+fn candidate_block_may_match_key_predicates(
+    block_meta: &BtreeIndexDataBlockMeta,
+    prefix: &[u8],
+    prefix_component_count: usize,
+    key_predicates: &[BtreeIndexKeyPredicate],
+) -> bool {
+    if key_predicates.is_empty()
+        || !block_meta.first_key.starts_with(prefix)
+        || !block_meta.last_key.starts_with(prefix)
+    {
+        return true;
+    }
+
+    key_predicates
+        .iter()
+        .filter(|predicate| predicate.component_index == prefix_component_count)
+        .all(|predicate| {
+            let Some(first_component) =
+                encoded_key_component(&block_meta.first_key, predicate.component_index)
+            else {
+                return true;
+            };
+            let Some(last_component) =
+                encoded_key_component(&block_meta.last_key, predicate.component_index)
+            else {
+                return true;
+            };
+            key_component_range_may_match_predicate(predicate, first_component, last_component)
+        })
+}
+
+fn key_component_range_may_match_predicate(
+    predicate: &BtreeIndexKeyPredicate,
+    first_component: &[u8],
+    last_component: &[u8],
+) -> bool {
+    if first_component > last_component {
+        return true;
+    }
+
+    match &predicate.kind {
+        BtreeIndexKeyPredicateKind::IsNull { null_component } => {
+            component_in_range(null_component, first_component, last_component)
+        }
+        BtreeIndexKeyPredicateKind::IsNotNull { null_component } => {
+            !(first_component == null_component.as_slice()
+                && last_component == null_component.as_slice())
+        }
+        BtreeIndexKeyPredicateKind::Compare {
+            op,
+            constant_component,
+            null_component,
+        } => {
+            if first_component == null_component.as_slice()
+                && last_component == null_component.as_slice()
+            {
+                return false;
+            }
+            match op {
+                BtreeIndexFastCompareOp::Eq => {
+                    component_in_range(constant_component, first_component, last_component)
+                }
+                BtreeIndexFastCompareOp::NotEq => {
+                    first_component != constant_component.as_slice()
+                        || last_component != constant_component.as_slice()
+                }
+                BtreeIndexFastCompareOp::Gt => match predicate.order {
+                    BtreeIndexKeyOrder::Asc => last_component > constant_component.as_slice(),
+                    BtreeIndexKeyOrder::Desc => first_component < constant_component.as_slice(),
+                },
+                BtreeIndexFastCompareOp::Gte => match predicate.order {
+                    BtreeIndexKeyOrder::Asc => last_component >= constant_component.as_slice(),
+                    BtreeIndexKeyOrder::Desc => first_component <= constant_component.as_slice(),
+                },
+                BtreeIndexFastCompareOp::Lt => match predicate.order {
+                    BtreeIndexKeyOrder::Asc => first_component < constant_component.as_slice(),
+                    BtreeIndexKeyOrder::Desc => last_component > constant_component.as_slice(),
+                },
+                BtreeIndexFastCompareOp::Lte => match predicate.order {
+                    BtreeIndexKeyOrder::Asc => first_component <= constant_component.as_slice(),
+                    BtreeIndexKeyOrder::Desc => last_component >= constant_component.as_slice(),
+                },
+            }
+        }
+    }
+}
+
+fn component_in_range(component: &[u8], first_component: &[u8], last_component: &[u8]) -> bool {
+    first_component <= component && component <= last_component
 }
 
 fn compile_btree_fast_predicates(
@@ -1675,6 +1787,133 @@ mod tests {
 
         let candidates = vec![candidate_block(b"a", b"z"), candidate_block(b"m", b"n")];
         assert!(!candidate_blocks_are_disjoint(&candidates));
+    }
+
+    #[test]
+    fn test_candidate_block_pruning_uses_first_suffix_desc_range() -> Result<()> {
+        let key_field = BtreeIndexKeyField {
+            component_index: 2,
+            order: BtreeIndexKeyOrder::Desc,
+            data_type: TableDataType::Number(NumberDataType::Int64),
+        };
+        let (key_predicates, _) = split_btree_fast_predicates(
+            vec![BtreeIndexFastPredicate::Compare {
+                column: 0,
+                op: BtreeIndexFastCompareOp::Gt,
+                constant: Scalar::Number(NumberScalar::Int64(0)),
+            }],
+            &[Some(key_field)],
+        )?;
+        let prefix_key = encoded_test_key(&[
+            (
+                Scalar::Number(NumberScalar::Int64(14)),
+                BtreeIndexKeyOrder::Asc,
+            ),
+            (
+                Scalar::String("token-a".to_string()),
+                BtreeIndexKeyOrder::Asc,
+            ),
+        ])?;
+        let prefix = btree_equality_prefix(&prefix_key, 2)?;
+
+        let positive_block = candidate_block(
+            &encoded_test_key(&[
+                (
+                    Scalar::Number(NumberScalar::Int64(14)),
+                    BtreeIndexKeyOrder::Asc,
+                ),
+                (
+                    Scalar::String("token-a".to_string()),
+                    BtreeIndexKeyOrder::Asc,
+                ),
+                (
+                    Scalar::Number(NumberScalar::Int64(10)),
+                    BtreeIndexKeyOrder::Desc,
+                ),
+            ])?,
+            &encoded_test_key(&[
+                (
+                    Scalar::Number(NumberScalar::Int64(14)),
+                    BtreeIndexKeyOrder::Asc,
+                ),
+                (
+                    Scalar::String("token-a".to_string()),
+                    BtreeIndexKeyOrder::Asc,
+                ),
+                (
+                    Scalar::Number(NumberScalar::Int64(1)),
+                    BtreeIndexKeyOrder::Desc,
+                ),
+            ])?,
+        );
+        assert!(candidate_block_may_match_key_predicates(
+            &positive_block.block_meta,
+            &prefix,
+            2,
+            &key_predicates
+        ));
+
+        let non_positive_block = candidate_block(
+            &encoded_test_key(&[
+                (
+                    Scalar::Number(NumberScalar::Int64(14)),
+                    BtreeIndexKeyOrder::Asc,
+                ),
+                (
+                    Scalar::String("token-a".to_string()),
+                    BtreeIndexKeyOrder::Asc,
+                ),
+                (
+                    Scalar::Number(NumberScalar::Int64(0)),
+                    BtreeIndexKeyOrder::Desc,
+                ),
+            ])?,
+            &encoded_test_key(&[
+                (
+                    Scalar::Number(NumberScalar::Int64(14)),
+                    BtreeIndexKeyOrder::Asc,
+                ),
+                (
+                    Scalar::String("token-a".to_string()),
+                    BtreeIndexKeyOrder::Asc,
+                ),
+                (
+                    Scalar::Number(NumberScalar::Int64(-10)),
+                    BtreeIndexKeyOrder::Desc,
+                ),
+            ])?,
+        );
+        assert!(!candidate_block_may_match_key_predicates(
+            &non_positive_block.block_meta,
+            &prefix,
+            2,
+            &key_predicates
+        ));
+
+        let boundary_block = candidate_block(
+            b"before-prefix",
+            &encoded_test_key(&[
+                (
+                    Scalar::Number(NumberScalar::Int64(14)),
+                    BtreeIndexKeyOrder::Asc,
+                ),
+                (
+                    Scalar::String("token-a".to_string()),
+                    BtreeIndexKeyOrder::Asc,
+                ),
+                (
+                    Scalar::Number(NumberScalar::Int64(-10)),
+                    BtreeIndexKeyOrder::Desc,
+                ),
+            ])?,
+        );
+        assert!(candidate_block_may_match_key_predicates(
+            &boundary_block.block_meta,
+            &prefix,
+            2,
+            &key_predicates
+        ));
+        Ok(())
     }
 
     #[tokio::test]
