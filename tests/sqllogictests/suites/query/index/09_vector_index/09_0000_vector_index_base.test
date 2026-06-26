@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS t(id Int, embedding Vector(8), VECTOR INDEX idx (embe
 query TT
 SHOW CREATE TABLE t
 ----
-t CREATE TABLE t ( id INT NULL, embedding VECTOR(8) NULL, SYNC VECTOR INDEX idx (embedding) distance = 'cosine', ef_construct = '40', m = '10' ) ENGINE=FUSE
+t CREATE TABLE t ( id INT NULL, embedding VECTOR(8) NULL, VECTOR INDEX idx (embedding) WITH (distance = 'cosine', ef_construct = '40', m = '10') ) ENGINE=FUSE
 
 statement ok
 DROP VECTOR INDEX idx ON t;
@@ -33,7 +33,7 @@ DROP INVERTED INDEX idx2 ON t;
 query TT
 SHOW CREATE TABLE t
 ----
-t CREATE TABLE t ( id INT NULL, embedding VECTOR(8) NULL, SYNC VECTOR INDEX idx2 (embedding) distance = 'cosine,l1,l2', ef_construct = '40', m = '10' ) ENGINE=FUSE
+t CREATE TABLE t ( id INT NULL, embedding VECTOR(8) NULL, VECTOR INDEX idx2 (embedding) WITH (distance = 'cosine,l1,l2', ef_construct = '40', m = '10') ) ENGINE=FUSE
 
 statement ok
 INSERT INTO t VALUES
@@ -323,4 +323,3 @@ use default
 
 statement ok
 drop database test_vector_index
-

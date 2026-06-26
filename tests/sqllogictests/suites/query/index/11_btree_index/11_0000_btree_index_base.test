@@ -1,0 +1,65 @@
+statement ok
+DROP DATABASE IF EXISTS test_btree_index
+
+statement ok
+CREATE DATABASE test_btree_index
+
+statement ok
+USE test_btree_index
+
+statement ok
+CREATE TABLE t_include (
+    platform_id INT,
+    wallet_address VARCHAR,
+    last_active_time BIGINT,
+    balance DECIMAL(10, 2),
+    tag_black_hole TINYINT,
+    BTREE INDEX idx_wallet_recent (platform_id, wallet_address, last_active_time DESC)
+        INCLUDE (balance, tag_black_hole)
+        WITH (compression = 'zstd')
+) ENGINE = FUSE
+
+query TT
+SHOW CREATE TABLE t_include
+----
+t_include CREATE TABLE t_include ( platform_id INT NULL, wallet_address VARCHAR NULL, last_active_time BIGINT NULL, balance DECIMAL(10, 2) NULL, tag_black_hole TINYINT NULL, BTREE INDEX idx_wallet_recent (platform_id, wallet_address, last_active_time DESC) INCLUDE (balance, tag_black_hole) WITH (compression = 'zstd') ) ENGINE=FUSE
+
+statement ok
+CREATE TABLE t_all (
+    platform_id INT,
+    wallet_address VARCHAR,
+    last_active_time BIGINT,
+    balance DECIMAL(10, 2),
+    tag_black_hole TINYINT
+) ENGINE = FUSE
+
+statement ok
+CREATE BTREE INDEX idx_wallet_recent_all
+ON t_all(platform_id, wallet_address, last_active_time DESC)
+WITH (
+    COMPRESSION = 'ZSTD',
+    INDEX_COVERED_TYPE = 'COVERED_ALL_COLUMNS_IN_SCHEMA'
+)
+
+query TT
+SHOW CREATE TABLE t_all
+----
+t_all CREATE TABLE t_all ( platform_id INT NULL, wallet_address VARCHAR NULL, last_active_time BIGINT NULL, balance DECIMAL(10, 2) NULL, tag_black_hole TINYINT NULL, BTREE INDEX idx_wallet_recent_all (platform_id, wallet_address, last_active_time DESC) WITH (compression = 'zstd', index_covered_type = 'covered_all_columns_in_schema') ) ENGINE=FUSE
+
+statement ok
+INSERT INTO t_all VALUES
+(14, 'wallet-a', 10, 1.00, NULL),
+(14, 'wallet-a', 20, 2.00, NULL),
+(14, 'wallet-b', 30, 3.00, NULL)
+
+query IRI
+SELECT platform_id, wallet_address, last_active_time
+FROM t_all
+WHERE platform_id = 14 AND wallet_address = 'wallet-a' AND tag_black_hole IS NULL
+ORDER BY last_active_time DESC
+LIMIT 1
+----
+14 wallet-a 20
+
+statement ok
+DROP DATABASE test_btree_index

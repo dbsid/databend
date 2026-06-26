@@ -75,12 +75,10 @@ idx1 NGRAM (empty) t1(content)bloom_size='1048576' gram_size='5'
 query TT
 show create table t1;
 ----
-t1 CREATE TABLE t1 (     id INT NULL,     content VARCHAR NULL,     SYNC NGRAM INDEX idx1 (content) bloom_size = '1048576', gram_size = '5'   ) ENGINE=FUSE
+t1 CREATE TABLE t1 (     id INT NULL,     content VARCHAR NULL,     NGRAM INDEX idx1 (content) WITH (bloom_size = '1048576', gram_size = '5')   ) ENGINE=FUSE
 
 statement ok
 use default
 
 statement ok
 drop database test_gram_index
-
-

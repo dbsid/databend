@@ -26,6 +26,8 @@ use databend_common_expression::BlockEntry;
 use databend_common_expression::ComputedExpr;
 use databend_common_expression::DataBlock;
 use databend_common_expression::types::StringType;
+use databend_common_meta_app::schema::TableIndexColumnOrder;
+use databend_common_meta_app::schema::TableIndexType;
 use databend_common_meta_app::schema::TableInfo;
 use databend_common_sql::ClusterKeyNormalizer;
 use databend_common_sql::plans::ShowCreateTablePlan;
@@ -241,23 +243,59 @@ impl ShowCreateTableInterpreter {
 
             for index_field in table_info.meta.indexes.values() {
                 let sync = if index_field.sync_creation {
-                    "SYNC"
+                    ""
                 } else {
-                    "ASYNC"
+                    "ASYNC "
                 };
-                let mut column_names = Vec::with_capacity(index_field.column_ids.len());
-                for column_id in index_field.column_ids.iter() {
-                    let field = schema.field_of_column_id(*column_id)?;
-                    column_names.push(field.name().to_string());
-                }
+                let column_names = if index_field.index_type == TableIndexType::Btree
+                    && !index_field.key_columns.is_empty()
+                {
+                    index_field
+                        .key_columns
+                        .iter()
+                        .map(|column| {
+                            let field = schema.field_of_column_id(column.column_id)?;
+                            Ok(match column.order {
+                                TableIndexColumnOrder::Asc => field.name().to_string(),
+                                TableIndexColumnOrder::Desc => format!("{} DESC", field.name()),
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    index_field
+                        .column_ids
+                        .iter()
+                        .map(|column_id| {
+                            let field = schema.field_of_column_id(*column_id)?;
+                            Ok(field.name().to_string())
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                };
                 let column_names_str = column_names.join(", ").to_string();
+                let include_columns = if index_field.index_type == TableIndexType::Btree
+                    && !index_field.include_column_ids.is_empty()
+                {
+                    Some(
+                        index_field
+                            .include_column_ids
+                            .iter()
+                            .map(|column_id| {
+                                let field = schema.field_of_column_id(*column_id)?;
+                                Ok(field.name().to_string())
+                            })
+                            .collect::<Result<Vec<_>>>()?
+                            .join(", "),
+                    )
+                } else {
+                    None
+                };
                 let mut options = Vec::with_capacity(index_field.options.len());
                 for (key, value) in index_field.options.iter() {
                     let option = format!("{} = '{}'", key, value);
                     options.push(option);
                 }
                 let mut index_str = format!(
-                    "  {} {} INDEX {} ({})",
+                    "  {}{} INDEX {} ({})",
                     sync,
                     index_field.index_type,
                     display_ident(
@@ -268,10 +306,12 @@ impl ShowCreateTableInterpreter {
                     ),
                     column_names_str
                 );
+                if let Some(include_columns) = include_columns {
+                    index_str.push_str(&format!(" INCLUDE ({include_columns})"));
+                }
                 if !options.is_empty() {
                     let options_str = options.join(", ").to_string();
-                    index_str.push(' ');
-                    index_str.push_str(&options_str);
+                    index_str.push_str(&format!(" WITH ({options_str})"));
                 }
                 create_defs.push(index_str);
             }

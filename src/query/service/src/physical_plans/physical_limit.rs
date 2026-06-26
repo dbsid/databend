@@ -14,6 +14,7 @@
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use databend_common_catalog::plan::DataSourcePlan;
 use databend_common_exception::ErrorCode;
@@ -139,12 +140,14 @@ impl PhysicalPlanBuilder {
     ) -> Result<PhysicalPlan> {
         // 1. Prune unused Columns.
         // Apply lazy.
+        let original_required = required.clone();
         let metadata = self.metadata.read().clone();
 
         let support_lazy_materialize = s_expr.child(0)?.support_lazy_materialize();
-        if !limit.lazy_columns.is_empty() && support_lazy_materialize {
+        let mut lazy_columns = limit.lazy_columns.clone();
+        if !lazy_columns.is_empty() && support_lazy_materialize {
             required = required
-                .difference(&limit.lazy_columns)
+                .difference(&lazy_columns)
                 .cloned()
                 .collect::<ColumnSet>();
 
@@ -153,10 +156,17 @@ impl PhysicalPlanBuilder {
 
         // 2. Build physical plan.
         let mut input_plan = self.build(s_expr.child(0)?, required).await?;
+        if !lazy_columns.is_empty()
+            && support_lazy_materialize
+            && btree_index_covers_lazy_columns(&input_plan, &lazy_columns, &metadata)
+        {
+            lazy_columns.clear();
+            input_plan = self.build(s_expr.child(0)?, original_required).await?;
+        }
         if let Some(count) = limit.limit {
             self.try_apply_presorted_merge_for_limit(&mut input_plan, count + limit.offset);
         }
-        if limit.before_exchange || limit.lazy_columns.is_empty() || !support_lazy_materialize {
+        if limit.before_exchange || lazy_columns.is_empty() || !support_lazy_materialize {
             return Ok(PhysicalPlan::new(Limit {
                 input: input_plan,
                 limit: limit.limit,
@@ -183,7 +193,7 @@ impl PhysicalPlanBuilder {
         // See the case in tests/sqllogictests/suites/crdb/limit:
         // SELECT * FROM (SELECT * FROM t_47283 ORDER BY k LIMIT 4) WHERE a > 5 LIMIT 1
         let mut lazy_columns_by_table: HashMap<IndexType, Vec<Symbol>> = HashMap::new();
-        for index in limit.lazy_columns.iter() {
+        for index in lazy_columns.iter() {
             if input_schema.has_field(&index.to_string()) {
                 continue;
             }
@@ -305,5 +315,54 @@ impl PhysicalPlanBuilder {
         }
 
         Ok(plan)
+    }
+}
+
+fn btree_index_covers_lazy_columns(
+    plan: &PhysicalPlan,
+    lazy_columns: &ColumnSet,
+    metadata: &databend_common_sql::Metadata,
+) -> bool {
+    let mut btree_payloads_by_table = HashMap::new();
+    collect_btree_index_payloads(plan, &mut btree_payloads_by_table);
+    if btree_payloads_by_table.is_empty() {
+        return false;
+    }
+
+    lazy_columns.iter().all(|index| {
+        let ColumnEntry::BaseTableColumn(column) = metadata.column(*index) else {
+            return false;
+        };
+        if column.path_indices.is_some() {
+            return false;
+        }
+        btree_payloads_by_table
+            .get(&column.table_index)
+            .is_some_and(|payloads| payloads.contains(column.column_name.as_str()))
+    })
+}
+
+fn collect_btree_index_payloads(
+    plan: &PhysicalPlan,
+    payloads_by_table: &mut HashMap<IndexType, HashSet<String>>,
+) {
+    if let Some(scan) = crate::physical_plans::TableScan::from_physical_plan(plan)
+        && let Some(table_index) = scan.table_index
+        && let Some(btree_index) = scan
+            .source
+            .push_downs
+            .as_ref()
+            .and_then(|push_downs| push_downs.btree_index.as_ref())
+    {
+        let payloads = payloads_by_table.entry(table_index).or_default();
+        payloads.extend(
+            btree_index
+                .payload_fields
+                .iter()
+                .map(|field| field.name().to_string()),
+        );
+    }
+    for child in plan.children() {
+        collect_btree_index_payloads(child, payloads_by_table);
     }
 }
