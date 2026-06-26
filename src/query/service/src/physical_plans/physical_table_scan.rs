@@ -964,6 +964,8 @@ impl PhysicalPlanBuilder {
         for predicate in scan.push_down_predicates.as_deref().unwrap_or_default() {
             collect_btree_prefix_column_constants(predicate, &mut prefix_constants_by_column);
         }
+        let filter_column_names = btree_filter_column_names(filters.as_ref());
+        let mut best_candidate: Option<(BtreeIndexCandidateScore, BtreeIndexInfo)> = None;
 
         for index in table_meta.indexes.values() {
             if !matches!(index.index_type, TableIndexType::Btree) {
@@ -1047,6 +1049,12 @@ impl PhysicalPlanBuilder {
             if !order_matches {
                 continue;
             }
+            let extra_filter_key_columns = btree_extra_filter_key_column_count(
+                table_meta,
+                &key_columns,
+                prefix_len + order_by.len(),
+                &filter_column_names,
+            );
 
             if !scan
                 .columns
@@ -1086,19 +1094,38 @@ impl PhysicalPlanBuilder {
             }
 
             let _ = table_schema;
-            return Ok(Some(BtreeIndexInfo {
+            let btree_index_info = BtreeIndexInfo {
                 index_name: index.name.clone(),
                 index_version: index.version.clone(),
                 key_columns: btree_key_columns,
                 payload_fields,
                 equality_prefix: prefix_values,
                 limit: scan.limit,
-                filters,
+                filters: filters.clone(),
                 use_block_btree_index_size_hint: btree_index_count == 1,
-            }));
+            };
+            let score = BtreeIndexCandidateScore {
+                prefix_len,
+                extra_filter_key_columns,
+                payload_width: btree_index_info.payload_fields.len(),
+                key_width: btree_index_info.key_columns.len(),
+            };
+            if best_candidate
+                .as_ref()
+                .is_none_or(|(best_score, best_index)| {
+                    btree_candidate_score_is_better(
+                        &score,
+                        &btree_index_info.index_name,
+                        best_score,
+                        &best_index.index_name,
+                    )
+                })
+            {
+                best_candidate = Some((score, btree_index_info));
+            }
         }
 
-        Ok(None)
+        Ok(best_candidate.map(|(_, index)| index))
     }
 
     fn create_scan_push_down_filters(
@@ -1407,6 +1434,72 @@ fn btree_filters_are_covered(
         .all(|name| covered_columns.contains(name))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BtreeIndexCandidateScore {
+    prefix_len: usize,
+    extra_filter_key_columns: usize,
+    payload_width: usize,
+    key_width: usize,
+}
+
+fn btree_filter_column_names(filters: Option<&Filters>) -> HashSet<String> {
+    filters
+        .map(|filters| {
+            filters
+                .filter
+                .as_expr(&BUILTIN_FUNCTIONS)
+                .column_refs()
+                .keys()
+                .map(|name| name.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn btree_extra_filter_key_column_count(
+    table_meta: &databend_common_meta_app::schema::TableMeta,
+    key_columns: &[TableIndexColumn],
+    first_extra_key_index: usize,
+    filter_column_names: &HashSet<String>,
+) -> usize {
+    if filter_column_names.is_empty() {
+        return 0;
+    }
+
+    key_columns
+        .iter()
+        .skip(first_extra_key_index)
+        .filter_map(|key_column| {
+            table_meta
+                .schema
+                .field_of_column_id(key_column.column_id)
+                .ok()
+        })
+        .filter(|field| filter_column_names.contains(field.name()))
+        .count()
+}
+
+fn btree_candidate_score_is_better(
+    candidate: &BtreeIndexCandidateScore,
+    candidate_name: &str,
+    best: &BtreeIndexCandidateScore,
+    best_name: &str,
+) -> bool {
+    if candidate.prefix_len != best.prefix_len {
+        return candidate.prefix_len > best.prefix_len;
+    }
+    if candidate.extra_filter_key_columns != best.extra_filter_key_columns {
+        return candidate.extra_filter_key_columns > best.extra_filter_key_columns;
+    }
+    if candidate.payload_width != best.payload_width {
+        return candidate.payload_width < best.payload_width;
+    }
+    if candidate.key_width != best.key_width {
+        return candidate.key_width < best.key_width;
+    }
+    candidate_name < best_name
+}
+
 fn key_order_is_asc(order: &TableIndexColumnOrder) -> bool {
     matches!(order, TableIndexColumnOrder::Asc)
 }
@@ -1566,6 +1659,75 @@ mod tests {
             extract_btree_prefix_column_constant(&is_not_null(test_column("tag_sniper", tag))),
             None
         );
+    }
+
+    #[test]
+    fn test_btree_candidate_score_prefers_longer_prefix() {
+        let shorter_payload = BtreeIndexCandidateScore {
+            prefix_len: 2,
+            extra_filter_key_columns: 0,
+            payload_width: 3,
+            key_width: 3,
+        };
+        let longer_prefix = BtreeIndexCandidateScore {
+            prefix_len: 3,
+            extra_filter_key_columns: 0,
+            payload_width: 20,
+            key_width: 4,
+        };
+
+        assert!(btree_candidate_score_is_better(
+            &longer_prefix,
+            "idx_longer_prefix",
+            &shorter_payload,
+            "idx_shorter_payload"
+        ));
+    }
+
+    #[test]
+    fn test_btree_candidate_score_prefers_extra_filter_key_columns() {
+        let no_extra_filter_keys = BtreeIndexCandidateScore {
+            prefix_len: 2,
+            extra_filter_key_columns: 0,
+            payload_width: 3,
+            key_width: 3,
+        };
+        let with_extra_filter_keys = BtreeIndexCandidateScore {
+            prefix_len: 2,
+            extra_filter_key_columns: 2,
+            payload_width: 10,
+            key_width: 5,
+        };
+
+        assert!(btree_candidate_score_is_better(
+            &with_extra_filter_keys,
+            "idx_with_tags",
+            &no_extra_filter_keys,
+            "idx_plain"
+        ));
+    }
+
+    #[test]
+    fn test_btree_candidate_score_prefers_narrower_payload_on_tie() {
+        let wide_payload = BtreeIndexCandidateScore {
+            prefix_len: 2,
+            extra_filter_key_columns: 1,
+            payload_width: 20,
+            key_width: 5,
+        };
+        let narrow_payload = BtreeIndexCandidateScore {
+            prefix_len: 2,
+            extra_filter_key_columns: 1,
+            payload_width: 8,
+            key_width: 5,
+        };
+
+        assert!(btree_candidate_score_is_better(
+            &narrow_payload,
+            "idx_narrow",
+            &wide_payload,
+            "idx_wide"
+        ));
     }
 
     fn test_column(name: &str, index: Symbol) -> ScalarExpr {
