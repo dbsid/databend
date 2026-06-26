@@ -469,6 +469,8 @@ impl BtreeIndexSource {
         rows: &[&BtreeIndexRow],
         filter: &BtreeIndexFilter,
         limit: Option<usize>,
+        key_predicate_start_component: usize,
+        key_predicate_start_offset: usize,
     ) -> Result<Vec<BtreeIndexRow>> {
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -478,12 +480,22 @@ impl BtreeIndexSource {
         if let Some(predicates) = &filter.fast_predicates {
             let filtered_rows = if predicates.is_empty() {
                 clone_matching_row_refs(rows, limit, |row| {
-                    evaluate_btree_key_predicates(&filter.key_predicates, &row.encoded_key)
+                    evaluate_btree_key_predicates_from(
+                        &filter.key_predicates,
+                        &row.encoded_key,
+                        key_predicate_start_component,
+                        key_predicate_start_offset,
+                    )
                 })
             } else {
                 let mut filtered_rows = Vec::new();
                 for row in rows {
-                    if !evaluate_btree_key_predicates(&filter.key_predicates, &row.encoded_key) {
+                    if !evaluate_btree_key_predicates_from(
+                        &filter.key_predicates,
+                        &row.encoded_key,
+                        key_predicate_start_component,
+                        key_predicate_start_offset,
+                    ) {
                         continue;
                     }
                     let payload_row = decode_btree_payload_projection(
@@ -776,7 +788,19 @@ impl BtreeIndexSource {
         let mut rows = btree_prefix_row_refs(&rows, prefix);
         truncate_row_refs_before_key(&mut rows, upper_bound_key);
         let rows = if let Some(filter) = filter {
-            self.filter_index_row_refs(&rows, filter, limit)?
+            let (key_predicate_start_component, key_predicate_start_offset) =
+                btree_key_predicate_scan_start(
+                    filter,
+                    prefix,
+                    self.btree_index.equality_prefix.len(),
+                );
+            self.filter_index_row_refs(
+                &rows,
+                filter,
+                limit,
+                key_predicate_start_component,
+                key_predicate_start_offset,
+            )?
         } else {
             clone_row_refs(&rows, limit)
         };
@@ -1053,6 +1077,22 @@ fn truncate_row_refs_before_key(rows: &mut Vec<&BtreeIndexRow>, upper_bound_key:
 
     let end = rows.partition_point(|row| row.encoded_key.as_slice() < upper_bound_key);
     rows.truncate(end);
+}
+
+fn btree_key_predicate_scan_start(
+    filter: &BtreeIndexFilter,
+    prefix: &[u8],
+    prefix_component_count: usize,
+) -> (usize, usize) {
+    if filter
+        .key_predicates
+        .iter()
+        .all(|predicate| predicate.component_index >= prefix_component_count)
+    {
+        (prefix_component_count, prefix.len())
+    } else {
+        (0, 0)
+    }
 }
 
 fn clone_row_refs(rows: &[&BtreeIndexRow], limit: Option<usize>) -> Vec<BtreeIndexRow> {
@@ -1369,17 +1409,29 @@ fn evaluate_btree_fast_predicates(
         .all(|predicate| evaluate_btree_fast_predicate(predicate, payload_row))
 }
 
+#[cfg(test)]
 fn evaluate_btree_key_predicates(
     predicates: &[BtreeIndexKeyPredicate],
     encoded_key: &[u8],
+) -> bool {
+    evaluate_btree_key_predicates_from(predicates, encoded_key, 0, 0)
+}
+
+fn evaluate_btree_key_predicates_from(
+    predicates: &[BtreeIndexKeyPredicate],
+    encoded_key: &[u8],
+    mut component_index: usize,
+    mut offset: usize,
 ) -> bool {
     if predicates.is_empty() {
         return true;
     }
 
-    let mut offset = 0usize;
-    let mut component_index = 0usize;
     let mut predicate_index = 0usize;
+    if predicates[predicate_index].component_index < component_index {
+        component_index = 0;
+        offset = 0;
+    }
     while predicate_index < predicates.len() {
         let len_bytes = match encoded_key.get(offset..offset + 4) {
             Some(len_bytes) => len_bytes,
@@ -1743,7 +1795,7 @@ mod tests {
         };
 
         let row_refs = rows.iter().collect::<Vec<_>>();
-        let rows = source.filter_index_row_refs(&row_refs, &filter, None)?;
+        let rows = source.filter_index_row_refs(&row_refs, &filter, None, 0, 0)?;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].encoded_key.as_slice(), b"k2");
         Ok(())
@@ -1844,7 +1896,7 @@ mod tests {
         };
 
         let row_refs = rows.iter().collect::<Vec<_>>();
-        let rows = source.filter_index_row_refs(&row_refs, &filter, None)?;
+        let rows = source.filter_index_row_refs(&row_refs, &filter, None, 0, 0)?;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].encoded_key.as_slice(), b"k3");
         Ok(())
@@ -2025,6 +2077,62 @@ mod tests {
             ),
         ])?;
         assert!(!evaluate_btree_key_predicates(&key_predicates, &key));
+        Ok(())
+    }
+
+    #[test]
+    fn test_key_predicate_evaluates_from_equality_prefix() -> Result<()> {
+        let key_field = BtreeIndexKeyField {
+            component_index: 1,
+            order: BtreeIndexKeyOrder::Asc,
+            data_type: TableDataType::Number(NumberDataType::Int8),
+        };
+        let (key_predicates, payload_predicates) = split_btree_fast_predicates(
+            vec![BtreeIndexFastPredicate::Compare {
+                column: 1,
+                op: BtreeIndexFastCompareOp::Gt,
+                constant: Scalar::Number(NumberScalar::Int64(0)),
+            }],
+            &[None, Some(key_field)],
+        )?;
+        assert_eq!(key_predicates.len(), 1);
+        assert_eq!(payload_predicates.unwrap().len(), 0);
+
+        let key = encoded_test_key(&[
+            (
+                Scalar::String("token-a".to_string()),
+                BtreeIndexKeyOrder::Asc,
+            ),
+            (
+                Scalar::Number(NumberScalar::Int8(1)),
+                BtreeIndexKeyOrder::Asc,
+            ),
+        ])?;
+        let prefix = btree_equality_prefix(&key, 1)?;
+        assert!(evaluate_btree_key_predicates_from(
+            &key_predicates,
+            &key,
+            1,
+            prefix.len()
+        ));
+
+        let key = encoded_test_key(&[
+            (
+                Scalar::String("token-a".to_string()),
+                BtreeIndexKeyOrder::Asc,
+            ),
+            (
+                Scalar::Number(NumberScalar::Int8(0)),
+                BtreeIndexKeyOrder::Asc,
+            ),
+        ])?;
+        let prefix = btree_equality_prefix(&key, 1)?;
+        assert!(!evaluate_btree_key_predicates_from(
+            &key_predicates,
+            &key,
+            1,
+            prefix.len()
+        ));
         Ok(())
     }
 
