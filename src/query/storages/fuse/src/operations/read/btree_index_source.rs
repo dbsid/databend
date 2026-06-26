@@ -58,6 +58,8 @@ use crate::io::TableMetaLocationGenerator;
 use crate::io::load_btree_index_data_block;
 use crate::io::load_btree_index_meta;
 
+const BTREE_INDEX_DATA_BLOCK_READ_BATCH_SIZE: usize = 32;
+
 pub fn build_btree_index_source_pipeline(
     ctx: Arc<dyn TableContext>,
     operator: Operator,
@@ -67,8 +69,7 @@ pub fn build_btree_index_source_pipeline(
     max_threads: usize,
     receiver: Option<Receiver<Result<PartInfoPtr>>>,
 ) -> Result<()> {
-    let _ = max_threads;
-    let max_threads = 1;
+    let max_threads = max_threads.max(1);
     let partitions =
         crate::operations::read::fuse_source::dispatch_partitions(ctx.clone(), plan, max_threads);
     let partitions = StealablePartitions::new(partitions, ctx.clone());
@@ -387,40 +388,62 @@ impl BtreeIndexSource {
     ) -> Result<Vec<BtreeIndexRow>> {
         let Some(limit) = self.btree_index.limit else {
             let mut rows = Vec::new();
-            for candidate in candidates {
-                let mut block_rows = self
-                    .read_candidate_block(&candidate, prefix, filter, None)
-                    .await?;
-                rows.append(&mut block_rows);
+            for batch in candidates.chunks(BTREE_INDEX_DATA_BLOCK_READ_BATCH_SIZE) {
+                for mut block_rows in self
+                    .read_candidate_blocks_batch(batch, prefix, filter, None)
+                    .await?
+                {
+                    rows.append(&mut block_rows);
+                }
             }
             rows.sort_by(|left, right| left.encoded_key.cmp(&right.encoded_key));
             return Ok(rows);
         };
 
         let mut rows = Vec::new();
-        let mut candidates = candidates.into_iter().peekable();
-        while let Some(candidate) = candidates.next() {
-            let remaining = limit.saturating_sub(rows.len());
-            if remaining == 0 {
-                return Ok(rows);
+        let mut candidate_offset = 0;
+        let mut batch_size = 1;
+        while candidate_offset < candidates.len() {
+            let batch_end = (candidate_offset + batch_size).min(candidates.len());
+            for mut block_rows in self
+                .read_candidate_blocks_batch(
+                    &candidates[candidate_offset..batch_end],
+                    prefix,
+                    filter,
+                    Some(limit),
+                )
+                .await?
+            {
+                rows.append(&mut block_rows);
             }
-            let mut block_rows = self
-                .read_candidate_block(&candidate, prefix, filter, Some(limit))
-                .await?;
-            rows.append(&mut block_rows);
+            candidate_offset = batch_end;
 
             if rows.len() >= limit {
                 sort_and_truncate_rows(&mut rows, limit);
-                if candidates.peek().is_none_or(|next| {
+                if candidates.get(candidate_offset).is_none_or(|next| {
                     next.block_meta.first_key.as_slice()
                         >= rows[rows.len() - 1].encoded_key.as_slice()
                 }) {
                     return Ok(rows);
                 }
             }
+            batch_size = BTREE_INDEX_DATA_BLOCK_READ_BATCH_SIZE;
         }
         sort_and_truncate_rows(&mut rows, limit);
         Ok(rows)
+    }
+
+    async fn read_candidate_blocks_batch(
+        &self,
+        candidates: &[BtreeIndexCandidateBlock],
+        prefix: &[u8],
+        filter: Option<&Expr<usize>>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Vec<BtreeIndexRow>>> {
+        let futures = candidates
+            .iter()
+            .map(|candidate| self.read_candidate_block(candidate, prefix, filter, limit));
+        future::try_join_all(futures).await
     }
 
     async fn read_candidate_block(
