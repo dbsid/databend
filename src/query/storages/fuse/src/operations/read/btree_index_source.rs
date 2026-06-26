@@ -13,8 +13,11 @@
 // limitations under the License.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_channel::Receiver;
+use databend_common_base::runtime::profile::Profile;
+use databend_common_base::runtime::profile::ProfileStatisticsName;
 use databend_common_catalog::plan::BtreeIndexColumnOrder;
 use databend_common_catalog::plan::BtreeIndexInfo;
 use databend_common_catalog::plan::DataSourcePlan;
@@ -175,10 +178,15 @@ impl AsyncSource for BtreeIndexSource {
         if rows.is_empty() {
             return Ok(None);
         }
+        let decode_start = Instant::now();
         let mut decoded_rows = Vec::with_capacity(rows.len());
         for row in rows {
             decoded_rows.push(decode_btree_payload(&row.encoded_row_payload)?);
         }
+        record_elapsed(
+            ProfileStatisticsName::BtreeIndexPayloadDecodeTime,
+            decode_start,
+        );
 
         let mut block = payload_rows_to_block(&self.btree_index.payload_fields, decoded_rows)?;
         block = block.resort(&self.payload_schema, &self.output_schema)?;
@@ -228,6 +236,7 @@ impl BtreeIndexSource {
             return Ok(rows);
         }
 
+        let start = Instant::now();
         let payload_rows = rows
             .iter()
             .map(|row| decode_btree_payload(&row.encoded_row_payload))
@@ -239,17 +248,19 @@ impl BtreeIndexSource {
             .try_downcast::<BooleanType>()
             .unwrap();
 
-        match filter {
-            databend_common_expression::Value::Scalar(true) => Ok(truncate_rows(rows, limit)),
-            databend_common_expression::Value::Scalar(false) => Ok(Vec::new()),
-            databend_common_expression::Value::Column(bitmap) => Ok(truncate_rows(
+        let filtered_rows = match filter {
+            databend_common_expression::Value::Scalar(true) => truncate_rows(rows, limit),
+            databend_common_expression::Value::Scalar(false) => Vec::new(),
+            databend_common_expression::Value::Column(bitmap) => truncate_rows(
                 rows.into_iter()
                     .enumerate()
                     .filter_map(|(idx, row)| bitmap.get_bit(idx).then_some(row))
                     .collect(),
                 limit,
-            )),
-        }
+            ),
+        };
+        record_elapsed(ProfileStatisticsName::BtreeIndexFilterTime, start);
+        Ok(filtered_rows)
     }
 
     async fn load_candidate_blocks(
@@ -268,7 +279,12 @@ impl BtreeIndexSource {
             )
         });
         let candidate_batches = future::try_join_all(futures).await?;
-        Ok(candidate_batches.into_iter().flatten().collect())
+        let candidates = candidate_batches.into_iter().flatten().collect::<Vec<_>>();
+        Profile::record_usize_profile(
+            ProfileStatisticsName::BtreeIndexCandidateBlocks,
+            candidates.len(),
+        );
+        Ok(candidates)
     }
 
     async fn load_candidate_blocks_for_part(
@@ -421,12 +437,20 @@ impl BtreeIndexSource {
             &candidate.block_meta,
         )
         .await?;
+        Profile::record_usize_profile(ProfileStatisticsName::BtreeIndexRowsDecoded, rows.len());
         rows.retain(|row| row.encoded_key.starts_with(prefix));
-        if let Some(filter) = filter {
-            return self.filter_index_rows(rows, filter, limit);
-        }
-        Ok(truncate_rows(rows, limit))
+        let rows = if let Some(filter) = filter {
+            self.filter_index_rows(rows, filter, limit)?
+        } else {
+            truncate_rows(rows, limit)
+        };
+        Profile::record_usize_profile(ProfileStatisticsName::BtreeIndexRowsMatched, rows.len());
+        Ok(rows)
     }
+}
+
+fn record_elapsed(name: ProfileStatisticsName, start: Instant) {
+    Profile::record_usize_profile(name, start.elapsed().as_nanos() as usize);
 }
 
 fn truncate_rows(mut rows: Vec<BtreeIndexRow>, limit: Option<usize>) -> Vec<BtreeIndexRow> {

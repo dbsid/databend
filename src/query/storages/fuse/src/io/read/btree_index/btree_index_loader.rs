@@ -15,6 +15,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use databend_common_base::runtime::profile::Profile;
+use databend_common_base::runtime::profile::ProfileStatisticsName;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_storages_common_cache::CacheAccessor;
@@ -87,11 +89,13 @@ pub async fn load_btree_index_meta(
     location: &str,
     len_hint: Option<u64>,
 ) -> Result<Arc<BtreeIndexFileMeta>> {
+    let start = Instant::now();
     let meta_cache = CacheManager::instance().get_btree_index_meta_cache();
     if let Some(meta) = match len_hint {
         Some(len) => meta_cache.get_sized(location, len),
         None => meta_cache.get(location),
     } {
+        record_elapsed(ProfileStatisticsName::BtreeIndexMetaLoadTime, start);
         return Ok(meta);
     }
 
@@ -107,7 +111,9 @@ pub async fn load_btree_index_meta(
             index_block: view.index_block().clone(),
             filter_block: view.filter_block().clone(),
         };
-        return Ok(meta_cache.insert(location.to_string(), meta));
+        let meta = meta_cache.insert(location.to_string(), meta);
+        record_elapsed(ProfileStatisticsName::BtreeIndexMetaLoadTime, start);
+        return Ok(meta);
     }
 
     let file_len = if let Some(len) = len_hint {
@@ -172,7 +178,9 @@ pub async fn load_btree_index_meta(
     )
     .await?;
     let meta = BtreeIndexFileMeta::from_sections(footer, index_block, filter_block)?;
-    Ok(meta_cache.insert(location.to_string(), meta))
+    let meta = meta_cache.insert(location.to_string(), meta);
+    record_elapsed(ProfileStatisticsName::BtreeIndexMetaLoadTime, start);
+    Ok(meta)
 }
 
 pub async fn load_btree_index_data_block(
@@ -184,9 +192,13 @@ pub async fn load_btree_index_data_block(
     let cache_key = format!("{}#{}+{}", location, block_meta.offset, block_meta.length);
     let cache = CacheManager::instance().get_btree_index_file_cache();
     if let Some(block) = cache.get_sized(&cache_key, block_meta.length) {
-        return meta.decode_data_block(block_meta, block.data.as_ref());
+        let start = Instant::now();
+        let rows = meta.decode_data_block(block_meta, block.data.as_ref())?;
+        record_elapsed(ProfileStatisticsName::BtreeIndexDataBlockDecodeTime, start);
+        return Ok(rows);
     }
 
+    let read_start = Instant::now();
     let bytes = read_range(
         operator,
         location,
@@ -194,9 +206,19 @@ pub async fn load_btree_index_data_block(
         "btree data block",
     )
     .await?;
+    record_elapsed(
+        ProfileStatisticsName::BtreeIndexDataBlockReadTime,
+        read_start,
+    );
     let block = BtreeIndexFile::create(cache_key.clone(), bytes);
     let block = cache.insert(cache_key, block);
-    meta.decode_data_block(block_meta, block.data.as_ref())
+    let decode_start = Instant::now();
+    let rows = meta.decode_data_block(block_meta, block.data.as_ref())?;
+    record_elapsed(
+        ProfileStatisticsName::BtreeIndexDataBlockDecodeTime,
+        decode_start,
+    );
+    Ok(rows)
 }
 
 async fn read_range(
@@ -213,6 +235,10 @@ async fn read_range(
             ErrorCode::StorageOther(format!("read {label} failed, {}, {:?}", location, err))
         })
         .map(|data| data.to_bytes())
+}
+
+fn record_elapsed(name: ProfileStatisticsName, start: Instant) {
+    Profile::record_usize_profile(name, start.elapsed().as_nanos() as usize);
 }
 
 #[cfg(test)]

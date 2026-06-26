@@ -66,6 +66,15 @@ pub enum ProfileStatisticsName {
     MemoryUsage,
     ExternalServerRetryCount,
     ExternalServerRequestCount,
+
+    BtreeIndexMetaLoadTime,
+    BtreeIndexDataBlockReadTime,
+    BtreeIndexDataBlockDecodeTime,
+    BtreeIndexPayloadDecodeTime,
+    BtreeIndexFilterTime,
+    BtreeIndexCandidateBlocks,
+    BtreeIndexRowsDecoded,
+    BtreeIndexRowsMatched,
 }
 
 #[derive(Clone, Hash, Eq, PartialEq, serde::Serialize, serde::Deserialize, Debug)]
@@ -374,6 +383,62 @@ pub fn get_statistics_desc() -> Arc<BTreeMap<ProfileStatisticsName, ProfileDesc>
                 desc: "The count of external server request times",
                 index: ProfileStatisticsName::ExternalServerRequestCount as usize,
                 unit: StatisticsUnit::Count,
+                plain_statistics: true,
+            }),
+            (ProfileStatisticsName::BtreeIndexMetaLoadTime, ProfileDesc {
+                display_name: "btree index meta load time",
+                desc: "Time spent loading BTREE index footer, filter block, and index block",
+                index: ProfileStatisticsName::BtreeIndexMetaLoadTime as usize,
+                unit: StatisticsUnit::NanoSeconds,
+                plain_statistics: false,
+            }),
+            (ProfileStatisticsName::BtreeIndexDataBlockReadTime, ProfileDesc {
+                display_name: "btree index data block read time",
+                desc: "Time spent reading BTREE index data blocks",
+                index: ProfileStatisticsName::BtreeIndexDataBlockReadTime as usize,
+                unit: StatisticsUnit::NanoSeconds,
+                plain_statistics: false,
+            }),
+            (ProfileStatisticsName::BtreeIndexDataBlockDecodeTime, ProfileDesc {
+                display_name: "btree index data block decode time",
+                desc: "Time spent decoding BTREE index data blocks",
+                index: ProfileStatisticsName::BtreeIndexDataBlockDecodeTime as usize,
+                unit: StatisticsUnit::NanoSeconds,
+                plain_statistics: false,
+            }),
+            (ProfileStatisticsName::BtreeIndexPayloadDecodeTime, ProfileDesc {
+                display_name: "btree index payload decode time",
+                desc: "Time spent decoding BTREE index row payloads",
+                index: ProfileStatisticsName::BtreeIndexPayloadDecodeTime as usize,
+                unit: StatisticsUnit::NanoSeconds,
+                plain_statistics: false,
+            }),
+            (ProfileStatisticsName::BtreeIndexFilterTime, ProfileDesc {
+                display_name: "btree index filter time",
+                desc: "Time spent applying filters to BTREE index payload rows",
+                index: ProfileStatisticsName::BtreeIndexFilterTime as usize,
+                unit: StatisticsUnit::NanoSeconds,
+                plain_statistics: false,
+            }),
+            (ProfileStatisticsName::BtreeIndexCandidateBlocks, ProfileDesc {
+                display_name: "btree index candidate blocks",
+                desc: "The number of candidate BTREE index data blocks selected by prefix pruning",
+                index: ProfileStatisticsName::BtreeIndexCandidateBlocks as usize,
+                unit: StatisticsUnit::Count,
+                plain_statistics: true,
+            }),
+            (ProfileStatisticsName::BtreeIndexRowsDecoded, ProfileDesc {
+                display_name: "btree index rows decoded",
+                desc: "The number of BTREE index rows decoded from data blocks",
+                index: ProfileStatisticsName::BtreeIndexRowsDecoded as usize,
+                unit: StatisticsUnit::Rows,
+                plain_statistics: true,
+            }),
+            (ProfileStatisticsName::BtreeIndexRowsMatched, ProfileDesc {
+                display_name: "btree index rows matched",
+                desc: "The number of BTREE index rows kept after prefix and payload filters",
+                index: ProfileStatisticsName::BtreeIndexRowsMatched as usize,
+                unit: StatisticsUnit::Rows,
                 plain_statistics: true,
             }),
         ]))
