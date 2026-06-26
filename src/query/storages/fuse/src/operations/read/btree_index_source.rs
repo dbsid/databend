@@ -39,8 +39,12 @@ use databend_common_expression::TableDataType;
 use databend_common_expression::TableField;
 use databend_common_expression::types::BooleanType;
 use databend_common_expression::types::DataType;
+use databend_common_expression::types::Decimal;
+use databend_common_expression::types::DecimalDataType;
+use databend_common_expression::types::DecimalScalar;
 use databend_common_expression::types::NumberDataType;
 use databend_common_expression::types::NumberScalar;
+use databend_common_expression::types::i256;
 use databend_common_functions::BUILTIN_FUNCTIONS;
 use databend_common_pipeline::core::OutputPort;
 use databend_common_pipeline::core::Pipeline;
@@ -774,6 +778,9 @@ fn normalize_key_filter_constant(constant: &Scalar, data_type: &TableDataType) -
 
     match data_type.remove_nullable() {
         TableDataType::Number(number_type) => normalize_number_key_constant(constant, number_type),
+        TableDataType::Decimal(decimal_type) => {
+            normalize_decimal_key_constant(constant, decimal_type)
+        }
         TableDataType::String => match constant {
             Scalar::String(_) => Some(constant.clone()),
             _ => None,
@@ -811,6 +818,72 @@ fn normalize_number_key_constant(constant: &Scalar, number_type: NumberDataType)
         NumberDataType::Float32 | NumberDataType::Float64 => return None,
     };
     Some(Scalar::Number(number))
+}
+
+fn normalize_decimal_key_constant(
+    constant: &Scalar,
+    decimal_type: DecimalDataType,
+) -> Option<Scalar> {
+    let target_size = decimal_type.size();
+    let value = match constant {
+        Scalar::Decimal(decimal) => {
+            let source_size = decimal.size();
+            rescale_decimal_i256(
+                decimal.as_decimal::<i256>(),
+                source_size.scale(),
+                target_size.scale(),
+            )?
+        }
+        Scalar::Number(number) if number.is_integer() => {
+            let value = i256::from(number.integer_to_i128()?);
+            value.checked_mul(i256::e(target_size.scale()))?
+        }
+        _ => return None,
+    };
+
+    decimal_scalar_from_i256(value, decimal_type).map(Scalar::Decimal)
+}
+
+fn rescale_decimal_i256(value: i256, source_scale: u8, target_scale: u8) -> Option<i256> {
+    if source_scale == target_scale {
+        return Some(value);
+    }
+
+    let diff = target_scale.abs_diff(source_scale);
+    if target_scale > source_scale {
+        value.checked_mul(i256::e(diff))
+    } else {
+        value.checked_div(i256::e(diff))
+    }
+}
+
+fn decimal_scalar_from_i256(value: i256, decimal_type: DecimalDataType) -> Option<DecimalScalar> {
+    match decimal_type {
+        DecimalDataType::Decimal64(size) => {
+            if value < i256::from(i64::min_for_precision(size.precision()))
+                || value > i256::from(i64::max_for_precision(size.precision()))
+            {
+                return None;
+            }
+            Some(DecimalScalar::Decimal64(value.as_i64(), size))
+        }
+        DecimalDataType::Decimal128(size) => {
+            if value < i256::from(i128::min_for_precision(size.precision()))
+                || value > i256::from(i128::max_for_precision(size.precision()))
+            {
+                return None;
+            }
+            Some(DecimalScalar::Decimal128(value.as_i128(), size))
+        }
+        DecimalDataType::Decimal256(size) => {
+            if value < i256::min_for_precision(size.precision())
+                || value > i256::max_for_precision(size.precision())
+            {
+                return None;
+            }
+            Some(DecimalScalar::Decimal256(value, size))
+        }
+    }
 }
 
 fn record_elapsed(name: ProfileStatisticsName, start: Instant) {
@@ -1158,6 +1231,7 @@ mod tests {
     use databend_common_expression::ScalarRef;
     use databend_common_expression::TableDataType;
     use databend_common_expression::type_check::check_function;
+    use databend_common_expression::types::DecimalDataType;
     use databend_common_expression::types::DecimalScalar;
     use databend_common_expression::types::DecimalSize;
     use databend_common_expression::types::NumberDataType;
@@ -1552,6 +1626,39 @@ mod tests {
 
         let key = encoded_test_key(&[(
             Scalar::Number(NumberScalar::Int64(-1)),
+            BtreeIndexKeyOrder::Desc,
+        )])?;
+        assert!(!evaluate_btree_key_predicates(&key_predicates, &key));
+        Ok(())
+    }
+
+    #[test]
+    fn test_key_predicate_compares_desc_decimal_from_integer_constant() -> Result<()> {
+        let size = DecimalSize::new(20, 2)?;
+        let key_field = BtreeIndexKeyField {
+            component_index: 0,
+            order: BtreeIndexKeyOrder::Desc,
+            data_type: TableDataType::Decimal(DecimalDataType::Decimal128(size)),
+        };
+        let (key_predicates, payload_predicates) = split_btree_fast_predicates(
+            vec![BtreeIndexFastPredicate::Compare {
+                column: 0,
+                op: BtreeIndexFastCompareOp::Gt,
+                constant: Scalar::Number(NumberScalar::Int64(0)),
+            }],
+            &[Some(key_field)],
+        )?;
+        assert_eq!(key_predicates.len(), 1);
+        assert_eq!(payload_predicates.unwrap().len(), 0);
+
+        let key = encoded_test_key(&[(
+            Scalar::Decimal(DecimalScalar::Decimal128(100, size)),
+            BtreeIndexKeyOrder::Desc,
+        )])?;
+        assert!(evaluate_btree_key_predicates(&key_predicates, &key));
+
+        let key = encoded_test_key(&[(
+            Scalar::Decimal(DecimalScalar::Decimal128(0, size)),
             BtreeIndexKeyOrder::Desc,
         )])?;
         assert!(!evaluate_btree_key_predicates(&key_predicates, &key));
