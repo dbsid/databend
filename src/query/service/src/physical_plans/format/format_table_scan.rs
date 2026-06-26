@@ -126,6 +126,19 @@ impl<'a> PhysicalFormat for TableScanFormatter<'a> {
         };
         children.push(FormatTreeNode::new(push_downs));
 
+        if let Some(btree_index) = self
+            .inner
+            .source
+            .push_downs
+            .as_ref()
+            .and_then(|p| p.btree_index.as_ref())
+        {
+            children.push(FormatTreeNode::new(format!(
+                "btree index: [{}@{}]",
+                btree_index.index_name, btree_index.index_version
+            )));
+        }
+
         // runtime filters
         let rf = ctx.scan_id_to_runtime_filters.get(&self.inner.scan_id);
         if let Some(rf) = rf {

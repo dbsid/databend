@@ -898,12 +898,23 @@ impl PhysicalPlanBuilder {
 
         let virtual_column = self.build_virtual_column(virtual_columns)?;
 
+        let btree_index =
+            self.try_build_btree_index_info(scan, table_schema, user_filters.clone())?;
+        let prewhere = if btree_index.is_some() {
+            // The BTREE source scans row payloads from the covered SST and applies the
+            // complete pushed filter there, so the normal block-read prewhere path is
+            // redundant and should not be mixed into the BTREE read path.
+            None
+        } else {
+            prewhere_info
+        };
+
         Ok(PushDownInfo {
             projection: Some(projection),
             output_columns,
             filters: user_filters.clone(),
             is_deterministic,
-            prewhere: prewhere_info,
+            prewhere,
             limit,
             order_by,
             virtual_column,
@@ -912,11 +923,7 @@ impl PhysicalPlanBuilder {
             change_type: scan.change_type.clone(),
             inverted_index: scan.inverted_index.clone(),
             vector_index: scan.vector_index.clone(),
-            btree_index: self.try_build_btree_index_info(
-                scan,
-                table_schema,
-                user_filters.clone(),
-            )?,
+            btree_index,
             sample: scan.sample.clone(),
             read_partitions_pruning_mode: Default::default(),
             secure_filters,
@@ -933,7 +940,6 @@ impl PhysicalPlanBuilder {
             .secure_predicates
             .as_ref()
             .is_some_and(|preds| !preds.is_empty())
-            || scan.prewhere.is_some()
             || scan.limit.is_none()
             || scan.push_down_predicates.as_ref().is_none_or(Vec::is_empty)
             || scan.order_by.as_ref().is_none_or(Vec::is_empty)
