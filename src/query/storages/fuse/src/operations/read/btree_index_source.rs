@@ -369,17 +369,41 @@ impl BtreeIndexSource {
         prefix: &[u8],
         filter: Option<&Expr<usize>>,
     ) -> Result<Vec<BtreeIndexRow>> {
+        let Some(limit) = self.btree_index.limit else {
+            let mut rows = Vec::new();
+            for candidate in candidates {
+                let mut block_rows = self
+                    .read_candidate_block(&candidate, prefix, filter, None)
+                    .await?;
+                rows.append(&mut block_rows);
+            }
+            rows.sort_by(|left, right| left.encoded_key.cmp(&right.encoded_key));
+            return Ok(rows);
+        };
+
         let mut rows = Vec::new();
-        for candidate in candidates {
+        let mut candidates = candidates.into_iter().peekable();
+        while let Some(candidate) = candidates.next() {
+            let remaining = limit.saturating_sub(rows.len());
+            if remaining == 0 {
+                return Ok(rows);
+            }
             let mut block_rows = self
-                .read_candidate_block(&candidate, prefix, filter, None)
+                .read_candidate_block(&candidate, prefix, filter, Some(limit))
                 .await?;
             rows.append(&mut block_rows);
+
+            if rows.len() >= limit {
+                sort_and_truncate_rows(&mut rows, limit);
+                if candidates.peek().is_none_or(|next| {
+                    next.block_meta.first_key.as_slice()
+                        >= rows[rows.len() - 1].encoded_key.as_slice()
+                }) {
+                    return Ok(rows);
+                }
+            }
         }
-        rows.sort_by(|left, right| left.encoded_key.cmp(&right.encoded_key));
-        if let Some(limit) = self.btree_index.limit {
-            rows.truncate(limit);
-        }
+        sort_and_truncate_rows(&mut rows, limit);
         Ok(rows)
     }
 
@@ -412,6 +436,11 @@ fn truncate_rows(mut rows: Vec<BtreeIndexRow>, limit: Option<usize>) -> Vec<Btre
         rows.truncate(limit);
     }
     rows
+}
+
+fn sort_and_truncate_rows(rows: &mut Vec<BtreeIndexRow>, limit: usize) {
+    rows.sort_by(|left, right| left.encoded_key.cmp(&right.encoded_key));
+    rows.truncate(limit);
 }
 
 fn candidate_blocks_are_disjoint(candidates: &[BtreeIndexCandidateBlock]) -> bool {
@@ -669,6 +698,66 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].encoded_key.as_slice(), b"wallet-1|001");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlapped_candidate_rows_stop_after_topk_boundary() -> Result<()> {
+        crate::test_utils::init_test_globals()?;
+        let operator = Operator::new(opendal::services::Memory::default())
+            .unwrap()
+            .finish();
+        let location = "btree-overlap-limit-first.sst";
+        let meta = BtreeIndexMeta {
+            columns: vec![],
+            metadata: Default::default(),
+        };
+        let mut writer = BtreeIndexWriter::new(meta, "schema", "wallet ASC", "none")
+            .with_data_block_size(usize::MAX);
+        for key in ["wallet-1|001", "wallet-1|002", "wallet-1|003"] {
+            writer.add_row(
+                bytes::Bytes::from(key.as_bytes().to_vec()),
+                bytes::Bytes::from(encode_btree_payload(&[Scalar::String(key.to_string())])?),
+            );
+        }
+        let data = writer.finish()?;
+        operator
+            .write(location, data.to_vec())
+            .await
+            .map_err(|err| {
+                ErrorCode::StorageOther(format!("write btree index test file failed: {err:?}"))
+            })?;
+
+        let meta = load_btree_index_meta(operator.clone(), location, None).await?;
+        let first_block = meta.index_block().data_blocks[0].clone();
+        let mut overlapping_missing_block = first_block.clone();
+        overlapping_missing_block.first_key = b"wallet-1|003".to_vec();
+        overlapping_missing_block.last_key = b"wallet-1|004".to_vec();
+
+        let field = TableField::new_from_column_id("wallet_address", TableDataType::String, 0);
+        let source = test_source(operator, field, Some(2));
+        let rows = source
+            .read_candidate_rows(
+                vec![
+                    BtreeIndexCandidateBlock {
+                        index_location: location.to_string(),
+                        meta: meta.clone(),
+                        block_meta: first_block,
+                    },
+                    BtreeIndexCandidateBlock {
+                        index_location: "missing-btree-overlap-limit-second.sst".to_string(),
+                        meta,
+                        block_meta: overlapping_missing_block,
+                    },
+                ],
+                b"wallet-1|",
+                None,
+            )
+            .await?;
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].encoded_key.as_slice(), b"wallet-1|001");
+        assert_eq!(rows[1].encoded_key.as_slice(), b"wallet-1|002");
         Ok(())
     }
 
