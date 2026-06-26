@@ -709,10 +709,7 @@ impl BtreeIndexSource {
         )
         .await?;
         Profile::record_usize_profile(ProfileStatisticsName::BtreeIndexRowsDecoded, rows.len());
-        let rows = rows
-            .iter()
-            .filter(|row| row.encoded_key.starts_with(prefix))
-            .collect::<Vec<_>>();
+        let rows = btree_prefix_row_refs(&rows, prefix);
         let rows = if let Some(filter) = filter {
             self.filter_index_row_refs(&rows, filter, limit)?
         } else {
@@ -938,6 +935,19 @@ fn decimal_scalar_from_i256(value: i256, decimal_type: DecimalDataType) -> Optio
 
 fn record_elapsed(name: ProfileStatisticsName, start: Instant) {
     Profile::record_usize_profile(name, start.elapsed().as_nanos() as usize);
+}
+
+fn btree_prefix_row_refs<'a>(rows: &'a [BtreeIndexRow], prefix: &[u8]) -> Vec<&'a BtreeIndexRow> {
+    if prefix.is_empty() {
+        return rows.iter().collect();
+    }
+
+    let start = rows.partition_point(|row| row.encoded_key.as_slice() < prefix);
+    let mut end = start;
+    while end < rows.len() && rows[end].encoded_key.starts_with(prefix) {
+        end += 1;
+    }
+    rows[start..end].iter().collect()
 }
 
 fn clone_row_refs(rows: &[&BtreeIndexRow], limit: Option<usize>) -> Vec<BtreeIndexRow> {
@@ -1689,6 +1699,35 @@ mod tests {
     }
 
     #[test]
+    fn test_btree_prefix_row_refs_seek_to_prefix_start() {
+        let rows = vec![
+            test_row(b"wallet-0|999"),
+            test_row(b"wallet-1|001"),
+            test_row(b"wallet-1|002"),
+            test_row(b"wallet-2|001"),
+        ];
+
+        let row_refs = btree_prefix_row_refs(&rows, b"wallet-1|");
+
+        assert_eq!(row_refs.len(), 2);
+        assert_eq!(row_refs[0].encoded_key.as_slice(), b"wallet-1|001");
+        assert_eq!(row_refs[1].encoded_key.as_slice(), b"wallet-1|002");
+    }
+
+    #[test]
+    fn test_btree_prefix_row_refs_handles_missing_prefix() {
+        let rows = vec![
+            test_row(b"wallet-0|999"),
+            test_row(b"wallet-2|001"),
+            test_row(b"wallet-3|001"),
+        ];
+
+        let row_refs = btree_prefix_row_refs(&rows, b"wallet-1|");
+
+        assert!(row_refs.is_empty());
+    }
+
+    #[test]
     fn test_fast_filter_compiler_skips_prefix_equality() -> Result<()> {
         let wallet_eq = check_function(
             None,
@@ -2369,6 +2408,13 @@ mod tests {
                 row_count: 0,
                 checksum: 0,
             },
+        }
+    }
+
+    fn test_row(encoded_key: &[u8]) -> BtreeIndexRow {
+        BtreeIndexRow {
+            encoded_key: encoded_key.to_vec(),
+            encoded_row_payload: Vec::new(),
         }
     }
 
