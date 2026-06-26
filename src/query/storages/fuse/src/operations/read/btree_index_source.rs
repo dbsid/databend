@@ -63,6 +63,8 @@ use databend_storages_common_index::btree_equality_prefix;
 use databend_storages_common_index::decode_btree_payload;
 use databend_storages_common_index::decode_btree_payload_projection;
 use databend_storages_common_index::encode_btree_key_component;
+use databend_storages_common_index::filters::BloomFilter;
+use databend_storages_common_index::filters::Filter as _;
 use futures::future;
 use opendal::Operator;
 use sha2::Digest;
@@ -74,6 +76,7 @@ use crate::io::load_btree_index_meta;
 
 const BTREE_INDEX_DATA_BLOCK_READ_BATCH_SIZE: usize = 32;
 const BTREE_DECODED_PAYLOAD_ROW_CACHE_ITEMS: usize = 65536;
+const BTREE_DECODED_EQUALITY_PREFIX_BLOOM_CACHE_ITEMS: usize = 8192;
 
 static BTREE_DECODED_PAYLOAD_ROW_CACHE: LazyLock<InMemoryLruCache<BtreeIndexDecodedPayloadRow>> =
     LazyLock::new(|| {
@@ -82,6 +85,15 @@ static BTREE_DECODED_PAYLOAD_ROW_CACHE: LazyLock<InMemoryLruCache<BtreeIndexDeco
             BTREE_DECODED_PAYLOAD_ROW_CACHE_ITEMS,
         )
     });
+
+static BTREE_DECODED_EQUALITY_PREFIX_BLOOM_CACHE: LazyLock<
+    InMemoryLruCache<BtreeIndexDecodedEqualityPrefixBloom>,
+> = LazyLock::new(|| {
+    InMemoryLruCache::with_items_capacity(
+        "btree_index_decoded_equality_prefix_bloom".to_string(),
+        BTREE_DECODED_EQUALITY_PREFIX_BLOOM_CACHE_ITEMS,
+    )
+});
 
 #[derive(Clone)]
 struct BtreeIndexDecodedPayloadRow {
@@ -92,6 +104,22 @@ impl From<BtreeIndexDecodedPayloadRow> for CacheValue<BtreeIndexDecodedPayloadRo
     fn from(value: BtreeIndexDecodedPayloadRow) -> Self {
         let mem_bytes =
             std::mem::size_of::<BtreeIndexDecodedPayloadRow>() + scalar_rows_mem_bytes(&value.row);
+        CacheValue::new(value, mem_bytes)
+    }
+}
+
+#[derive(Clone)]
+struct BtreeIndexDecodedEqualityPrefixBloom {
+    filter: Option<Arc<BloomFilter>>,
+    mem_bytes: usize,
+}
+
+impl From<BtreeIndexDecodedEqualityPrefixBloom>
+    for CacheValue<BtreeIndexDecodedEqualityPrefixBloom>
+{
+    fn from(value: BtreeIndexDecodedEqualityPrefixBloom) -> Self {
+        let mem_bytes =
+            value.mem_bytes + std::mem::size_of::<BtreeIndexDecodedEqualityPrefixBloom>();
         CacheValue::new(value, mem_bytes)
     }
 }
@@ -565,7 +593,7 @@ impl BtreeIndexSource {
             .then_some(fuse_part.btree_index_size)
             .flatten();
         let meta = load_btree_index_meta(operator, &index_location, len_hint).await?;
-        if !meta.may_contain_equality_prefix(&prefix) {
+        if !may_contain_equality_prefix_cached(&index_location, &meta, &prefix) {
             return Ok(Vec::new());
         }
         Ok(meta
@@ -975,6 +1003,33 @@ fn decimal_scalar_from_i256(value: i256, decimal_type: DecimalDataType) -> Optio
 
 fn record_elapsed(name: ProfileStatisticsName, start: Instant) {
     Profile::record_usize_profile(name, start.elapsed().as_nanos() as usize);
+}
+
+fn may_contain_equality_prefix_cached(
+    index_location: &str,
+    meta: &BtreeIndexFileMeta,
+    prefix: &[u8],
+) -> bool {
+    let cache_key = format!("{}#equality_prefix_bloom", index_location);
+    if let Some(cached) = BTREE_DECODED_EQUALITY_PREFIX_BLOOM_CACHE.get(&cache_key) {
+        return cached
+            .filter
+            .as_ref()
+            .is_none_or(|filter| filter.contains(prefix));
+    }
+
+    let filter = BloomFilter::from_bytes(&meta.filter_block.equality_prefix_bloom)
+        .ok()
+        .map(|(filter, _)| Arc::new(filter));
+    let may_contain = filter.as_ref().is_none_or(|filter| filter.contains(prefix));
+    BTREE_DECODED_EQUALITY_PREFIX_BLOOM_CACHE.insert(
+        cache_key,
+        BtreeIndexDecodedEqualityPrefixBloom {
+            filter,
+            mem_bytes: meta.filter_block.equality_prefix_bloom.len(),
+        },
+    );
+    may_contain
 }
 
 fn btree_prefix_row_refs<'a>(rows: &'a [BtreeIndexRow], prefix: &[u8]) -> Vec<&'a BtreeIndexRow> {
