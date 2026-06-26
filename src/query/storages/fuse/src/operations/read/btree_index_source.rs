@@ -651,9 +651,8 @@ impl BtreeIndexSource {
 
         let mut rows = Vec::new();
         let mut candidate_offset = 0;
-        let mut batch_size = 1;
         while candidate_offset < candidates.len() {
-            let batch_end = (candidate_offset + batch_size).min(candidates.len());
+            let batch_end = candidate_offset + 1;
             for mut block_rows in self
                 .read_candidate_blocks_batch(
                     &candidates[candidate_offset..batch_end],
@@ -676,7 +675,6 @@ impl BtreeIndexSource {
                     return Ok(rows);
                 }
             }
-            batch_size = BTREE_INDEX_DATA_BLOCK_READ_BATCH_SIZE;
         }
         sort_and_truncate_rows(&mut rows, limit);
         Ok(rows)
@@ -2221,6 +2219,89 @@ mod tests {
                         index_location: "missing-btree-overlap-limit-second.sst".to_string(),
                         meta,
                         block_meta: overlapping_missing_block,
+                    },
+                ],
+                b"wallet-1|",
+                None,
+            )
+            .await?;
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].encoded_key.as_slice(), b"wallet-1|001");
+        assert_eq!(rows[1].encoded_key.as_slice(), b"wallet-1|002");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlapped_candidate_rows_reads_until_limit_then_stops() -> Result<()> {
+        crate::test_utils::init_test_globals()?;
+        let operator = Operator::new(opendal::services::Memory::default())
+            .unwrap()
+            .finish();
+        let first_location = "btree-overlap-limit-one.sst";
+        let second_location = "btree-overlap-limit-two.sst";
+        let meta = BtreeIndexMeta {
+            columns: vec![],
+            metadata: Default::default(),
+        };
+        let mut first_writer = BtreeIndexWriter::new(meta.clone(), "schema", "wallet ASC", "none")
+            .with_data_block_size(usize::MAX);
+        first_writer.add_row(
+            bytes::Bytes::from_static(b"wallet-1|001"),
+            bytes::Bytes::from(encode_btree_payload(&[Scalar::String(
+                "row-1".to_string(),
+            )])?),
+        );
+        operator
+            .write(first_location, first_writer.finish()?.to_vec())
+            .await
+            .map_err(|err| {
+                ErrorCode::StorageOther(format!("write btree index test file failed: {err:?}"))
+            })?;
+
+        let mut second_writer = BtreeIndexWriter::new(meta, "schema", "wallet ASC", "none")
+            .with_data_block_size(usize::MAX);
+        for key in ["wallet-1|002", "wallet-1|003"] {
+            second_writer.add_row(
+                bytes::Bytes::from(key.as_bytes().to_vec()),
+                bytes::Bytes::from(encode_btree_payload(&[Scalar::String(key.to_string())])?),
+            );
+        }
+        operator
+            .write(second_location, second_writer.finish()?.to_vec())
+            .await
+            .map_err(|err| {
+                ErrorCode::StorageOther(format!("write btree index test file failed: {err:?}"))
+            })?;
+
+        let first_meta = load_btree_index_meta(operator.clone(), first_location, None).await?;
+        let second_meta = load_btree_index_meta(operator.clone(), second_location, None).await?;
+        let mut first_block = first_meta.index_block().data_blocks[0].clone();
+        first_block.last_key = b"wallet-1|002".to_vec();
+        let second_block = second_meta.index_block().data_blocks[0].clone();
+        let mut later_missing_block = second_block.clone();
+        later_missing_block.first_key = b"wallet-1|003".to_vec();
+        later_missing_block.last_key = b"wallet-1|004".to_vec();
+
+        let field = TableField::new_from_column_id("wallet_address", TableDataType::String, 0);
+        let source = test_source(operator, field, Some(2));
+        let rows = source
+            .read_candidate_rows(
+                vec![
+                    BtreeIndexCandidateBlock {
+                        index_location: first_location.to_string(),
+                        meta: first_meta,
+                        block_meta: first_block,
+                    },
+                    BtreeIndexCandidateBlock {
+                        index_location: second_location.to_string(),
+                        meta: second_meta.clone(),
+                        block_meta: second_block,
+                    },
+                    BtreeIndexCandidateBlock {
+                        index_location: "missing-btree-overlap-limit-third.sst".to_string(),
+                        meta: second_meta,
+                        block_meta: later_missing_block,
                     },
                 ],
                 b"wallet-1|",
