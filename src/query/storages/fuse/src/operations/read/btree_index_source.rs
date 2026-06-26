@@ -1143,39 +1143,65 @@ fn candidate_block_may_match_key_predicates(
         return true;
     }
 
-    key_predicates
-        .iter()
-        .filter(|predicate| {
-            candidate_block_has_constant_prefix_before_component(
+    let mut constant_prefix_component_count = prefix_component_count;
+    let mut predicate_index = 0;
+    while predicate_index < key_predicates.len() {
+        let component_index = key_predicates[predicate_index].component_index;
+        if component_index > constant_prefix_component_count {
+            if !candidate_block_has_constant_prefix_before_component(
                 block_meta,
-                prefix_component_count,
-                predicate.component_index,
-            )
-        })
-        .all(|predicate| {
-            let Some(first_component) =
-                encoded_key_component(&block_meta.first_key, predicate.component_index)
-            else {
+                constant_prefix_component_count,
+                component_index,
+            ) {
                 return true;
-            };
-            let Some(last_component) =
-                encoded_key_component(&block_meta.last_key, predicate.component_index)
-            else {
-                return true;
-            };
-            key_component_range_may_match_predicate(predicate, first_component, last_component)
-        })
+            }
+            constant_prefix_component_count = component_index;
+        }
+
+        let Some(first_component) = encoded_key_component(&block_meta.first_key, component_index)
+        else {
+            return true;
+        };
+        let Some(last_component) = encoded_key_component(&block_meta.last_key, component_index)
+        else {
+            return true;
+        };
+        while key_predicates
+            .get(predicate_index)
+            .is_some_and(|predicate| predicate.component_index == component_index)
+        {
+            if !key_component_range_may_match_predicate(
+                &key_predicates[predicate_index],
+                first_component,
+                last_component,
+            ) {
+                return false;
+            }
+            predicate_index += 1;
+        }
+
+        if first_component == last_component {
+            constant_prefix_component_count =
+                constant_prefix_component_count.max(component_index + 1);
+        } else if key_predicates
+            .get(predicate_index)
+            .is_some_and(|predicate| predicate.component_index > component_index)
+        {
+            return true;
+        }
+    }
+    true
 }
 
 fn candidate_block_has_constant_prefix_before_component(
     block_meta: &BtreeIndexDataBlockMeta,
-    prefix_component_count: usize,
+    known_constant_prefix_component_count: usize,
     component_index: usize,
 ) -> bool {
-    if component_index == prefix_component_count {
+    if component_index == known_constant_prefix_component_count {
         return true;
     }
-    if component_index < prefix_component_count {
+    if component_index < known_constant_prefix_component_count {
         return false;
     }
 
