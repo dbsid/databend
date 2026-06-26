@@ -202,6 +202,7 @@ impl AsyncSource for BtreeIndexSource {
 
         let prefix = encode_prefix(&self.btree_index)?;
         let filter = self.build_filter_expr(self.btree_index.filters.as_ref())?;
+        let candidate_read_start = Instant::now();
         let mut candidates = Vec::new();
         while let Some(parts) = self.fetch_parts().await? {
             if parts.is_empty() {
@@ -215,7 +216,6 @@ impl AsyncSource for BtreeIndexSource {
             );
         }
 
-        let candidate_read_start = Instant::now();
         let rows = self
             .read_candidate_rows(candidates, &prefix, filter.as_ref())
             .await?;
