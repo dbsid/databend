@@ -35,9 +35,12 @@ use databend_common_expression::Evaluator;
 use databend_common_expression::Expr;
 use databend_common_expression::FunctionContext;
 use databend_common_expression::Scalar;
+use databend_common_expression::TableDataType;
 use databend_common_expression::TableField;
 use databend_common_expression::types::BooleanType;
 use databend_common_expression::types::DataType;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::types::NumberScalar;
 use databend_common_functions::BUILTIN_FUNCTIONS;
 use databend_common_pipeline::core::OutputPort;
 use databend_common_pipeline::core::Pipeline;
@@ -209,7 +212,37 @@ struct BtreeIndexFilter {
     expr: Option<Expr<usize>>,
     payload_field_indexes: Vec<usize>,
     payload_fields: Vec<TableField>,
+    key_predicates: Vec<BtreeIndexKeyPredicate>,
     fast_predicates: Option<Vec<BtreeIndexFastPredicate>>,
+}
+
+#[derive(Clone, Debug)]
+struct BtreeIndexKeyPredicate {
+    component_index: usize,
+    order: BtreeIndexKeyOrder,
+    kind: BtreeIndexKeyPredicateKind,
+}
+
+#[derive(Clone, Debug)]
+enum BtreeIndexKeyPredicateKind {
+    IsNull {
+        null_component: Vec<u8>,
+    },
+    IsNotNull {
+        null_component: Vec<u8>,
+    },
+    Compare {
+        op: BtreeIndexFastCompareOp,
+        constant_component: Vec<u8>,
+        null_component: Vec<u8>,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct BtreeIndexKeyField {
+    component_index: usize,
+    order: BtreeIndexKeyOrder,
+    data_type: TableDataType,
 }
 
 #[derive(Clone, Debug)]
@@ -262,11 +295,17 @@ impl BtreeIndexSource {
             .project_column_ref(|name| self.payload_schema.index_of(name))?;
         let prefix_equalities = self.btree_prefix_payload_equalities()?;
         let fast_predicates = compile_btree_fast_predicates(&expr, &prefix_equalities);
+        let key_fields = self.btree_key_fields_by_payload_index()?;
+        let (key_predicates, fast_predicates) = if let Some(predicates) = fast_predicates {
+            split_btree_fast_predicates(predicates, &key_fields)?
+        } else {
+            (Vec::new(), None)
+        };
         let mut payload_field_indexes = if let Some(predicates) = &fast_predicates {
             predicates
                 .iter()
-                .filter_map(|predicate| predicate.column())
-                .collect::<Vec<_>>()
+                .map(|predicate| predicate.column())
+                .collect()
         } else {
             expr.column_refs().keys().cloned().collect::<Vec<_>>()
         };
@@ -310,6 +349,7 @@ impl BtreeIndexSource {
             expr,
             payload_field_indexes,
             payload_fields,
+            key_predicates,
             fast_predicates,
         }))
     }
@@ -328,6 +368,23 @@ impl BtreeIndexSource {
         Ok(equalities)
     }
 
+    fn btree_key_fields_by_payload_index(&self) -> Result<Vec<Option<BtreeIndexKeyField>>> {
+        let mut key_fields = vec![None; self.btree_index.payload_fields.len()];
+        for (component_index, key_column) in self.btree_index.key_columns.iter().enumerate() {
+            let payload_index = self.payload_schema.index_of(key_column.field.name())?;
+            let order = match key_column.order {
+                BtreeIndexColumnOrder::Asc => BtreeIndexKeyOrder::Asc,
+                BtreeIndexColumnOrder::Desc => BtreeIndexKeyOrder::Desc,
+            };
+            key_fields[payload_index] = Some(BtreeIndexKeyField {
+                component_index,
+                order,
+                data_type: key_column.field.data_type().clone(),
+            });
+        }
+        Ok(key_fields)
+    }
+
     fn filter_index_rows(
         &self,
         rows: Vec<BtreeIndexRow>,
@@ -341,10 +398,19 @@ impl BtreeIndexSource {
         let start = Instant::now();
         if let Some(predicates) = &filter.fast_predicates {
             let filtered_rows = if predicates.is_empty() {
+                let rows = rows
+                    .into_iter()
+                    .filter(|row| {
+                        evaluate_btree_key_predicates(&filter.key_predicates, &row.encoded_key)
+                    })
+                    .collect();
                 truncate_rows(rows, limit)
             } else {
                 let mut filtered_rows = Vec::new();
                 for row in rows {
+                    if !evaluate_btree_key_predicates(&filter.key_predicates, &row.encoded_key) {
+                        continue;
+                    }
                     let payload_row = decode_btree_payload_projection(
                         &row.encoded_row_payload,
                         &filter.payload_field_indexes,
@@ -604,11 +670,11 @@ impl BtreeIndexSource {
 }
 
 impl BtreeIndexFastPredicate {
-    fn column(&self) -> Option<usize> {
+    fn column(&self) -> usize {
         match self {
             BtreeIndexFastPredicate::IsNull { column }
             | BtreeIndexFastPredicate::IsNotNull { column }
-            | BtreeIndexFastPredicate::Compare { column, .. } => Some(*column),
+            | BtreeIndexFastPredicate::Compare { column, .. } => *column,
         }
     }
 
@@ -642,6 +708,109 @@ impl BtreeIndexFastPredicate {
             },
         })
     }
+}
+
+fn split_btree_fast_predicates(
+    predicates: Vec<BtreeIndexFastPredicate>,
+    key_fields: &[Option<BtreeIndexKeyField>],
+) -> Result<(
+    Vec<BtreeIndexKeyPredicate>,
+    Option<Vec<BtreeIndexFastPredicate>>,
+)> {
+    let mut key_predicates = Vec::new();
+    let mut payload_predicates = Vec::new();
+    for predicate in predicates {
+        let Some(Some(key_field)) = key_fields.get(predicate.column()) else {
+            payload_predicates.push(predicate);
+            continue;
+        };
+        if let Some(key_predicate) = predicate.clone().try_into_key_predicate(key_field)? {
+            key_predicates.push(key_predicate);
+        } else {
+            payload_predicates.push(predicate);
+        }
+    }
+    Ok((key_predicates, Some(payload_predicates)))
+}
+
+impl BtreeIndexFastPredicate {
+    fn try_into_key_predicate(
+        self,
+        key_field: &BtreeIndexKeyField,
+    ) -> Result<Option<BtreeIndexKeyPredicate>> {
+        let null_component = encode_key_component_value(&Scalar::Null, key_field.order)?;
+        let kind = match self {
+            BtreeIndexFastPredicate::IsNull { .. } => {
+                BtreeIndexKeyPredicateKind::IsNull { null_component }
+            }
+            BtreeIndexFastPredicate::IsNotNull { .. } => {
+                BtreeIndexKeyPredicateKind::IsNotNull { null_component }
+            }
+            BtreeIndexFastPredicate::Compare { op, constant, .. } => {
+                let Some(constant) = normalize_key_filter_constant(&constant, &key_field.data_type)
+                else {
+                    return Ok(None);
+                };
+                let constant_component = encode_key_component_value(&constant, key_field.order)?;
+                BtreeIndexKeyPredicateKind::Compare {
+                    op,
+                    constant_component,
+                    null_component,
+                }
+            }
+        };
+        Ok(Some(BtreeIndexKeyPredicate {
+            component_index: key_field.component_index,
+            order: key_field.order,
+            kind,
+        }))
+    }
+}
+
+fn normalize_key_filter_constant(constant: &Scalar, data_type: &TableDataType) -> Option<Scalar> {
+    if matches!(constant, Scalar::Null) {
+        return Some(Scalar::Null);
+    }
+
+    match data_type.remove_nullable() {
+        TableDataType::Number(number_type) => normalize_number_key_constant(constant, number_type),
+        TableDataType::String => match constant {
+            Scalar::String(_) => Some(constant.clone()),
+            _ => None,
+        },
+        TableDataType::Boolean => match constant {
+            Scalar::Boolean(_) => Some(constant.clone()),
+            _ => None,
+        },
+        TableDataType::Date => match constant {
+            Scalar::Date(_) => Some(constant.clone()),
+            _ => None,
+        },
+        TableDataType::Timestamp => match constant {
+            Scalar::Timestamp(_) => Some(constant.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn normalize_number_key_constant(constant: &Scalar, number_type: NumberDataType) -> Option<Scalar> {
+    let Scalar::Number(number) = constant else {
+        return None;
+    };
+    let value = number.integer_to_i128()?;
+    let number = match number_type {
+        NumberDataType::UInt8 => NumberScalar::UInt8(u8::try_from(value).ok()?),
+        NumberDataType::UInt16 => NumberScalar::UInt16(u16::try_from(value).ok()?),
+        NumberDataType::UInt32 => NumberScalar::UInt32(u32::try_from(value).ok()?),
+        NumberDataType::UInt64 => NumberScalar::UInt64(u64::try_from(value).ok()?),
+        NumberDataType::Int8 => NumberScalar::Int8(i8::try_from(value).ok()?),
+        NumberDataType::Int16 => NumberScalar::Int16(i16::try_from(value).ok()?),
+        NumberDataType::Int32 => NumberScalar::Int32(i32::try_from(value).ok()?),
+        NumberDataType::Int64 => NumberScalar::Int64(i64::try_from(value).ok()?),
+        NumberDataType::Float32 | NumberDataType::Float64 => return None,
+    };
+    Some(Scalar::Number(number))
 }
 
 fn record_elapsed(name: ProfileStatisticsName, start: Instant) {
@@ -795,6 +964,39 @@ fn evaluate_btree_fast_predicates(
         .all(|predicate| evaluate_btree_fast_predicate(predicate, payload_row))
 }
 
+fn evaluate_btree_key_predicates(
+    predicates: &[BtreeIndexKeyPredicate],
+    encoded_key: &[u8],
+) -> bool {
+    predicates
+        .iter()
+        .all(|predicate| evaluate_btree_key_predicate(predicate, encoded_key))
+}
+
+fn evaluate_btree_key_predicate(predicate: &BtreeIndexKeyPredicate, encoded_key: &[u8]) -> bool {
+    let Some(component) = encoded_key_component(encoded_key, predicate.component_index) else {
+        return false;
+    };
+    match &predicate.kind {
+        BtreeIndexKeyPredicateKind::IsNull { null_component } => component == null_component,
+        BtreeIndexKeyPredicateKind::IsNotNull { null_component } => component != null_component,
+        BtreeIndexKeyPredicateKind::Compare {
+            op,
+            constant_component,
+            null_component,
+        } => {
+            if component == null_component || constant_component == null_component {
+                return false;
+            }
+            let ordering = match predicate.order {
+                BtreeIndexKeyOrder::Asc => component.cmp(constant_component.as_slice()),
+                BtreeIndexKeyOrder::Desc => component.cmp(constant_component.as_slice()).reverse(),
+            };
+            evaluate_btree_ordering(*op, ordering)
+        }
+    }
+}
+
 fn evaluate_btree_fast_predicate(
     predicate: &BtreeIndexFastPredicate,
     payload_row: &[Scalar],
@@ -820,19 +1022,19 @@ fn evaluate_btree_fast_predicate(
             let Some(ordering) = compare_btree_filter_scalars(value, constant) else {
                 return false;
             };
-            match op {
-                BtreeIndexFastCompareOp::Eq => ordering == Ordering::Equal,
-                BtreeIndexFastCompareOp::NotEq => ordering != Ordering::Equal,
-                BtreeIndexFastCompareOp::Gt => ordering == Ordering::Greater,
-                BtreeIndexFastCompareOp::Gte => {
-                    matches!(ordering, Ordering::Greater | Ordering::Equal)
-                }
-                BtreeIndexFastCompareOp::Lt => ordering == Ordering::Less,
-                BtreeIndexFastCompareOp::Lte => {
-                    matches!(ordering, Ordering::Less | Ordering::Equal)
-                }
-            }
+            evaluate_btree_ordering(*op, ordering)
         }
+    }
+}
+
+fn evaluate_btree_ordering(op: BtreeIndexFastCompareOp, ordering: Ordering) -> bool {
+    match op {
+        BtreeIndexFastCompareOp::Eq => ordering == Ordering::Equal,
+        BtreeIndexFastCompareOp::NotEq => ordering != Ordering::Equal,
+        BtreeIndexFastCompareOp::Gt => ordering == Ordering::Greater,
+        BtreeIndexFastCompareOp::Gte => matches!(ordering, Ordering::Greater | Ordering::Equal),
+        BtreeIndexFastCompareOp::Lt => ordering == Ordering::Less,
+        BtreeIndexFastCompareOp::Lte => matches!(ordering, Ordering::Less | Ordering::Equal),
     }
 }
 
@@ -862,6 +1064,37 @@ fn compare_btree_filter_scalars(left: &Scalar, right: &Scalar) -> Option<Orderin
         }
         _ => None,
     }
+}
+
+fn encode_key_component_value(scalar: &Scalar, order: BtreeIndexKeyOrder) -> Result<Vec<u8>> {
+    let mut key = Vec::new();
+    encode_btree_key_component(&mut key, scalar.as_ref(), order)?;
+    let Some(component) = encoded_key_component(&key, 0) else {
+        return Err(ErrorCode::StorageOther(
+            "failed to encode btree key component".to_string(),
+        ));
+    };
+    Ok(component.to_vec())
+}
+
+fn encoded_key_component(encoded_key: &[u8], component_index: usize) -> Option<&[u8]> {
+    let mut offset = 0usize;
+    for current_index in 0..=component_index {
+        let len_bytes = encoded_key.get(offset..offset + 4)?;
+        let len = u32::from_be_bytes(len_bytes.try_into().ok()?) as usize;
+        let value_start = offset + 4;
+        let value_end = value_start.checked_add(len)?;
+        let component = encoded_key.get(value_start..value_end)?;
+        let separator = encoded_key.get(value_end)?;
+        if *separator != 0xff {
+            return None;
+        }
+        if current_index == component_index {
+            return Some(component);
+        }
+        offset = value_end + 1;
+    }
+    None
 }
 
 fn encode_prefix(btree_index: &BtreeIndexInfo) -> Result<Vec<u8>> {
@@ -1052,6 +1285,7 @@ mod tests {
             expr: Some(expr),
             payload_field_indexes: vec![1],
             payload_fields: vec![balance],
+            key_predicates: vec![],
             fast_predicates: None,
         };
 
@@ -1144,6 +1378,7 @@ mod tests {
             expr: None,
             payload_field_indexes: vec![1, 2],
             payload_fields: vec![balance, tag_black_hole],
+            key_predicates: vec![],
             fast_predicates: Some(vec![
                 BtreeIndexFastPredicate::Compare {
                     column: 0,
@@ -1247,6 +1482,80 @@ mod tests {
             ),
             Some(Ordering::Greater)
         );
+    }
+
+    #[test]
+    fn test_key_predicate_compares_tinyint_suffix() -> Result<()> {
+        let key_field = BtreeIndexKeyField {
+            component_index: 1,
+            order: BtreeIndexKeyOrder::Asc,
+            data_type: TableDataType::Number(NumberDataType::Int8),
+        };
+        let (key_predicates, payload_predicates) = split_btree_fast_predicates(
+            vec![BtreeIndexFastPredicate::Compare {
+                column: 1,
+                op: BtreeIndexFastCompareOp::Gt,
+                constant: Scalar::Number(NumberScalar::Int64(0)),
+            }],
+            &[None, Some(key_field)],
+        )?;
+        assert_eq!(key_predicates.len(), 1);
+        assert_eq!(payload_predicates.unwrap().len(), 0);
+
+        let key = encoded_test_key(&[
+            (
+                Scalar::String("token-a".to_string()),
+                BtreeIndexKeyOrder::Asc,
+            ),
+            (
+                Scalar::Number(NumberScalar::Int8(1)),
+                BtreeIndexKeyOrder::Asc,
+            ),
+        ])?;
+        assert!(evaluate_btree_key_predicates(&key_predicates, &key));
+
+        let key = encoded_test_key(&[
+            (
+                Scalar::String("token-a".to_string()),
+                BtreeIndexKeyOrder::Asc,
+            ),
+            (
+                Scalar::Number(NumberScalar::Int8(0)),
+                BtreeIndexKeyOrder::Asc,
+            ),
+        ])?;
+        assert!(!evaluate_btree_key_predicates(&key_predicates, &key));
+        Ok(())
+    }
+
+    #[test]
+    fn test_key_predicate_reverses_desc_compare_order() -> Result<()> {
+        let key_field = BtreeIndexKeyField {
+            component_index: 0,
+            order: BtreeIndexKeyOrder::Desc,
+            data_type: TableDataType::Number(NumberDataType::Int64),
+        };
+        let (key_predicates, _) = split_btree_fast_predicates(
+            vec![BtreeIndexFastPredicate::Compare {
+                column: 0,
+                op: BtreeIndexFastCompareOp::Gt,
+                constant: Scalar::Number(NumberScalar::Int64(0)),
+            }],
+            &[Some(key_field)],
+        )?;
+
+        let key = encoded_test_key(&[(
+            Scalar::Number(NumberScalar::Int64(10)),
+            BtreeIndexKeyOrder::Desc,
+        )])?;
+        assert!(evaluate_btree_key_predicates(&key_predicates, &key));
+
+        let key = encoded_test_key(&[(
+            Scalar::Number(NumberScalar::Int64(-1)),
+            BtreeIndexKeyOrder::Desc,
+        )])?;
+        assert!(!evaluate_btree_key_predicates(&key_predicates, &key));
+        Ok(())
     }
 
     #[test]
@@ -1447,5 +1756,13 @@ mod tests {
             worker_id: 0,
             is_finished: false,
         }
+    }
+
+    fn encoded_test_key(values: &[(Scalar, BtreeIndexKeyOrder)]) -> Result<Vec<u8>> {
+        let mut key = Vec::new();
+        for (scalar, order) in values {
+            encode_btree_key_component(&mut key, scalar.as_ref(), *order)?;
+        }
+        Ok(key)
     }
 }
