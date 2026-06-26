@@ -420,16 +420,6 @@ impl BtreeIndexSource {
         Ok(key_fields)
     }
 
-    fn filter_index_rows(
-        &self,
-        rows: Vec<BtreeIndexRow>,
-        filter: &BtreeIndexFilter,
-        limit: Option<usize>,
-    ) -> Result<Vec<BtreeIndexRow>> {
-        let row_refs = rows.iter().collect::<Vec<_>>();
-        self.filter_index_row_refs(&row_refs, filter, limit)
-    }
-
     fn filter_index_row_refs(
         &self,
         rows: &[&BtreeIndexRow],
@@ -1590,7 +1580,8 @@ mod tests {
             fast_predicates: None,
         };
 
-        let rows = source.filter_index_rows(rows, &filter, None)?;
+        let row_refs = rows.iter().collect::<Vec<_>>();
+        let rows = source.filter_index_row_refs(&row_refs, &filter, None)?;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].encoded_key.as_slice(), b"k2");
         Ok(())
@@ -1690,7 +1681,8 @@ mod tests {
             ]),
         };
 
-        let rows = source.filter_index_rows(rows, &filter, None)?;
+        let row_refs = rows.iter().collect::<Vec<_>>();
+        let rows = source.filter_index_row_refs(&row_refs, &filter, None)?;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].encoded_key.as_slice(), b"k3");
         Ok(())
