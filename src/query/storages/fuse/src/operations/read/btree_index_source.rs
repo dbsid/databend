@@ -215,9 +215,14 @@ impl AsyncSource for BtreeIndexSource {
             );
         }
 
+        let candidate_read_start = Instant::now();
         let rows = self
             .read_candidate_rows(candidates, &prefix, filter.as_ref())
             .await?;
+        record_elapsed(
+            ProfileStatisticsName::BtreeIndexCandidateReadTime,
+            candidate_read_start,
+        );
         if rows.is_empty() {
             return Ok(None);
         }
@@ -231,8 +236,13 @@ impl AsyncSource for BtreeIndexSource {
             decode_start,
         );
 
+        let output_build_start = Instant::now();
         let mut block = payload_rows_to_block(&self.btree_index.payload_fields, decoded_rows)?;
         block = block.resort(&self.payload_schema, &self.output_schema)?;
+        record_elapsed(
+            ProfileStatisticsName::BtreeIndexOutputBuildTime,
+            output_build_start,
+        );
         Ok(Some(block))
     }
 }
