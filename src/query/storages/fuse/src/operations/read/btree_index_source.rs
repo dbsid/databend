@@ -203,6 +203,7 @@ impl AsyncSource for BtreeIndexSource {
         let prefix = encode_prefix(&self.btree_index)?;
         let filter = self.build_filter_expr(self.btree_index.filters.as_ref())?;
         let candidate_read_start = Instant::now();
+        let candidate_collect_start = Instant::now();
         let mut candidates = Vec::new();
         while let Some(parts) = self.fetch_parts().await? {
             if parts.is_empty() {
@@ -215,6 +216,10 @@ impl AsyncSource for BtreeIndexSource {
                     .await?,
             );
         }
+        record_elapsed(
+            ProfileStatisticsName::BtreeIndexCandidateCollectTime,
+            candidate_collect_start,
+        );
 
         let rows = self
             .read_candidate_rows(candidates, &prefix, filter.as_ref())
@@ -513,6 +518,7 @@ impl BtreeIndexSource {
         prefix: &[u8],
         filter: Option<&BtreeIndexFilter>,
     ) -> Result<Vec<BtreeIndexCandidateBlock>> {
+        Profile::record_usize_profile(ProfileStatisticsName::BtreeIndexPartsScanned, parts.len());
         let key_predicates = filter
             .map(|filter| filter.key_predicates.clone())
             .unwrap_or_default();
@@ -591,6 +597,7 @@ impl BtreeIndexSource {
             return Ok(Vec::new());
         }
 
+        let sort_start = Instant::now();
         candidates.sort_by(|left, right| {
             left.block_meta
                 .first_key
@@ -599,6 +606,10 @@ impl BtreeIndexSource {
                 .then_with(|| left.index_location.cmp(&right.index_location))
                 .then_with(|| left.block_meta.offset.cmp(&right.block_meta.offset))
         });
+        record_elapsed(
+            ProfileStatisticsName::BtreeIndexCandidateSortTime,
+            sort_start,
+        );
 
         if candidate_blocks_are_disjoint(&candidates) {
             self.read_candidate_rows_in_order(candidates, prefix, filter)
@@ -719,6 +730,7 @@ impl BtreeIndexSource {
         limit: Option<usize>,
         upper_bound_key: Option<&[u8]>,
     ) -> Result<Vec<BtreeIndexRow>> {
+        let load_start = Instant::now();
         let rows = load_btree_index_data_block(
             self.operator.clone(),
             &candidate.index_location,
@@ -726,7 +738,12 @@ impl BtreeIndexSource {
             &candidate.block_meta,
         )
         .await?;
+        record_elapsed(
+            ProfileStatisticsName::BtreeIndexDataBlockLoadTime,
+            load_start,
+        );
         Profile::record_usize_profile(ProfileStatisticsName::BtreeIndexRowsDecoded, rows.len());
+        let row_select_start = Instant::now();
         let mut rows = btree_prefix_row_refs(&rows, prefix);
         truncate_row_refs_before_key(&mut rows, upper_bound_key);
         let rows = if let Some(filter) = filter {
@@ -734,6 +751,10 @@ impl BtreeIndexSource {
         } else {
             clone_row_refs(&rows, limit)
         };
+        record_elapsed(
+            ProfileStatisticsName::BtreeIndexRowSelectTime,
+            row_select_start,
+        );
         Profile::record_usize_profile(ProfileStatisticsName::BtreeIndexRowsMatched, rows.len());
         Ok(rows)
     }
