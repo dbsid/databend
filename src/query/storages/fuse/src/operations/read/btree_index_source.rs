@@ -973,7 +973,13 @@ fn candidate_block_may_match_key_predicates(
 
     key_predicates
         .iter()
-        .filter(|predicate| predicate.component_index == prefix_component_count)
+        .filter(|predicate| {
+            candidate_block_has_constant_prefix_before_component(
+                block_meta,
+                prefix_component_count,
+                predicate.component_index,
+            )
+        })
         .all(|predicate| {
             let Some(first_component) =
                 encoded_key_component(&block_meta.first_key, predicate.component_index)
@@ -987,6 +993,27 @@ fn candidate_block_may_match_key_predicates(
             };
             key_component_range_may_match_predicate(predicate, first_component, last_component)
         })
+}
+
+fn candidate_block_has_constant_prefix_before_component(
+    block_meta: &BtreeIndexDataBlockMeta,
+    prefix_component_count: usize,
+    component_index: usize,
+) -> bool {
+    if component_index == prefix_component_count {
+        return true;
+    }
+    if component_index < prefix_component_count {
+        return false;
+    }
+
+    let Ok(first_prefix) = btree_equality_prefix(&block_meta.first_key, component_index) else {
+        return false;
+    };
+    let Ok(last_prefix) = btree_equality_prefix(&block_meta.last_key, component_index) else {
+        return false;
+    };
+    first_prefix == last_prefix
 }
 
 fn key_component_range_may_match_predicate(
@@ -1970,6 +1997,118 @@ mod tests {
         );
         assert!(candidate_block_may_match_key_predicates(
             &boundary_block.block_meta,
+            &prefix,
+            2,
+            &key_predicates
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_candidate_block_pruning_uses_later_suffix_only_when_prefix_is_constant() -> Result<()> {
+        let key_field = BtreeIndexKeyField {
+            component_index: 3,
+            order: BtreeIndexKeyOrder::Asc,
+            data_type: TableDataType::Number(NumberDataType::Int8).wrap_nullable(),
+        };
+        let (key_predicates, _) =
+            split_btree_fast_predicates(vec![BtreeIndexFastPredicate::IsNull { column: 0 }], &[
+                Some(key_field),
+            ])?;
+        let prefix_key = encoded_test_key(&[
+            (
+                Scalar::Number(NumberScalar::Int64(14)),
+                BtreeIndexKeyOrder::Asc,
+            ),
+            (
+                Scalar::String("token-a".to_string()),
+                BtreeIndexKeyOrder::Asc,
+            ),
+        ])?;
+        let prefix = btree_equality_prefix(&prefix_key, 2)?;
+
+        let same_balance_non_null_tag_block = candidate_block(
+            &encoded_test_key(&[
+                (
+                    Scalar::Number(NumberScalar::Int64(14)),
+                    BtreeIndexKeyOrder::Asc,
+                ),
+                (
+                    Scalar::String("token-a".to_string()),
+                    BtreeIndexKeyOrder::Asc,
+                ),
+                (
+                    Scalar::Number(NumberScalar::Int64(10)),
+                    BtreeIndexKeyOrder::Desc,
+                ),
+                (
+                    Scalar::Number(NumberScalar::Int8(1)),
+                    BtreeIndexKeyOrder::Asc,
+                ),
+            ])?,
+            &encoded_test_key(&[
+                (
+                    Scalar::Number(NumberScalar::Int64(14)),
+                    BtreeIndexKeyOrder::Asc,
+                ),
+                (
+                    Scalar::String("token-a".to_string()),
+                    BtreeIndexKeyOrder::Asc,
+                ),
+                (
+                    Scalar::Number(NumberScalar::Int64(10)),
+                    BtreeIndexKeyOrder::Desc,
+                ),
+                (
+                    Scalar::Number(NumberScalar::Int8(1)),
+                    BtreeIndexKeyOrder::Asc,
+                ),
+            ])?,
+        );
+        assert!(!candidate_block_may_match_key_predicates(
+            &same_balance_non_null_tag_block.block_meta,
+            &prefix,
+            2,
+            &key_predicates
+        ));
+
+        let different_balance_block = candidate_block(
+            &encoded_test_key(&[
+                (
+                    Scalar::Number(NumberScalar::Int64(14)),
+                    BtreeIndexKeyOrder::Asc,
+                ),
+                (
+                    Scalar::String("token-a".to_string()),
+                    BtreeIndexKeyOrder::Asc,
+                ),
+                (
+                    Scalar::Number(NumberScalar::Int64(11)),
+                    BtreeIndexKeyOrder::Desc,
+                ),
+                (
+                    Scalar::Number(NumberScalar::Int8(1)),
+                    BtreeIndexKeyOrder::Asc,
+                ),
+            ])?,
+            &encoded_test_key(&[
+                (
+                    Scalar::Number(NumberScalar::Int64(14)),
+                    BtreeIndexKeyOrder::Asc,
+                ),
+                (
+                    Scalar::String("token-a".to_string()),
+                    BtreeIndexKeyOrder::Asc,
+                ),
+                (
+                    Scalar::Number(NumberScalar::Int64(10)),
+                    BtreeIndexKeyOrder::Desc,
+                ),
+                (Scalar::Null, BtreeIndexKeyOrder::Asc),
+            ])?,
+        );
+        assert!(candidate_block_may_match_key_predicates(
+            &different_balance_block.block_meta,
             &prefix,
             2,
             &key_predicates
