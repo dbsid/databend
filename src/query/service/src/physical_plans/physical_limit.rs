@@ -158,8 +158,11 @@ impl PhysicalPlanBuilder {
         let mut input_plan = self.build(s_expr.child(0)?, required).await?;
         if !lazy_columns.is_empty()
             && support_lazy_materialize
-            && btree_index_covers_lazy_columns(&input_plan, &lazy_columns, &metadata)
+            && (plan_contains_btree_index(&input_plan)
+                || btree_index_covers_lazy_columns(&input_plan, &lazy_columns, &metadata))
         {
+            // A covered BTREE scan returns rows from the SST payload directly and
+            // does not provide `_row_id`, so it cannot be combined with RowFetch.
             lazy_columns.clear();
             input_plan = self.build(s_expr.child(0)?, original_required).await?;
         }
@@ -316,6 +319,20 @@ impl PhysicalPlanBuilder {
 
         Ok(plan)
     }
+}
+
+fn plan_contains_btree_index(plan: &PhysicalPlan) -> bool {
+    if let Some(scan) = crate::physical_plans::TableScan::from_physical_plan(plan)
+        && scan
+            .source
+            .push_downs
+            .as_ref()
+            .and_then(|push_downs| push_downs.btree_index.as_ref())
+            .is_some()
+    {
+        return true;
+    }
+    plan.children().any(plan_contains_btree_index)
 }
 
 fn btree_index_covers_lazy_columns(
