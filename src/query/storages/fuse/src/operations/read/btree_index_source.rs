@@ -49,6 +49,7 @@ use databend_storages_common_index::BtreeIndexKeyOrder;
 use databend_storages_common_index::BtreeIndexRow;
 use databend_storages_common_index::btree_equality_prefix;
 use databend_storages_common_index::decode_btree_payload;
+use databend_storages_common_index::decode_btree_payload_projection;
 use databend_storages_common_index::encode_btree_key_component;
 use futures::future;
 use opendal::Operator;
@@ -203,6 +204,12 @@ struct BtreeIndexCandidateBlock {
     block_meta: BtreeIndexDataBlockMeta,
 }
 
+struct BtreeIndexFilter {
+    expr: Expr<usize>,
+    payload_field_indexes: Vec<usize>,
+    payload_fields: Vec<TableField>,
+}
+
 impl BtreeIndexSource {
     async fn fetch_parts(&self) -> Result<Option<Vec<PartInfoPtr>>> {
         if let Some(receiver) = &self.receiver {
@@ -218,21 +225,50 @@ impl BtreeIndexSource {
             .and_then(|partitions| partitions.steal(self.worker_id, 8)))
     }
 
-    fn build_filter_expr(&self, filters: Option<&Filters>) -> Result<Option<Expr<usize>>> {
+    fn build_filter_expr(&self, filters: Option<&Filters>) -> Result<Option<BtreeIndexFilter>> {
         let Some(filters) = filters else {
             return Ok(None);
         };
-        filters
+        let expr = filters
             .filter
             .as_expr(&BUILTIN_FUNCTIONS)
-            .project_column_ref(|name| self.payload_schema.index_of(name))
-            .map(Some)
+            .project_column_ref(|name| self.payload_schema.index_of(name))?;
+        let mut payload_field_indexes = expr.column_refs().keys().cloned().collect::<Vec<_>>();
+        payload_field_indexes.sort_unstable();
+        payload_field_indexes.dedup();
+        let payload_fields = payload_field_indexes
+            .iter()
+            .map(|index| {
+                self.btree_index
+                    .payload_fields
+                    .get(*index)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ErrorCode::StorageOther(format!(
+                            "btree filter references missing payload column {}, width {}",
+                            index,
+                            self.btree_index.payload_fields.len()
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let expr = expr.project_column_ref(|index| {
+            Ok(payload_field_indexes
+                .iter()
+                .position(|payload_index| payload_index == index)
+                .unwrap())
+        })?;
+        Ok(Some(BtreeIndexFilter {
+            expr,
+            payload_field_indexes,
+            payload_fields,
+        }))
     }
 
     fn filter_index_rows(
         &self,
         rows: Vec<BtreeIndexRow>,
-        filter: &Expr<usize>,
+        filter: &BtreeIndexFilter,
         limit: Option<usize>,
     ) -> Result<Vec<BtreeIndexRow>> {
         if rows.is_empty() {
@@ -242,12 +278,17 @@ impl BtreeIndexSource {
         let start = Instant::now();
         let payload_rows = rows
             .iter()
-            .map(|row| decode_btree_payload(&row.encoded_row_payload))
+            .map(|row| {
+                decode_btree_payload_projection(
+                    &row.encoded_row_payload,
+                    &filter.payload_field_indexes,
+                )
+            })
             .collect::<Result<Vec<_>>>()?;
-        let block = payload_rows_to_block(&self.btree_index.payload_fields, payload_rows)?;
+        let block = payload_rows_to_block(&filter.payload_fields, payload_rows)?;
         let evaluator = Evaluator::new(&block, &self.func_ctx, &BUILTIN_FUNCTIONS);
         let filter = evaluator
-            .run(filter)?
+            .run(&filter.expr)?
             .try_downcast::<BooleanType>()
             .unwrap();
 
@@ -327,7 +368,7 @@ impl BtreeIndexSource {
         &self,
         mut candidates: Vec<BtreeIndexCandidateBlock>,
         prefix: &[u8],
-        filter: Option<&Expr<usize>>,
+        filter: Option<&BtreeIndexFilter>,
     ) -> Result<Vec<BtreeIndexRow>> {
         if candidates.is_empty() {
             return Ok(Vec::new());
@@ -355,7 +396,7 @@ impl BtreeIndexSource {
         &self,
         candidates: Vec<BtreeIndexCandidateBlock>,
         prefix: &[u8],
-        filter: Option<&Expr<usize>>,
+        filter: Option<&BtreeIndexFilter>,
     ) -> Result<Vec<BtreeIndexRow>> {
         let mut rows = Vec::new();
         for candidate in candidates {
@@ -386,7 +427,7 @@ impl BtreeIndexSource {
         &self,
         candidates: Vec<BtreeIndexCandidateBlock>,
         prefix: &[u8],
-        filter: Option<&Expr<usize>>,
+        filter: Option<&BtreeIndexFilter>,
     ) -> Result<Vec<BtreeIndexRow>> {
         let Some(limit) = self.btree_index.limit else {
             let mut rows = Vec::new();
@@ -439,7 +480,7 @@ impl BtreeIndexSource {
         &self,
         candidates: &[BtreeIndexCandidateBlock],
         prefix: &[u8],
-        filter: Option<&Expr<usize>>,
+        filter: Option<&BtreeIndexFilter>,
         limit: Option<usize>,
     ) -> Result<Vec<Vec<BtreeIndexRow>>> {
         let futures = candidates
@@ -452,7 +493,7 @@ impl BtreeIndexSource {
         &self,
         candidate: &BtreeIndexCandidateBlock,
         prefix: &[u8],
-        filter: Option<&Expr<usize>>,
+        filter: Option<&BtreeIndexFilter>,
         limit: Option<usize>,
     ) -> Result<Vec<BtreeIndexRow>> {
         let mut rows = load_btree_index_data_block(
@@ -518,6 +559,14 @@ fn payload_rows_to_block(
     rows: Vec<Vec<Scalar>>,
 ) -> Result<DataBlock> {
     let num_rows = rows.len();
+    if payload_fields.is_empty() {
+        if rows.iter().any(|row| !row.is_empty()) {
+            return Err(ErrorCode::StorageOther(
+                "invalid btree payload width for empty projection".to_string(),
+            ));
+        }
+        return Ok(DataBlock::empty_with_rows(num_rows));
+    }
     let mut builders = payload_fields
         .iter()
         .map(|field| ColumnBuilder::with_capacity(&DataType::from(field.data_type()), num_rows))
@@ -653,14 +702,14 @@ mod tests {
                 ])?,
             },
         ];
-        let filter = check_function(
+        let expr = check_function(
             None,
             "eq",
             &[],
             &[
                 Expr::ColumnRef(ColumnRef {
                     span: None,
-                    id: "balance".to_string(),
+                    id: 0usize,
                     data_type: DataType::Number(NumberDataType::UInt64),
                     display_name: "balance".to_string(),
                 }),
@@ -671,8 +720,12 @@ mod tests {
                 }),
             ],
             &BUILTIN_FUNCTIONS,
-        )?
-        .project_column_ref(|name| source.payload_schema.index_of(name))?;
+        )?;
+        let filter = BtreeIndexFilter {
+            expr,
+            payload_field_indexes: vec![1],
+            payload_fields: vec![balance],
+        };
 
         let rows = source.filter_index_rows(rows, &filter, None)?;
         assert_eq!(rows.len(), 1);

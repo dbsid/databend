@@ -63,6 +63,7 @@ pub use btree_index::btree_footer_range;
 pub use btree_index::btree_index_section;
 pub use btree_index::decode_btree_footer_bytes;
 pub use btree_index::decode_btree_payload;
+pub use btree_index::decode_btree_payload_projection;
 pub use btree_index::encode_btree_key_component;
 pub use btree_index::encode_btree_payload;
 pub use eliminate_cast::eliminate_cast;

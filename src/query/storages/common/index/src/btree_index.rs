@@ -41,6 +41,8 @@ pub const DEFAULT_BTREE_INDEX_BLOOM_BITS_PER_KEY: u64 = 10;
 const BTREE_INDEX_BLOOM_SEED: u64 = 0;
 const FOOTER_LEN_SIZE: usize = 4;
 const MAGIC_SIZE: usize = BTREE_INDEX_MAGIC.len();
+const BTREE_ROW_PAYLOAD_MAGIC: &[u8; 4] = b"DBP1";
+const BTREE_ROW_PAYLOAD_HEADER_SIZE: usize = BTREE_ROW_PAYLOAD_MAGIC.len() + 4;
 pub const BTREE_INDEX_FOOTER_TAIL_SIZE: usize = FOOTER_LEN_SIZE + MAGIC_SIZE;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -737,11 +739,186 @@ impl TryFrom<Bytes> for BtreeIndexFileMeta {
 }
 
 pub fn encode_btree_payload(payload: &[Scalar]) -> Result<Vec<u8>> {
-    encode_to_vec(payload, "btree row payload")
+    let column_count = u32::try_from(payload.len()).map_err(|_| {
+        ErrorCode::StorageOther(format!(
+            "btree row payload has too many columns: {}",
+            payload.len()
+        ))
+    })?;
+    let mut encoded_columns = Vec::with_capacity(payload.len());
+    let mut payload_size = 0usize;
+    for scalar in payload {
+        let encoded = encode_to_vec(scalar, "btree row payload column")?;
+        payload_size = payload_size
+            .checked_add(encoded.len())
+            .ok_or_else(|| ErrorCode::StorageOther("btree row payload is too large".to_string()))?;
+        encoded_columns.push(encoded);
+    }
+
+    let header_size =
+        BTREE_ROW_PAYLOAD_HEADER_SIZE
+            .checked_add(payload.len().checked_mul(4).ok_or_else(|| {
+                ErrorCode::StorageOther("btree row payload is too large".to_string())
+            })?)
+            .ok_or_else(|| ErrorCode::StorageOther("btree row payload is too large".to_string()))?;
+    let mut encoded_payload = Vec::with_capacity(header_size + payload_size);
+    encoded_payload.extend_from_slice(BTREE_ROW_PAYLOAD_MAGIC);
+    encoded_payload.extend_from_slice(&column_count.to_le_bytes());
+
+    let mut offset = 0usize;
+    for column in &encoded_columns {
+        offset = offset
+            .checked_add(column.len())
+            .ok_or_else(|| ErrorCode::StorageOther("btree row payload is too large".to_string()))?;
+        let offset = u32::try_from(offset)
+            .map_err(|_| ErrorCode::StorageOther("btree row payload is too large".to_string()))?;
+        encoded_payload.extend_from_slice(&offset.to_le_bytes());
+    }
+    for column in encoded_columns {
+        encoded_payload.extend_from_slice(&column);
+    }
+    Ok(encoded_payload)
 }
 
 pub fn decode_btree_payload(payload: &[u8]) -> Result<Vec<Scalar>> {
-    decode_from_slice(payload, "btree row payload")
+    if !is_offset_encoded_payload(payload) {
+        return decode_from_slice(payload, "btree row payload");
+    }
+
+    let view = BtreePayloadView::parse(payload)?;
+    (0..view.column_count())
+        .map(|index| view.decode_column(index))
+        .collect()
+}
+
+pub fn decode_btree_payload_projection(
+    payload: &[u8],
+    column_indexes: &[usize],
+) -> Result<Vec<Scalar>> {
+    if !is_offset_encoded_payload(payload) {
+        let row = decode_from_slice::<Vec<Scalar>>(payload, "btree row payload")?;
+        return column_indexes
+            .iter()
+            .map(|index| {
+                row.get(*index).cloned().ok_or_else(|| {
+                    ErrorCode::StorageOther(format!(
+                        "btree row payload missing column {}, width {}",
+                        index,
+                        row.len()
+                    ))
+                })
+            })
+            .collect();
+    }
+
+    let view = BtreePayloadView::parse(payload)?;
+    column_indexes
+        .iter()
+        .map(|index| view.decode_column(*index))
+        .collect()
+}
+
+fn is_offset_encoded_payload(payload: &[u8]) -> bool {
+    payload.starts_with(BTREE_ROW_PAYLOAD_MAGIC)
+}
+
+struct BtreePayloadView<'a> {
+    offsets: &'a [u8],
+    data: &'a [u8],
+    column_count: usize,
+}
+
+impl<'a> BtreePayloadView<'a> {
+    fn parse(payload: &'a [u8]) -> Result<Self> {
+        if payload.len() < BTREE_ROW_PAYLOAD_HEADER_SIZE {
+            return Err(ErrorCode::StorageOther(format!(
+                "invalid btree row payload length {}, too small",
+                payload.len()
+            )));
+        }
+        if !is_offset_encoded_payload(payload) {
+            return Err(ErrorCode::StorageOther(
+                "invalid btree row payload magic".to_string(),
+            ));
+        }
+        let column_count = u32::from_le_bytes(
+            payload[BTREE_ROW_PAYLOAD_MAGIC.len()..BTREE_ROW_PAYLOAD_HEADER_SIZE]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let offsets_len = column_count.checked_mul(4).ok_or_else(|| {
+            ErrorCode::StorageOther("invalid btree row payload column count".to_string())
+        })?;
+        let data_start = BTREE_ROW_PAYLOAD_HEADER_SIZE
+            .checked_add(offsets_len)
+            .ok_or_else(|| {
+                ErrorCode::StorageOther("invalid btree row payload header".to_string())
+            })?;
+        if payload.len() < data_start {
+            return Err(ErrorCode::StorageOther(format!(
+                "invalid btree row payload header length {}, payload length {}",
+                data_start,
+                payload.len()
+            )));
+        }
+
+        let offsets = &payload[BTREE_ROW_PAYLOAD_HEADER_SIZE..data_start];
+        let data = &payload[data_start..];
+        let mut previous = 0usize;
+        for index in 0..column_count {
+            let offset = read_payload_offset(offsets, index)?;
+            if offset < previous || offset > data.len() {
+                return Err(ErrorCode::StorageOther(format!(
+                    "invalid btree row payload offset {} at column {}, previous {}, data length {}",
+                    offset,
+                    index,
+                    previous,
+                    data.len()
+                )));
+            }
+            previous = offset;
+        }
+
+        Ok(Self {
+            offsets,
+            data,
+            column_count,
+        })
+    }
+
+    fn column_count(&self) -> usize {
+        self.column_count
+    }
+
+    fn decode_column(&self, index: usize) -> Result<Scalar> {
+        if index >= self.column_count {
+            return Err(ErrorCode::StorageOther(format!(
+                "btree row payload missing column {}, width {}",
+                index, self.column_count
+            )));
+        }
+        let start = if index == 0 {
+            0
+        } else {
+            read_payload_offset(self.offsets, index - 1)?
+        };
+        let end = read_payload_offset(self.offsets, index)?;
+        decode_from_slice(&self.data[start..end], "btree row payload column")
+    }
+}
+
+fn read_payload_offset(offsets: &[u8], index: usize) -> Result<usize> {
+    let start = index.checked_mul(4).ok_or_else(|| {
+        ErrorCode::StorageOther("invalid btree row payload offset index".to_string())
+    })?;
+    let end = start + 4;
+    let Some(bytes) = offsets.get(start..end) else {
+        return Err(ErrorCode::StorageOther(format!(
+            "invalid btree row payload offset index {}",
+            index
+        )));
+    };
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()) as usize)
 }
 
 pub fn btree_equality_prefix(key: &[u8], component_count: usize) -> Result<Vec<u8>> {
@@ -940,6 +1117,26 @@ mod tests {
 
         assert_eq!(footer.version, BTREE_INDEX_FILE_VERSION);
         assert_eq!(footer.key_order, "wallet ASC");
+        Ok(())
+    }
+
+    #[test]
+    fn test_btree_payload_projection_decode() -> Result<()> {
+        let payload = encode_btree_payload(&[
+            Scalar::String("wallet-a".to_string()),
+            Scalar::Number(databend_common_expression::types::NumberScalar::UInt64(14)),
+            Scalar::String("token-a".to_string()),
+        ])?;
+
+        let projected = decode_btree_payload_projection(&payload, &[2, 0])?;
+        assert_eq!(projected, vec![
+            Scalar::String("token-a".to_string()),
+            Scalar::String("wallet-a".to_string())
+        ]);
+
+        let decoded = decode_btree_payload(&payload)?;
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0], Scalar::String("wallet-a".to_string()));
         Ok(())
     }
 }
