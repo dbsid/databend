@@ -605,7 +605,7 @@ impl BtreeIndexSource {
         prefix: &[u8],
         filter: Option<&BtreeIndexFilter>,
     ) -> Result<Vec<BtreeIndexRow>> {
-        let mut rows = Vec::new();
+        let mut rows: Vec<BtreeIndexRow> = Vec::new();
         for candidate in candidates {
             let remaining = self
                 .btree_index
@@ -615,7 +615,7 @@ impl BtreeIndexSource {
                 return Ok(rows);
             }
             let mut block_rows = self
-                .read_candidate_block(&candidate, prefix, filter, remaining)
+                .read_candidate_block(&candidate, prefix, filter, remaining, None)
                 .await?;
             rows.append(&mut block_rows);
             if self
@@ -640,7 +640,7 @@ impl BtreeIndexSource {
             let mut rows = Vec::new();
             for batch in candidates.chunks(BTREE_INDEX_DATA_BLOCK_READ_BATCH_SIZE) {
                 for mut block_rows in self
-                    .read_candidate_blocks_batch(batch, prefix, filter, None)
+                    .read_candidate_blocks_batch(batch, prefix, filter, None, None)
                     .await?
                 {
                     rows.append(&mut block_rows);
@@ -650,16 +650,22 @@ impl BtreeIndexSource {
             return Ok(rows);
         };
 
-        let mut rows = Vec::new();
+        let mut rows: Vec<BtreeIndexRow> = Vec::new();
         let mut candidate_offset = 0;
         while candidate_offset < candidates.len() {
             let batch_end = candidate_offset + 1;
+            let upper_bound_key = if rows.len() == limit {
+                Some(rows[limit - 1].encoded_key.as_slice())
+            } else {
+                None
+            };
             for mut block_rows in self
                 .read_candidate_blocks_batch(
                     &candidates[candidate_offset..batch_end],
                     prefix,
                     filter,
                     Some(limit),
+                    upper_bound_key,
                 )
                 .await?
             {
@@ -687,10 +693,11 @@ impl BtreeIndexSource {
         prefix: &[u8],
         filter: Option<&BtreeIndexFilter>,
         limit: Option<usize>,
+        upper_bound_key: Option<&[u8]>,
     ) -> Result<Vec<Vec<BtreeIndexRow>>> {
-        let futures = candidates
-            .iter()
-            .map(|candidate| self.read_candidate_block(candidate, prefix, filter, limit));
+        let futures = candidates.iter().map(|candidate| {
+            self.read_candidate_block(candidate, prefix, filter, limit, upper_bound_key)
+        });
         future::try_join_all(futures).await
     }
 
@@ -700,6 +707,7 @@ impl BtreeIndexSource {
         prefix: &[u8],
         filter: Option<&BtreeIndexFilter>,
         limit: Option<usize>,
+        upper_bound_key: Option<&[u8]>,
     ) -> Result<Vec<BtreeIndexRow>> {
         let rows = load_btree_index_data_block(
             self.operator.clone(),
@@ -709,7 +717,8 @@ impl BtreeIndexSource {
         )
         .await?;
         Profile::record_usize_profile(ProfileStatisticsName::BtreeIndexRowsDecoded, rows.len());
-        let rows = btree_prefix_row_refs(&rows, prefix);
+        let mut rows = btree_prefix_row_refs(&rows, prefix);
+        truncate_row_refs_before_key(&mut rows, upper_bound_key);
         let rows = if let Some(filter) = filter {
             self.filter_index_row_refs(&rows, filter, limit)?
         } else {
@@ -948,6 +957,15 @@ fn btree_prefix_row_refs<'a>(rows: &'a [BtreeIndexRow], prefix: &[u8]) -> Vec<&'
         end += 1;
     }
     rows[start..end].iter().collect()
+}
+
+fn truncate_row_refs_before_key(rows: &mut Vec<&BtreeIndexRow>, upper_bound_key: Option<&[u8]>) {
+    let Some(upper_bound_key) = upper_bound_key else {
+        return;
+    };
+
+    let end = rows.partition_point(|row| row.encoded_key.as_slice() < upper_bound_key);
+    rows.truncate(end);
 }
 
 fn clone_row_refs(rows: &[&BtreeIndexRow], limit: Option<usize>) -> Vec<BtreeIndexRow> {
@@ -1725,6 +1743,22 @@ mod tests {
         let row_refs = btree_prefix_row_refs(&rows, b"wallet-1|");
 
         assert!(row_refs.is_empty());
+    }
+
+    #[test]
+    fn test_truncate_row_refs_before_topk_boundary() {
+        let rows = vec![
+            test_row(b"wallet-1|001"),
+            test_row(b"wallet-1|002"),
+            test_row(b"wallet-1|003"),
+        ];
+        let mut row_refs = rows.iter().collect::<Vec<_>>();
+
+        truncate_row_refs_before_key(&mut row_refs, Some(b"wallet-1|003"));
+
+        assert_eq!(row_refs.len(), 2);
+        assert_eq!(row_refs[0].encoded_key.as_slice(), b"wallet-1|001");
+        assert_eq!(row_refs[1].encoded_key.as_slice(), b"wallet-1|002");
     }
 
     #[test]
