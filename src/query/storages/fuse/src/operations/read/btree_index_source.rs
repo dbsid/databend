@@ -391,10 +391,12 @@ impl BtreeIndexSource {
         let Some(limit) = self.btree_index.limit else {
             let mut rows = Vec::new();
             for batch in candidates.chunks(BTREE_INDEX_DATA_BLOCK_READ_BATCH_SIZE) {
-                let mut block_rows = self
+                for mut block_rows in self
                     .read_candidate_blocks_batch(batch, prefix, filter, None)
-                    .await?;
-                rows.append(&mut block_rows);
+                    .await?
+                {
+                    rows.append(&mut block_rows);
+                }
             }
             rows.sort_by(|left, right| left.encoded_key.cmp(&right.encoded_key));
             return Ok(rows);
@@ -405,15 +407,17 @@ impl BtreeIndexSource {
         let mut batch_size = 1;
         while candidate_offset < candidates.len() {
             let batch_end = (candidate_offset + batch_size).min(candidates.len());
-            let mut block_rows = self
+            for mut block_rows in self
                 .read_candidate_blocks_batch(
                     &candidates[candidate_offset..batch_end],
                     prefix,
                     filter,
                     Some(limit),
                 )
-                .await?;
-            rows.append(&mut block_rows);
+                .await?
+            {
+                rows.append(&mut block_rows);
+            }
             candidate_offset = batch_end;
 
             if rows.len() >= limit {
@@ -425,11 +429,7 @@ impl BtreeIndexSource {
                     return Ok(rows);
                 }
             }
-            batch_size = limit
-                .checked_sub(rows.len())
-                .filter(|remaining| *remaining > 0)
-                .map(|remaining| remaining.min(BTREE_INDEX_DATA_BLOCK_READ_BATCH_SIZE))
-                .unwrap_or(BTREE_INDEX_DATA_BLOCK_READ_BATCH_SIZE);
+            batch_size = BTREE_INDEX_DATA_BLOCK_READ_BATCH_SIZE;
         }
         sort_and_truncate_rows(&mut rows, limit);
         Ok(rows)
@@ -441,24 +441,11 @@ impl BtreeIndexSource {
         prefix: &[u8],
         filter: Option<&Expr<usize>>,
         limit: Option<usize>,
-    ) -> Result<Vec<BtreeIndexRow>> {
+    ) -> Result<Vec<Vec<BtreeIndexRow>>> {
         let futures = candidates
             .iter()
-            .map(|candidate| self.load_candidate_block_rows(candidate, prefix));
-        let mut rows = future::try_join_all(futures)
-            .await?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-
-        if let Some(filter) = filter {
-            rows = self.filter_index_rows(rows, filter, None)?;
-        }
-        if let Some(limit) = limit {
-            sort_and_truncate_rows(&mut rows, limit);
-        }
-        Profile::record_usize_profile(ProfileStatisticsName::BtreeIndexRowsMatched, rows.len());
-        Ok(rows)
+            .map(|candidate| self.read_candidate_block(candidate, prefix, filter, limit));
+        future::try_join_all(futures).await
     }
 
     async fn read_candidate_block(
@@ -483,23 +470,6 @@ impl BtreeIndexSource {
             truncate_rows(rows, limit)
         };
         Profile::record_usize_profile(ProfileStatisticsName::BtreeIndexRowsMatched, rows.len());
-        Ok(rows)
-    }
-
-    async fn load_candidate_block_rows(
-        &self,
-        candidate: &BtreeIndexCandidateBlock,
-        prefix: &[u8],
-    ) -> Result<Vec<BtreeIndexRow>> {
-        let mut rows = load_btree_index_data_block(
-            self.operator.clone(),
-            &candidate.index_location,
-            &candidate.meta,
-            &candidate.block_meta,
-        )
-        .await?;
-        Profile::record_usize_profile(ProfileStatisticsName::BtreeIndexRowsDecoded, rows.len());
-        rows.retain(|row| row.encoded_key.starts_with(prefix));
         Ok(rows)
     }
 }
