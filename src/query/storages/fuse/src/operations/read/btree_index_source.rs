@@ -1372,15 +1372,27 @@ fn evaluate_btree_key_predicates(
     predicates: &[BtreeIndexKeyPredicate],
     encoded_key: &[u8],
 ) -> bool {
-    predicates
+    let Some(max_component_index) = predicates
         .iter()
-        .all(|predicate| evaluate_btree_key_predicate(predicate, encoded_key))
-}
-
-fn evaluate_btree_key_predicate(predicate: &BtreeIndexKeyPredicate, encoded_key: &[u8]) -> bool {
-    let Some(component) = encoded_key_component(encoded_key, predicate.component_index) else {
+        .map(|predicate| predicate.component_index)
+        .max()
+    else {
+        return true;
+    };
+    let Some(components) = encoded_key_components(encoded_key, max_component_index + 1) else {
         return false;
     };
+    predicates.iter().all(|predicate| {
+        components
+            .get(predicate.component_index)
+            .is_some_and(|component| evaluate_btree_key_predicate_component(predicate, component))
+    })
+}
+
+fn evaluate_btree_key_predicate_component(
+    predicate: &BtreeIndexKeyPredicate,
+    component: &[u8],
+) -> bool {
     match &predicate.kind {
         BtreeIndexKeyPredicateKind::IsNull { null_component } => component == null_component,
         BtreeIndexKeyPredicateKind::IsNotNull { null_component } => component != null_component,
@@ -1499,6 +1511,25 @@ fn encoded_key_component(encoded_key: &[u8], component_index: usize) -> Option<&
         offset = value_end + 1;
     }
     None
+}
+
+fn encoded_key_components(encoded_key: &[u8], component_count: usize) -> Option<Vec<&[u8]>> {
+    let mut components = Vec::with_capacity(component_count);
+    let mut offset = 0usize;
+    for _ in 0..component_count {
+        let len_bytes = encoded_key.get(offset..offset + 4)?;
+        let len = u32::from_be_bytes(len_bytes.try_into().ok()?) as usize;
+        let value_start = offset + 4;
+        let value_end = value_start.checked_add(len)?;
+        let component = encoded_key.get(value_start..value_end)?;
+        let separator = encoded_key.get(value_end)?;
+        if *separator != 0xff {
+            return None;
+        }
+        components.push(component);
+        offset = value_end + 1;
+    }
+    Some(components)
 }
 
 fn encode_prefix(btree_index: &BtreeIndexInfo) -> Result<Vec<u8>> {
