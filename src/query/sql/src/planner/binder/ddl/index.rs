@@ -1081,6 +1081,19 @@ impl Binder {
                 "index_covered_type" => {
                     options.insert("index_covered_type".to_string(), value);
                 }
+                "data_block_size" => {
+                    let data_block_size = value.parse::<usize>().map_err(|_| {
+                        ErrorCode::IndexOptionInvalid(format!(
+                            "index option `{key}` must be a positive integer"
+                        ))
+                    })?;
+                    if data_block_size == 0 {
+                        return Err(ErrorCode::IndexOptionInvalid(format!(
+                            "index option `{key}` must be a positive integer"
+                        )));
+                    }
+                    options.insert("data_block_size".to_string(), value);
+                }
                 _ => {
                     return Err(ErrorCode::IndexOptionInvalid(format!(
                         "index option `{key}` is invalid key for create btree index statement",

@@ -39,6 +39,7 @@ use crate::io::TableMetaLocationGenerator;
 
 const BTREE_INDEX_OPTION_COMPRESSION: &str = "compression";
 const BTREE_INDEX_OPTION_COVERED_TYPE: &str = "index_covered_type";
+const BTREE_INDEX_OPTION_DATA_BLOCK_SIZE: &str = "data_block_size";
 const BTREE_INDEX_COVERED_ALL_COLUMNS: &str = "covered_all_columns_in_schema";
 
 #[derive(Clone)]
@@ -236,6 +237,9 @@ pub fn build_btree_index(
         ]),
     };
     let mut writer = BtreeIndexWriter::new(meta, schema, key_order, compression);
+    if let Some(data_block_size) = btree_index_data_block_size(&btree_index_builder.options)? {
+        writer = writer.with_data_block_size(data_block_size);
+    }
     let key_column_count = key_field_indexes.len();
     for row in 0..full_block.num_rows() {
         let mut key = Vec::new();
@@ -265,6 +269,25 @@ fn is_covered_all_columns(options: &BTreeMap<String, String>) -> bool {
     options
         .get(BTREE_INDEX_OPTION_COVERED_TYPE)
         .is_some_and(|value| value.eq_ignore_ascii_case(BTREE_INDEX_COVERED_ALL_COLUMNS))
+}
+
+fn btree_index_data_block_size(options: &BTreeMap<String, String>) -> Result<Option<usize>> {
+    options
+        .get(BTREE_INDEX_OPTION_DATA_BLOCK_SIZE)
+        .map(|value| {
+            let data_block_size = value.parse::<usize>().map_err(|_| {
+                ErrorCode::StorageOther(format!(
+                    "invalid btree index data_block_size option: {value}"
+                ))
+            })?;
+            if data_block_size == 0 {
+                return Err(ErrorCode::StorageOther(
+                    "invalid btree index data_block_size option: 0".to_string(),
+                ));
+            }
+            Ok(data_block_size)
+        })
+        .transpose()
 }
 
 fn field_indexes(schema: &TableSchemaRef, fields: &[TableField]) -> Result<Vec<usize>> {
@@ -378,6 +401,30 @@ mod tests {
             Scalar::Number(databend_common_expression::types::NumberScalar::UInt64(14)),
             Scalar::Number(databend_common_expression::types::NumberScalar::UInt64(30)),
         ]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_btree_index_sst_with_data_block_size_option() -> Result<()> {
+        let wallet = TableField::new_from_column_id("wallet_address", TableDataType::String, 0);
+        let schema = TableSchemaRefExt::create(vec![wallet.clone()]);
+        let block = DataBlock::new_from_columns(vec![StringType::from_data(vec![
+            "wallet-a", "wallet-b", "wallet-c",
+        ])]);
+        let builder = BtreeIndexBuilder {
+            name: "idx_wallet".to_string(),
+            version: "123456789".to_string(),
+            key_fields: vec![(wallet.clone(), TableIndexColumnOrder::Asc)],
+            payload_fields: vec![wallet],
+            options: BTreeMap::from([
+                ("compression".to_string(), "none".to_string()),
+                ("data_block_size".to_string(), "1".to_string()),
+            ]),
+        };
+
+        let data = build_btree_index(&schema, &block, &builder)?;
+        let view = BtreeIndexFileView::open(data.into())?;
+        assert_eq!(view.index_block().data_blocks.len(), 3);
         Ok(())
     }
 
