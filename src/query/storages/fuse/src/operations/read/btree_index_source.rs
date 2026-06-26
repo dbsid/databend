@@ -47,6 +47,7 @@ use databend_storages_common_index::BtreeIndexRow;
 use databend_storages_common_index::btree_equality_prefix;
 use databend_storages_common_index::decode_btree_payload;
 use databend_storages_common_index::encode_btree_key_component;
+use futures::future;
 use opendal::Operator;
 
 use crate::fuse_part::FuseBlockPartInfo;
@@ -165,32 +166,7 @@ impl AsyncSource for BtreeIndexSource {
                 continue;
             }
 
-            for part in parts {
-                let fuse_part = FuseBlockPartInfo::from_part(&part)?;
-                let index_location =
-                    TableMetaLocationGenerator::gen_btree_index_location_from_block_location(
-                        &fuse_part.location,
-                        &self.btree_index.index_name,
-                        &self.btree_index.index_version,
-                    );
-                let len_hint = self
-                    .btree_index
-                    .use_block_btree_index_size_hint
-                    .then_some(fuse_part.btree_index_size)
-                    .flatten();
-                let meta =
-                    load_btree_index_meta(self.operator.clone(), &index_location, len_hint).await?;
-                if !meta.may_contain_equality_prefix(&prefix) {
-                    continue;
-                }
-                for block_meta in meta.blocks_for_prefix(&prefix) {
-                    candidates.push(BtreeIndexCandidateBlock {
-                        index_location: index_location.clone(),
-                        meta: meta.clone(),
-                        block_meta,
-                    });
-                }
-            }
+            candidates.append(&mut self.load_candidate_blocks(parts, &prefix).await?);
         }
 
         let rows = self
@@ -246,6 +222,7 @@ impl BtreeIndexSource {
         &self,
         rows: Vec<BtreeIndexRow>,
         filter: &Expr<usize>,
+        limit: Option<usize>,
     ) -> Result<Vec<BtreeIndexRow>> {
         if rows.is_empty() {
             return Ok(rows);
@@ -263,14 +240,68 @@ impl BtreeIndexSource {
             .unwrap();
 
         match filter {
-            databend_common_expression::Value::Scalar(true) => Ok(rows),
+            databend_common_expression::Value::Scalar(true) => Ok(truncate_rows(rows, limit)),
             databend_common_expression::Value::Scalar(false) => Ok(Vec::new()),
-            databend_common_expression::Value::Column(bitmap) => Ok(rows
-                .into_iter()
-                .enumerate()
-                .filter_map(|(idx, row)| bitmap.get_bit(idx).then_some(row))
-                .collect()),
+            databend_common_expression::Value::Column(bitmap) => Ok(truncate_rows(
+                rows.into_iter()
+                    .enumerate()
+                    .filter_map(|(idx, row)| bitmap.get_bit(idx).then_some(row))
+                    .collect(),
+                limit,
+            )),
         }
+    }
+
+    async fn load_candidate_blocks(
+        &self,
+        parts: Vec<PartInfoPtr>,
+        prefix: &[u8],
+    ) -> Result<Vec<BtreeIndexCandidateBlock>> {
+        let futures = parts.into_iter().map(|part| {
+            Self::load_candidate_blocks_for_part(
+                self.operator.clone(),
+                part,
+                self.btree_index.index_name.clone(),
+                self.btree_index.index_version.clone(),
+                self.btree_index.use_block_btree_index_size_hint,
+                prefix.to_vec(),
+            )
+        });
+        let candidate_batches = future::try_join_all(futures).await?;
+        Ok(candidate_batches.into_iter().flatten().collect())
+    }
+
+    async fn load_candidate_blocks_for_part(
+        operator: Operator,
+        part: PartInfoPtr,
+        index_name: String,
+        index_version: String,
+        use_block_btree_index_size_hint: bool,
+        prefix: Vec<u8>,
+    ) -> Result<Vec<BtreeIndexCandidateBlock>> {
+        let fuse_part = FuseBlockPartInfo::from_part(&part)?;
+        let index_location =
+            TableMetaLocationGenerator::gen_btree_index_location_from_block_location(
+                &fuse_part.location,
+                &index_name,
+                &index_version,
+            );
+        let len_hint = use_block_btree_index_size_hint
+            .then_some(fuse_part.btree_index_size)
+            .flatten();
+        let meta = load_btree_index_meta(operator, &index_location, len_hint).await?;
+        if !meta.may_contain_equality_prefix(&prefix) {
+            return Ok(Vec::new());
+        }
+        Ok(meta
+            .blocks_for_prefix(&prefix)
+            .into_iter()
+            .map(|block_meta| BtreeIndexCandidateBlock {
+                index_location: index_location.clone(),
+                meta: meta.clone(),
+                block_meta,
+            })
+            .collect())
     }
 
     async fn read_candidate_rows(
@@ -309,8 +340,15 @@ impl BtreeIndexSource {
     ) -> Result<Vec<BtreeIndexRow>> {
         let mut rows = Vec::new();
         for candidate in candidates {
+            let remaining = self
+                .btree_index
+                .limit
+                .map(|limit| limit.saturating_sub(rows.len()));
+            if remaining == Some(0) {
+                return Ok(rows);
+            }
             let mut block_rows = self
-                .read_candidate_block(&candidate, prefix, filter)
+                .read_candidate_block(&candidate, prefix, filter, remaining)
                 .await?;
             rows.append(&mut block_rows);
             if self
@@ -334,7 +372,7 @@ impl BtreeIndexSource {
         let mut rows = Vec::new();
         for candidate in candidates {
             let mut block_rows = self
-                .read_candidate_block(&candidate, prefix, filter)
+                .read_candidate_block(&candidate, prefix, filter, None)
                 .await?;
             rows.append(&mut block_rows);
         }
@@ -350,6 +388,7 @@ impl BtreeIndexSource {
         candidate: &BtreeIndexCandidateBlock,
         prefix: &[u8],
         filter: Option<&Expr<usize>>,
+        limit: Option<usize>,
     ) -> Result<Vec<BtreeIndexRow>> {
         let mut rows = load_btree_index_data_block(
             self.operator.clone(),
@@ -360,10 +399,19 @@ impl BtreeIndexSource {
         .await?;
         rows.retain(|row| row.encoded_key.starts_with(prefix));
         if let Some(filter) = filter {
-            return self.filter_index_rows(rows, filter);
+            return self.filter_index_rows(rows, filter, limit);
         }
-        Ok(rows)
+        Ok(truncate_rows(rows, limit))
     }
+}
+
+fn truncate_rows(mut rows: Vec<BtreeIndexRow>, limit: Option<usize>) -> Vec<BtreeIndexRow> {
+    if let Some(limit) = limit
+        && rows.len() > limit
+    {
+        rows.truncate(limit);
+    }
+    rows
 }
 
 fn candidate_blocks_are_disjoint(candidates: &[BtreeIndexCandidateBlock]) -> bool {
@@ -548,7 +596,7 @@ mod tests {
         )?
         .project_column_ref(|name| source.payload_schema.index_of(name))?;
 
-        let rows = source.filter_index_rows(rows, &filter)?;
+        let rows = source.filter_index_rows(rows, &filter, None)?;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].encoded_key.as_slice(), b"k2");
         Ok(())
