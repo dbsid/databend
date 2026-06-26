@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -205,9 +206,35 @@ struct BtreeIndexCandidateBlock {
 }
 
 struct BtreeIndexFilter {
-    expr: Expr<usize>,
+    expr: Option<Expr<usize>>,
     payload_field_indexes: Vec<usize>,
     payload_fields: Vec<TableField>,
+    fast_predicates: Option<Vec<BtreeIndexFastPredicate>>,
+}
+
+#[derive(Clone, Debug)]
+enum BtreeIndexFastPredicate {
+    IsNull {
+        column: usize,
+    },
+    IsNotNull {
+        column: usize,
+    },
+    Compare {
+        column: usize,
+        op: BtreeIndexFastCompareOp,
+        constant: Scalar,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BtreeIndexFastCompareOp {
+    Eq,
+    NotEq,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
 }
 
 impl BtreeIndexSource {
@@ -233,7 +260,16 @@ impl BtreeIndexSource {
             .filter
             .as_expr(&BUILTIN_FUNCTIONS)
             .project_column_ref(|name| self.payload_schema.index_of(name))?;
-        let mut payload_field_indexes = expr.column_refs().keys().cloned().collect::<Vec<_>>();
+        let prefix_equalities = self.btree_prefix_payload_equalities()?;
+        let fast_predicates = compile_btree_fast_predicates(&expr, &prefix_equalities);
+        let mut payload_field_indexes = if let Some(predicates) = &fast_predicates {
+            predicates
+                .iter()
+                .filter_map(|predicate| predicate.column())
+                .collect::<Vec<_>>()
+        } else {
+            expr.column_refs().keys().cloned().collect::<Vec<_>>()
+        };
         payload_field_indexes.sort_unstable();
         payload_field_indexes.dedup();
         let payload_fields = payload_field_indexes
@@ -252,17 +288,44 @@ impl BtreeIndexSource {
                     })
             })
             .collect::<Result<Vec<_>>>()?;
-        let expr = expr.project_column_ref(|index| {
-            Ok(payload_field_indexes
-                .iter()
-                .position(|payload_index| payload_index == index)
-                .unwrap())
-        })?;
+        let fast_predicates = fast_predicates
+            .map(|predicates| {
+                predicates
+                    .into_iter()
+                    .map(|predicate| predicate.remap(&payload_field_indexes))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
+        let expr = if fast_predicates.is_none() {
+            Some(expr.project_column_ref(|index| {
+                Ok(payload_field_indexes
+                    .iter()
+                    .position(|payload_index| payload_index == index)
+                    .unwrap())
+            })?)
+        } else {
+            None
+        };
         Ok(Some(BtreeIndexFilter {
             expr,
             payload_field_indexes,
             payload_fields,
+            fast_predicates,
         }))
+    }
+
+    fn btree_prefix_payload_equalities(&self) -> Result<Vec<(usize, Scalar)>> {
+        let mut equalities = Vec::with_capacity(self.btree_index.equality_prefix.len());
+        for (key_column, scalar) in self
+            .btree_index
+            .key_columns
+            .iter()
+            .zip(self.btree_index.equality_prefix.iter())
+        {
+            let payload_index = self.payload_schema.index_of(key_column.field.name())?;
+            equalities.push((payload_index, scalar.clone()));
+        }
+        Ok(equalities)
     }
 
     fn filter_index_rows(
@@ -276,6 +339,29 @@ impl BtreeIndexSource {
         }
 
         let start = Instant::now();
+        if let Some(predicates) = &filter.fast_predicates {
+            let filtered_rows = if predicates.is_empty() {
+                truncate_rows(rows, limit)
+            } else {
+                let mut filtered_rows = Vec::new();
+                for row in rows {
+                    let payload_row = decode_btree_payload_projection(
+                        &row.encoded_row_payload,
+                        &filter.payload_field_indexes,
+                    )?;
+                    if evaluate_btree_fast_predicates(predicates, &payload_row) {
+                        filtered_rows.push(row);
+                        if limit.is_some_and(|limit| filtered_rows.len() >= limit) {
+                            break;
+                        }
+                    }
+                }
+                filtered_rows
+            };
+            record_elapsed(ProfileStatisticsName::BtreeIndexFilterTime, start);
+            return Ok(filtered_rows);
+        }
+
         let payload_rows = rows
             .iter()
             .map(|row| {
@@ -288,7 +374,9 @@ impl BtreeIndexSource {
         let block = payload_rows_to_block(&filter.payload_fields, payload_rows)?;
         let evaluator = Evaluator::new(&block, &self.func_ctx, &BUILTIN_FUNCTIONS);
         let filter = evaluator
-            .run(&filter.expr)?
+            .run(filter.expr.as_ref().ok_or_else(|| {
+                ErrorCode::StorageOther("missing btree fallback filter expression".to_string())
+            })?)?
             .try_downcast::<BooleanType>()
             .unwrap();
 
@@ -515,6 +603,47 @@ impl BtreeIndexSource {
     }
 }
 
+impl BtreeIndexFastPredicate {
+    fn column(&self) -> Option<usize> {
+        match self {
+            BtreeIndexFastPredicate::IsNull { column }
+            | BtreeIndexFastPredicate::IsNotNull { column }
+            | BtreeIndexFastPredicate::Compare { column, .. } => Some(*column),
+        }
+    }
+
+    fn remap(self, payload_field_indexes: &[usize]) -> Result<Self> {
+        let remap_column = |column| {
+            payload_field_indexes
+                .iter()
+                .position(|payload_index| *payload_index == column)
+                .ok_or_else(|| {
+                    ErrorCode::StorageOther(format!(
+                        "btree fast filter references missing payload column {}",
+                        column
+                    ))
+                })
+        };
+        Ok(match self {
+            BtreeIndexFastPredicate::IsNull { column } => BtreeIndexFastPredicate::IsNull {
+                column: remap_column(column)?,
+            },
+            BtreeIndexFastPredicate::IsNotNull { column } => BtreeIndexFastPredicate::IsNotNull {
+                column: remap_column(column)?,
+            },
+            BtreeIndexFastPredicate::Compare {
+                column,
+                op,
+                constant,
+            } => BtreeIndexFastPredicate::Compare {
+                column: remap_column(column)?,
+                op,
+                constant,
+            },
+        })
+    }
+}
+
 fn record_elapsed(name: ProfileStatisticsName, start: Instant) {
     Profile::record_usize_profile(name, start.elapsed().as_nanos() as usize);
 }
@@ -537,6 +666,202 @@ fn candidate_blocks_are_disjoint(candidates: &[BtreeIndexCandidateBlock]) -> boo
     candidates
         .windows(2)
         .all(|blocks| blocks[0].block_meta.last_key < blocks[1].block_meta.first_key)
+}
+
+fn compile_btree_fast_predicates(
+    expr: &Expr<usize>,
+    prefix_equalities: &[(usize, Scalar)],
+) -> Option<Vec<BtreeIndexFastPredicate>> {
+    let mut predicates = Vec::new();
+    collect_btree_fast_predicates(expr, prefix_equalities, &mut predicates)?;
+    Some(predicates)
+}
+
+fn collect_btree_fast_predicates(
+    expr: &Expr<usize>,
+    prefix_equalities: &[(usize, Scalar)],
+    predicates: &mut Vec<BtreeIndexFastPredicate>,
+) -> Option<()> {
+    let Expr::FunctionCall(function) = expr else {
+        return match expr {
+            Expr::Constant(constant) => match &constant.scalar {
+                Scalar::Boolean(true) => Some(()),
+                _ => None,
+            },
+            _ => None,
+        };
+    };
+
+    let name = function.id.name();
+    match name.as_ref() {
+        "and" | "and_filters" => {
+            for arg in &function.args {
+                collect_btree_fast_predicates(arg, prefix_equalities, predicates)?;
+            }
+            Some(())
+        }
+        "not" if function.args.len() == 1 => {
+            if let Some(column) = extract_is_not_null_column(&function.args[0]) {
+                predicates.push(BtreeIndexFastPredicate::IsNull { column });
+                Some(())
+            } else {
+                None
+            }
+        }
+        "is_not_null" if function.args.len() == 1 => {
+            let Expr::ColumnRef(column) = &function.args[0] else {
+                return None;
+            };
+            predicates.push(BtreeIndexFastPredicate::IsNotNull { column: column.id });
+            Some(())
+        }
+        "eq" | "noteq" | "gt" | "gte" | "lt" | "lte" if function.args.len() == 2 => {
+            let (column, constant, op) = extract_fast_compare(&function.args, name.as_ref())?;
+            if matches!(op, BtreeIndexFastCompareOp::Eq)
+                && prefix_equalities
+                    .iter()
+                    .any(|(prefix_column, prefix_scalar)| {
+                        *prefix_column == column && prefix_scalar == &constant
+                    })
+            {
+                return Some(());
+            }
+            predicates.push(BtreeIndexFastPredicate::Compare {
+                column,
+                op,
+                constant,
+            });
+            Some(())
+        }
+        _ => None,
+    }
+}
+
+fn extract_is_not_null_column(expr: &Expr<usize>) -> Option<usize> {
+    let Expr::FunctionCall(function) = expr else {
+        return None;
+    };
+    if function.id.name().as_ref() != "is_not_null" || function.args.len() != 1 {
+        return None;
+    }
+    let Expr::ColumnRef(column) = &function.args[0] else {
+        return None;
+    };
+    Some(column.id)
+}
+
+fn extract_fast_compare(
+    args: &[Expr<usize>],
+    op_name: &str,
+) -> Option<(usize, Scalar, BtreeIndexFastCompareOp)> {
+    match (&args[0], &args[1]) {
+        (Expr::ColumnRef(column), Expr::Constant(constant)) => Some((
+            column.id,
+            constant.scalar.clone(),
+            fast_compare_op(op_name, false)?,
+        )),
+        (Expr::Constant(constant), Expr::ColumnRef(column)) => Some((
+            column.id,
+            constant.scalar.clone(),
+            fast_compare_op(op_name, true)?,
+        )),
+        _ => None,
+    }
+}
+
+fn fast_compare_op(op_name: &str, reverse: bool) -> Option<BtreeIndexFastCompareOp> {
+    let op = match op_name {
+        "eq" => BtreeIndexFastCompareOp::Eq,
+        "noteq" => BtreeIndexFastCompareOp::NotEq,
+        "gt" if reverse => BtreeIndexFastCompareOp::Lt,
+        "gt" => BtreeIndexFastCompareOp::Gt,
+        "gte" if reverse => BtreeIndexFastCompareOp::Lte,
+        "gte" => BtreeIndexFastCompareOp::Gte,
+        "lt" if reverse => BtreeIndexFastCompareOp::Gt,
+        "lt" => BtreeIndexFastCompareOp::Lt,
+        "lte" if reverse => BtreeIndexFastCompareOp::Gte,
+        "lte" => BtreeIndexFastCompareOp::Lte,
+        _ => return None,
+    };
+    Some(op)
+}
+
+fn evaluate_btree_fast_predicates(
+    predicates: &[BtreeIndexFastPredicate],
+    payload_row: &[Scalar],
+) -> bool {
+    predicates
+        .iter()
+        .all(|predicate| evaluate_btree_fast_predicate(predicate, payload_row))
+}
+
+fn evaluate_btree_fast_predicate(
+    predicate: &BtreeIndexFastPredicate,
+    payload_row: &[Scalar],
+) -> bool {
+    match predicate {
+        BtreeIndexFastPredicate::IsNull { column } => payload_row
+            .get(*column)
+            .is_some_and(|value| matches!(value, Scalar::Null)),
+        BtreeIndexFastPredicate::IsNotNull { column } => payload_row
+            .get(*column)
+            .is_some_and(|value| !matches!(value, Scalar::Null)),
+        BtreeIndexFastPredicate::Compare {
+            column,
+            op,
+            constant,
+        } => {
+            let Some(value) = payload_row.get(*column) else {
+                return false;
+            };
+            if matches!(value, Scalar::Null) || matches!(constant, Scalar::Null) {
+                return false;
+            }
+            let Some(ordering) = compare_btree_filter_scalars(value, constant) else {
+                return false;
+            };
+            match op {
+                BtreeIndexFastCompareOp::Eq => ordering == Ordering::Equal,
+                BtreeIndexFastCompareOp::NotEq => ordering != Ordering::Equal,
+                BtreeIndexFastCompareOp::Gt => ordering == Ordering::Greater,
+                BtreeIndexFastCompareOp::Gte => {
+                    matches!(ordering, Ordering::Greater | Ordering::Equal)
+                }
+                BtreeIndexFastCompareOp::Lt => ordering == Ordering::Less,
+                BtreeIndexFastCompareOp::Lte => {
+                    matches!(ordering, Ordering::Less | Ordering::Equal)
+                }
+            }
+        }
+    }
+}
+
+fn compare_btree_filter_scalars(left: &Scalar, right: &Scalar) -> Option<Ordering> {
+    if let Some(ordering) = left.partial_cmp(right) {
+        return Some(ordering);
+    }
+
+    match (left, right) {
+        (Scalar::Number(left), Scalar::Number(right)) => {
+            if left.is_integer()
+                && right.is_integer()
+                && let (Some(left), Some(right)) = (left.integer_to_i128(), right.integer_to_i128())
+            {
+                return Some(left.cmp(&right));
+            }
+            Some(left.to_f64().cmp(&right.to_f64()))
+        }
+        (Scalar::Decimal(left), Scalar::Decimal(right)) => {
+            left.to_float64().partial_cmp(&right.to_float64())
+        }
+        (Scalar::Decimal(left), Scalar::Number(right)) => {
+            left.to_float64().partial_cmp(&right.to_f64().into_inner())
+        }
+        (Scalar::Number(left), Scalar::Decimal(right)) => {
+            left.to_f64().into_inner().partial_cmp(&right.to_float64())
+        }
+        _ => None,
+    }
 }
 
 fn encode_prefix(btree_index: &BtreeIndexInfo) -> Result<Vec<u8>> {
@@ -600,6 +925,8 @@ mod tests {
     use databend_common_expression::ScalarRef;
     use databend_common_expression::TableDataType;
     use databend_common_expression::type_check::check_function;
+    use databend_common_expression::types::DecimalScalar;
+    use databend_common_expression::types::DecimalSize;
     use databend_common_expression::types::NumberDataType;
     use databend_common_expression::types::NumberScalar;
     use databend_storages_common_index::BtreeIndexMeta;
@@ -722,15 +1049,204 @@ mod tests {
             &BUILTIN_FUNCTIONS,
         )?;
         let filter = BtreeIndexFilter {
-            expr,
+            expr: Some(expr),
             payload_field_indexes: vec![1],
             payload_fields: vec![balance],
+            fast_predicates: None,
         };
 
         let rows = source.filter_index_rows(rows, &filter, None)?;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].encoded_key.as_slice(), b"k2");
         Ok(())
+    }
+
+    #[test]
+    fn test_fast_filter_index_rows() -> Result<()> {
+        let wallet = TableField::new_from_column_id("wallet_address", TableDataType::String, 0);
+        let balance = TableField::new_from_column_id(
+            "balance",
+            TableDataType::Number(NumberDataType::UInt64),
+            1,
+        );
+        let tag_black_hole = TableField::new_from_column_id(
+            "tag_black_hole",
+            TableDataType::Number(NumberDataType::UInt64).wrap_nullable(),
+            2,
+        );
+        let payload_fields = vec![wallet.clone(), balance.clone(), tag_black_hole.clone()];
+        let payload_schema = DataSchema::new(vec![
+            databend_common_expression::DataField::new(
+                wallet.name(),
+                DataType::from(wallet.data_type()),
+            ),
+            databend_common_expression::DataField::new(
+                balance.name(),
+                DataType::from(balance.data_type()),
+            ),
+            databend_common_expression::DataField::new(
+                tag_black_hole.name(),
+                DataType::from(tag_black_hole.data_type()),
+            ),
+        ]);
+        let source = BtreeIndexSource {
+            operator: Operator::new(opendal::services::Memory::default())
+                .unwrap()
+                .finish(),
+            output_schema: payload_schema.clone(),
+            payload_schema,
+            func_ctx: FunctionContext::default(),
+            partitions: None,
+            receiver: None,
+            btree_index: BtreeIndexInfo {
+                index_name: "idx".to_string(),
+                index_version: "1".to_string(),
+                key_columns: vec![BtreeIndexKeyColumn {
+                    field: wallet.clone(),
+                    order: BtreeIndexColumnOrder::Asc,
+                }],
+                payload_fields,
+                equality_prefix: vec![Scalar::String("wallet-a".to_string())],
+                limit: Some(100),
+                filters: None,
+                use_block_btree_index_size_hint: false,
+            },
+            worker_id: 0,
+            is_finished: false,
+        };
+        let rows = vec![
+            BtreeIndexRow {
+                encoded_key: b"k1".to_vec(),
+                encoded_row_payload: encode_btree_payload(&[
+                    Scalar::String("wallet-a".to_string()),
+                    Scalar::Number(NumberScalar::UInt64(0)),
+                    Scalar::Null,
+                ])?,
+            },
+            BtreeIndexRow {
+                encoded_key: b"k2".to_vec(),
+                encoded_row_payload: encode_btree_payload(&[
+                    Scalar::String("wallet-a".to_string()),
+                    Scalar::Number(NumberScalar::UInt64(2)),
+                    Scalar::Number(NumberScalar::UInt64(1)),
+                ])?,
+            },
+            BtreeIndexRow {
+                encoded_key: b"k3".to_vec(),
+                encoded_row_payload: encode_btree_payload(&[
+                    Scalar::String("wallet-a".to_string()),
+                    Scalar::Number(NumberScalar::UInt64(3)),
+                    Scalar::Null,
+                ])?,
+            },
+        ];
+        let filter = BtreeIndexFilter {
+            expr: None,
+            payload_field_indexes: vec![1, 2],
+            payload_fields: vec![balance, tag_black_hole],
+            fast_predicates: Some(vec![
+                BtreeIndexFastPredicate::Compare {
+                    column: 0,
+                    op: BtreeIndexFastCompareOp::Gt,
+                    constant: Scalar::Number(NumberScalar::UInt64(0)),
+                },
+                BtreeIndexFastPredicate::IsNull { column: 1 },
+            ]),
+        };
+
+        let rows = source.filter_index_rows(rows, &filter, None)?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].encoded_key.as_slice(), b"k3");
+        Ok(())
+    }
+
+    #[test]
+    fn test_fast_filter_compiler_skips_prefix_equality() -> Result<()> {
+        let wallet_eq = check_function(
+            None,
+            "eq",
+            &[],
+            &[
+                Expr::ColumnRef(ColumnRef {
+                    span: None,
+                    id: 0usize,
+                    data_type: DataType::String,
+                    display_name: "wallet_address".to_string(),
+                }),
+                Expr::Constant(Constant {
+                    span: None,
+                    scalar: Scalar::String("wallet-a".to_string()),
+                    data_type: DataType::String,
+                }),
+            ],
+            &BUILTIN_FUNCTIONS,
+        )?;
+        let balance_gt = check_function(
+            None,
+            "gt",
+            &[],
+            &[
+                Expr::ColumnRef(ColumnRef {
+                    span: None,
+                    id: 1usize,
+                    data_type: DataType::Number(NumberDataType::UInt64),
+                    display_name: "balance".to_string(),
+                }),
+                Expr::Constant(Constant {
+                    span: None,
+                    scalar: Scalar::Number(NumberScalar::UInt64(0)),
+                    data_type: DataType::Number(NumberDataType::UInt64),
+                }),
+            ],
+            &BUILTIN_FUNCTIONS,
+        )?;
+        let expr = check_function(
+            None,
+            "and_filters",
+            &[],
+            &[wallet_eq, balance_gt],
+            &BUILTIN_FUNCTIONS,
+        )?;
+
+        let predicates =
+            compile_btree_fast_predicates(&expr, &[(0, Scalar::String("wallet-a".to_string()))])
+                .unwrap();
+        assert_eq!(predicates.len(), 1);
+        assert!(matches!(predicates[0], BtreeIndexFastPredicate::Compare {
+            column: 1,
+            op: BtreeIndexFastCompareOp::Gt,
+            ..
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_fast_filter_compare_cross_numeric_types() {
+        assert_eq!(
+            compare_btree_filter_scalars(
+                &Scalar::Number(NumberScalar::UInt8(1)),
+                &Scalar::Number(NumberScalar::Int64(0)),
+            ),
+            Some(Ordering::Greater)
+        );
+
+        let decimal_size = DecimalSize::new(65, 30).unwrap();
+        assert_eq!(
+            compare_btree_filter_scalars(
+                &Scalar::Decimal(DecimalScalar::Decimal128(1, decimal_size)),
+                &Scalar::Number(NumberScalar::Int64(0)),
+            ),
+            Some(Ordering::Greater)
+        );
+
+        let decimal_zero = DecimalSize::new(1, 0).unwrap();
+        assert_eq!(
+            compare_btree_filter_scalars(
+                &Scalar::Decimal(DecimalScalar::Decimal128(1, decimal_size)),
+                &Scalar::Decimal(DecimalScalar::Decimal64(0, decimal_zero)),
+            ),
+            Some(Ordering::Greater)
+        );
     }
 
     #[test]

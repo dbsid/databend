@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Instant;
 
 use databend_common_base::runtime::profile::Profile;
@@ -21,13 +22,46 @@ use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_storages_common_cache::CacheAccessor;
 use databend_storages_common_cache::CacheManager;
+use databend_storages_common_cache::CacheValue;
+use databend_storages_common_cache::InMemoryLruCache;
 use databend_storages_common_index::BTREE_INDEX_FOOTER_TAIL_SIZE;
 use databend_storages_common_index::BtreeIndexFile;
 use databend_storages_common_index::BtreeIndexFileMeta;
 use databend_storages_common_index::BtreeIndexFileView;
+use databend_storages_common_index::BtreeIndexRow;
 use databend_storages_common_index::btree_footer_range;
 use databend_storages_common_index::decode_btree_footer_bytes;
 use opendal::Operator;
+
+const BTREE_DECODED_DATA_BLOCK_CACHE_ITEMS: usize = 8192;
+
+static BTREE_DECODED_DATA_BLOCK_CACHE: LazyLock<InMemoryLruCache<BtreeIndexDecodedDataBlock>> =
+    LazyLock::new(|| {
+        InMemoryLruCache::with_items_capacity(
+            "btree_index_decoded_data_block".to_string(),
+            BTREE_DECODED_DATA_BLOCK_CACHE_ITEMS,
+        )
+    });
+
+#[derive(Clone)]
+struct BtreeIndexDecodedDataBlock {
+    rows: Vec<BtreeIndexRow>,
+}
+
+impl From<BtreeIndexDecodedDataBlock> for CacheValue<BtreeIndexDecodedDataBlock> {
+    fn from(value: BtreeIndexDecodedDataBlock) -> Self {
+        let mem_bytes = value
+            .rows
+            .iter()
+            .map(|row| {
+                std::mem::size_of::<BtreeIndexRow>()
+                    + row.encoded_key.len()
+                    + row.encoded_row_payload.len()
+            })
+            .sum();
+        CacheValue::new(value, mem_bytes)
+    }
+}
 
 #[fastrace::trace]
 pub async fn load_btree_index_file(
@@ -188,13 +222,21 @@ pub async fn load_btree_index_data_block(
     location: &str,
     meta: &BtreeIndexFileMeta,
     block_meta: &databend_storages_common_index::BtreeIndexDataBlockMeta,
-) -> Result<Vec<databend_storages_common_index::BtreeIndexRow>> {
+) -> Result<Vec<BtreeIndexRow>> {
     let cache_key = format!("{}#{}+{}", location, block_meta.offset, block_meta.length);
+    let decoded_cache_key = format!("decoded#{cache_key}");
+    if let Some(block) = BTREE_DECODED_DATA_BLOCK_CACHE.get(&decoded_cache_key) {
+        return Ok(block.rows.clone());
+    }
+
     let cache = CacheManager::instance().get_btree_index_file_cache();
     if let Some(block) = cache.get_sized(&cache_key, block_meta.length) {
         let start = Instant::now();
         let rows = meta.decode_data_block(block_meta, block.data.as_ref())?;
         record_elapsed(ProfileStatisticsName::BtreeIndexDataBlockDecodeTime, start);
+        BTREE_DECODED_DATA_BLOCK_CACHE.insert(decoded_cache_key, BtreeIndexDecodedDataBlock {
+            rows: rows.clone(),
+        });
         return Ok(rows);
     }
 
@@ -218,6 +260,9 @@ pub async fn load_btree_index_data_block(
         ProfileStatisticsName::BtreeIndexDataBlockDecodeTime,
         decode_start,
     );
+    BTREE_DECODED_DATA_BLOCK_CACHE.insert(decoded_cache_key, BtreeIndexDecodedDataBlock {
+        rows: rows.clone(),
+    });
     Ok(rows)
 }
 
