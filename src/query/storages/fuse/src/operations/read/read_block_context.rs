@@ -151,6 +151,7 @@ impl ReadBlockContext {
                     0,
                     None,
                     0,
+                    None,
                     block_meta.num_rows,
                     block_meta.columns_meta,
                     None,

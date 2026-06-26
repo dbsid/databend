@@ -2106,50 +2106,124 @@ impl Binder {
                     name
                 )));
             }
-            let (index_type, column_ids, options) = match table_index_def.index_type {
-                AstTableIndexType::Inverted => {
-                    let column_ids = self.validate_inverted_index_columns(
-                        table_schema.clone(),
-                        &table_index_def.columns,
-                    )?;
-                    let options =
-                        self.validate_inverted_index_options(&table_index_def.index_options)?;
-                    (TableIndexType::Inverted, column_ids, options)
-                }
-                AstTableIndexType::Ngram => {
-                    let column_ids = self.validate_ngram_index_columns(
-                        table_schema.clone(),
-                        &table_index_def.columns,
-                    )?;
-                    let options =
-                        self.validate_ngram_index_options(&table_index_def.index_options)?;
-                    (TableIndexType::Ngram, column_ids, options)
-                }
-                AstTableIndexType::Vector => {
-                    let column_ids = self.validate_vector_index_columns(
-                        table_schema.clone(),
-                        &table_index_def.columns,
-                    )?;
-                    let options =
-                        self.validate_vector_index_options(&table_index_def.index_options)?;
-                    (TableIndexType::Vector, column_ids, options)
-                }
-                AstTableIndexType::Spatial => {
-                    let column_ids = self.validate_spatial_index_columns(
-                        table_schema.clone(),
-                        &table_index_def.columns,
-                    )?;
-                    let options =
-                        self.validate_spatial_index_options(&table_index_def.index_options)?;
-                    (TableIndexType::Spatial, column_ids, options)
-                }
-                AstTableIndexType::Aggregating => unreachable!(),
-            };
+            let (index_type, column_ids, key_columns, include_column_ids, options) =
+                match table_index_def.index_type {
+                    AstTableIndexType::Inverted => {
+                        super::index::validate_no_btree_column_features(
+                            &table_index_def.index_type,
+                            &table_index_def.columns,
+                            &table_index_def.include_columns,
+                        )?;
+                        let columns =
+                            super::index::table_index_column_names(&table_index_def.columns);
+                        let column_ids =
+                            self.validate_inverted_index_columns(table_schema.clone(), &columns)?;
+                        let options =
+                            self.validate_inverted_index_options(&table_index_def.index_options)?;
+                        let key_columns = super::index::asc_key_columns(&column_ids);
+                        (
+                            TableIndexType::Inverted,
+                            column_ids,
+                            key_columns,
+                            vec![],
+                            options,
+                        )
+                    }
+                    AstTableIndexType::Ngram => {
+                        super::index::validate_no_btree_column_features(
+                            &table_index_def.index_type,
+                            &table_index_def.columns,
+                            &table_index_def.include_columns,
+                        )?;
+                        let columns =
+                            super::index::table_index_column_names(&table_index_def.columns);
+                        let column_ids =
+                            self.validate_ngram_index_columns(table_schema.clone(), &columns)?;
+                        let options =
+                            self.validate_ngram_index_options(&table_index_def.index_options)?;
+                        let key_columns = super::index::asc_key_columns(&column_ids);
+                        (
+                            TableIndexType::Ngram,
+                            column_ids,
+                            key_columns,
+                            vec![],
+                            options,
+                        )
+                    }
+                    AstTableIndexType::Vector => {
+                        super::index::validate_no_btree_column_features(
+                            &table_index_def.index_type,
+                            &table_index_def.columns,
+                            &table_index_def.include_columns,
+                        )?;
+                        let columns =
+                            super::index::table_index_column_names(&table_index_def.columns);
+                        let column_ids =
+                            self.validate_vector_index_columns(table_schema.clone(), &columns)?;
+                        let options =
+                            self.validate_vector_index_options(&table_index_def.index_options)?;
+                        let key_columns = super::index::asc_key_columns(&column_ids);
+                        (
+                            TableIndexType::Vector,
+                            column_ids,
+                            key_columns,
+                            vec![],
+                            options,
+                        )
+                    }
+                    AstTableIndexType::Spatial => {
+                        super::index::validate_no_btree_column_features(
+                            &table_index_def.index_type,
+                            &table_index_def.columns,
+                            &table_index_def.include_columns,
+                        )?;
+                        let columns =
+                            super::index::table_index_column_names(&table_index_def.columns);
+                        let column_ids =
+                            self.validate_spatial_index_columns(table_schema.clone(), &columns)?;
+                        let options =
+                            self.validate_spatial_index_options(&table_index_def.index_options)?;
+                        let key_columns = super::index::asc_key_columns(&column_ids);
+                        (
+                            TableIndexType::Spatial,
+                            column_ids,
+                            key_columns,
+                            vec![],
+                            options,
+                        )
+                    }
+                    AstTableIndexType::Btree => {
+                        let key_columns = self.validate_btree_index_columns(
+                            table_schema.clone(),
+                            &table_index_def.columns,
+                        )?;
+                        let column_ids = key_columns
+                            .iter()
+                            .map(|column| column.column_id)
+                            .collect::<Vec<_>>();
+                        let include_column_ids = self.validate_btree_index_include_columns(
+                            table_schema.clone(),
+                            &table_index_def.include_columns,
+                        )?;
+                        let options =
+                            self.validate_btree_index_options(&table_index_def.index_options)?;
+                        (
+                            TableIndexType::Btree,
+                            column_ids,
+                            key_columns,
+                            include_column_ids,
+                            options,
+                        )
+                    }
+                    AstTableIndexType::Aggregating => unreachable!(),
+                };
 
             let table_index = TableIndex {
                 index_type,
                 name: name.clone(),
                 column_ids,
+                key_columns,
+                include_column_ids,
                 sync_creation: table_index_def.sync_creation,
                 version: Uuid::new_v4().simple().to_string(),
                 options,

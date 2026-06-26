@@ -821,6 +821,8 @@ pub enum TokenKind {
     IN,
     #[token("INCLUDE_QUERY_ID", ignore(ascii_case))]
     INCLUDE_QUERY_ID,
+    #[token("INCLUDE", ignore(ascii_case))]
+    INCLUDE,
     #[token("INCREMENTAL", ignore(ascii_case))]
     INCREMENTAL,
     #[token("INCREMENT", ignore(ascii_case))]
@@ -833,6 +835,8 @@ pub enum TokenKind {
     INFORMATION,
     #[token("INITIALIZE", ignore(ascii_case))]
     INITIALIZE,
+    #[token("BTREE", ignore(ascii_case))]
+    BTREE,
     #[token("INNER", ignore(ascii_case))]
     INNER,
     #[token("INSERT", ignore(ascii_case))]

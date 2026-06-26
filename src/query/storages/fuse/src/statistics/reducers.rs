@@ -369,6 +369,8 @@ pub fn merge_statistics_mut(
         l.ngram_index_size.unwrap_or_default() + r.ngram_index_size.unwrap_or_default();
     let inverted_index_size =
         l.inverted_index_size.unwrap_or_default() + r.inverted_index_size.unwrap_or_default();
+    let btree_index_size =
+        l.btree_index_size.unwrap_or_default() + r.btree_index_size.unwrap_or_default();
     let vector_index_size =
         l.vector_index_size.unwrap_or_default() + r.vector_index_size.unwrap_or_default();
     let virtual_column_size =
@@ -377,6 +379,7 @@ pub fn merge_statistics_mut(
     l.bloom_index_size = Option::from(bloom_index_size).filter(|&x| x > 0);
     l.ngram_index_size = Option::from(ngram_index_size).filter(|&x| x > 0);
     l.inverted_index_size = Option::from(inverted_index_size).filter(|&x| x > 0);
+    l.btree_index_size = Option::from(btree_index_size).filter(|&x| x > 0);
     l.vector_index_size = Option::from(vector_index_size).filter(|&x| x > 0);
     l.virtual_column_size = Option::from(virtual_column_size).filter(|&x| x > 0);
 
@@ -421,6 +424,8 @@ pub fn deduct_statistics_mut(l: &mut Statistics, r: &Statistics) {
         l.ngram_index_size.unwrap_or_default() - r.ngram_index_size.unwrap_or_default();
     let inverted_index_size =
         l.inverted_index_size.unwrap_or_default() - r.inverted_index_size.unwrap_or_default();
+    let btree_index_size =
+        l.btree_index_size.unwrap_or_default() - r.btree_index_size.unwrap_or_default();
     let vector_index_size =
         l.vector_index_size.unwrap_or_default() - r.vector_index_size.unwrap_or_default();
     let spatial_index_size =
@@ -431,6 +436,7 @@ pub fn deduct_statistics_mut(l: &mut Statistics, r: &Statistics) {
     l.bloom_index_size = Option::from(bloom_index_size).filter(|&x| x > 0);
     l.ngram_index_size = Option::from(ngram_index_size).filter(|&x| x > 0);
     l.inverted_index_size = Option::from(inverted_index_size).filter(|&x| x > 0);
+    l.btree_index_size = Option::from(btree_index_size).filter(|&x| x > 0);
     l.vector_index_size = Option::from(vector_index_size).filter(|&x| x > 0);
     l.spatial_index_size = Option::from(spatial_index_size).filter(|&x| x > 0);
     l.virtual_column_size = Option::from(virtual_column_size).filter(|&x| x > 0);
@@ -453,6 +459,7 @@ pub fn reduce_block_metas<T: Borrow<BlockMeta>>(
     let mut bloom_index_size: u64 = 0;
     let mut ngram_index_size: u64 = 0;
     let mut inverted_index_size: u64 = 0;
+    let mut btree_index_size: u64 = 0;
     let mut vector_index_size: u64 = 0;
     let mut spatial_index_size: u64 = 0;
     let mut virtual_column_size: u64 = 0;
@@ -481,6 +488,10 @@ pub fn reduce_block_metas<T: Borrow<BlockMeta>>(
         if let Some(size) = b.inverted_index_size {
             index_size += size;
             inverted_index_size += size;
+        }
+        if let Some(size) = b.btree_index_size {
+            index_size += size;
+            btree_index_size += size;
         }
         if let Some(size) = b.vector_index_size {
             index_size += size;
@@ -523,6 +534,7 @@ pub fn reduce_block_metas<T: Borrow<BlockMeta>>(
     let bloom_index_size = Option::from(bloom_index_size).filter(|&x| x > 0);
     let ngram_index_size = Option::from(ngram_index_size).filter(|&x| x > 0);
     let inverted_index_size = Option::from(inverted_index_size).filter(|&x| x > 0);
+    let btree_index_size = Option::from(btree_index_size).filter(|&x| x > 0);
     let vector_index_size = Option::from(vector_index_size).filter(|&x| x > 0);
     let spatial_index_size = Option::from(spatial_index_size).filter(|&x| x > 0);
     let virtual_column_size = Option::from(virtual_column_size).filter(|&x| x > 0);
@@ -537,6 +549,7 @@ pub fn reduce_block_metas<T: Borrow<BlockMeta>>(
         bloom_index_size,
         ngram_index_size,
         inverted_index_size,
+        btree_index_size,
         vector_index_size,
         spatial_index_size,
         virtual_column_size,

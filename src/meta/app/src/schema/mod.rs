@@ -144,6 +144,8 @@ pub use table::TableIdTagName;
 pub use table::TableIdToName;
 pub use table::TableIdent;
 pub use table::TableIndex;
+pub use table::TableIndexColumn;
+pub use table::TableIndexColumnOrder;
 pub use table::TableIndexType;
 pub use table::TableInfo;
 pub use table::TableLvtCheck;

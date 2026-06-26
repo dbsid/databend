@@ -140,6 +140,8 @@ pub struct TableStatistics {
     pub ngram_index_size: Option<u64>,
     /// Size of inverted index in bytes
     pub inverted_index_size: Option<u64>,
+    /// Size of btree index in bytes
+    pub btree_index_size: Option<u64>,
     /// Size of vector index in bytes
     pub vector_index_size: Option<u64>,
     /// Size of virtual column in bytes
@@ -264,6 +266,34 @@ pub enum TableIndexType {
     Ngram = 1,
     Vector = 2,
     Spatial = 3,
+    Btree = 4,
+}
+
+#[derive(
+    serde::Serialize,
+    serde::Deserialize,
+    Clone,
+    Debug,
+    Eq,
+    PartialEq,
+    num_derive::FromPrimitive,
+    Hash,
+)]
+pub enum TableIndexColumnOrder {
+    Asc = 0,
+    Desc = 1,
+}
+
+impl Default for TableIndexColumnOrder {
+    fn default() -> Self {
+        Self::Asc
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq, Default, Hash)]
+pub struct TableIndexColumn {
+    pub column_id: ColumnId,
+    pub order: TableIndexColumnOrder,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -271,6 +301,13 @@ pub struct TableIndex {
     pub index_type: TableIndexType,
     pub name: String,
     pub column_ids: Vec<u32>,
+    /// Ordered key columns. Empty for metadata written before key direction
+    /// existed; readers should fall back to `column_ids` as ascending.
+    pub key_columns: Vec<TableIndexColumn>,
+    /// Included payload columns for covered indexes. Empty means either no
+    /// explicit include list or all columns when the corresponding option asks
+    /// for full schema coverage.
+    pub include_column_ids: Vec<ColumnId>,
     // if true, index will create after data written to databend,
     // no need execute refresh index manually.
     pub sync_creation: bool,
@@ -459,6 +496,9 @@ impl Display for TableIndexType {
             }
             TableIndexType::Spatial => {
                 write!(f, "SPATIAL")
+            }
+            TableIndexType::Btree => {
+                write!(f, "BTREE")
             }
         }
     }
@@ -898,6 +938,8 @@ pub struct CreateTableIndexReq {
     pub table_id: u64,
     pub name: String,
     pub column_ids: Vec<u32>,
+    pub key_columns: Vec<TableIndexColumn>,
+    pub include_column_ids: Vec<ColumnId>,
     pub sync_creation: bool,
     pub options: BTreeMap<String, String>,
 }
@@ -912,8 +954,14 @@ impl Display for CreateTableIndexReq {
 
         write!(
             f,
-            "{}: {} ColumnIds: {:?}, SyncCreation: {:?}, Options: {:?}",
-            typ, self.name, self.column_ids, self.sync_creation, self.options,
+            "{}: {} ColumnIds: {:?}, KeyColumns: {:?}, IncludeColumnIds: {:?}, SyncCreation: {:?}, Options: {:?}",
+            typ,
+            self.name,
+            self.column_ids,
+            self.key_columns,
+            self.include_column_ids,
+            self.sync_creation,
+            self.options,
         )
     }
 }

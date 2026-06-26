@@ -20,6 +20,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use databend_common_catalog::catalog::CatalogManager;
+use databend_common_catalog::plan::BtreeIndexColumnOrder;
+use databend_common_catalog::plan::BtreeIndexInfo;
+use databend_common_catalog::plan::BtreeIndexKeyColumn;
 use databend_common_catalog::plan::DataSourceInfo;
 use databend_common_catalog::plan::DataSourcePlan;
 use databend_common_catalog::plan::Filters;
@@ -40,12 +43,16 @@ use databend_common_expression::DataSchemaRef;
 use databend_common_expression::FieldIndex;
 use databend_common_expression::ROW_ID_COL_NAME;
 use databend_common_expression::RemoteExpr;
+use databend_common_expression::Scalar;
 use databend_common_expression::TableDataType;
 use databend_common_expression::TableSchema;
 use databend_common_expression::TableSchemaRef;
 use databend_common_expression::type_check::check_function;
 use databend_common_expression::types::DataType;
 use databend_common_functions::BUILTIN_FUNCTIONS;
+use databend_common_meta_app::schema::TableIndexColumn;
+use databend_common_meta_app::schema::TableIndexColumnOrder;
+use databend_common_meta_app::schema::TableIndexType;
 use databend_common_pipeline_transforms::TransformPipelineHelper;
 use databend_common_pipeline_transforms::blocks::CompoundBlockOperator;
 use databend_common_pipeline_transforms::columns::TransformAddInternalColumns;
@@ -86,6 +93,9 @@ use crate::pipelines::PipelineBuilder;
 use crate::sessions::TableContextPartitionStats;
 use crate::sessions::TableContextSettings;
 use crate::sessions::TableContextTableFactory;
+
+const BTREE_INDEX_OPTION_COVERED_TYPE: &str = "index_covered_type";
+const BTREE_INDEX_COVERED_ALL_COLUMNS: &str = "covered_all_columns_in_schema";
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TableScan {
@@ -148,7 +158,7 @@ impl IPhysicalPlan for TableScan {
     }
 
     fn get_labels(&self) -> Result<HashMap<String, Vec<String>>> {
-        Ok(HashMap::from([
+        let mut labels = HashMap::from([
             (String::from("Full table name"), vec![format!(
                 "{}.{}",
                 self.source.source_info.catalog_name(),
@@ -168,7 +178,19 @@ impl IPhysicalPlan for TableScan {
             (String::from("Total partitions"), vec![
                 self.source.statistics.partitions_total.to_string(),
             ]),
-        ]))
+        ]);
+        if let Some(btree_index) = self
+            .source
+            .push_downs
+            .as_ref()
+            .and_then(|push_downs| push_downs.btree_index.as_ref())
+        {
+            labels.insert(String::from("Btree index"), vec![format!(
+                "{}@{}",
+                btree_index.index_name, btree_index.index_version
+            )]);
+        }
+        Ok(labels)
     }
 
     fn derive(&self, children: Vec<PhysicalPlan>) -> PhysicalPlan {
@@ -340,7 +362,36 @@ impl PhysicalPlanBuilder {
             };
 
             if scan.is_lazy_table && supported_lazy_materialize {
-                let lazy_columns = columns.difference(&used).cloned().collect();
+                let btree_user_filters = if let Some(predicates) = scan
+                    .push_down_predicates
+                    .as_ref()
+                    .filter(|preds| !preds.is_empty())
+                {
+                    let metadata = self.metadata.read().clone();
+                    let predicates = predicates.iter().collect::<Vec<_>>();
+                    self.create_scan_push_down_filters(&metadata, &predicates)?
+                        .0
+                } else {
+                    None
+                };
+                let lazy_columns = if self
+                    .try_build_btree_index_info(
+                        scan,
+                        &self
+                            .metadata
+                            .read()
+                            .table(scan.table_index)
+                            .table()
+                            .schema_with_stream(),
+                        btree_user_filters,
+                    )?
+                    .is_some()
+                {
+                    used = columns.clone();
+                    ColumnSet::new()
+                } else {
+                    columns.difference(&used).cloned().collect()
+                };
                 let mut metadata = self.metadata.write();
                 metadata.set_table_lazy_columns(scan.table_index, lazy_columns);
                 for column_index in used.iter() {
@@ -850,7 +901,7 @@ impl PhysicalPlanBuilder {
         Ok(PushDownInfo {
             projection: Some(projection),
             output_columns,
-            filters: user_filters,
+            filters: user_filters.clone(),
             is_deterministic,
             prewhere: prewhere_info,
             limit,
@@ -861,10 +912,183 @@ impl PhysicalPlanBuilder {
             change_type: scan.change_type.clone(),
             inverted_index: scan.inverted_index.clone(),
             vector_index: scan.vector_index.clone(),
+            btree_index: self.try_build_btree_index_info(
+                scan,
+                table_schema,
+                user_filters.clone(),
+            )?,
             sample: scan.sample.clone(),
             read_partitions_pruning_mode: Default::default(),
             secure_filters,
         })
+    }
+
+    fn try_build_btree_index_info(
+        &self,
+        scan: &databend_common_sql::plans::Scan,
+        table_schema: &TableSchema,
+        filters: Option<Filters>,
+    ) -> Result<Option<BtreeIndexInfo>> {
+        if scan
+            .secure_predicates
+            .as_ref()
+            .is_some_and(|preds| !preds.is_empty())
+            || scan.prewhere.is_some()
+            || scan.limit.is_none()
+            || scan.push_down_predicates.as_ref().is_none_or(Vec::is_empty)
+            || scan.order_by.as_ref().is_none_or(Vec::is_empty)
+        {
+            return Ok(None);
+        }
+
+        let metadata = self.metadata.read();
+        let table_entry = metadata.table(scan.table_index);
+        let table_info = table_entry.table().get_table_info().clone();
+        let table_meta = &table_info.meta;
+        let btree_index_count = table_meta
+            .indexes
+            .values()
+            .filter(|index| matches!(index.index_type, TableIndexType::Btree))
+            .count();
+        let mut equality_by_column = HashMap::new();
+        for predicate in scan.push_down_predicates.as_deref().unwrap_or_default() {
+            collect_eq_column_constants(predicate, &mut equality_by_column);
+        }
+
+        for index in table_meta.indexes.values() {
+            if !matches!(index.index_type, TableIndexType::Btree) {
+                continue;
+            }
+
+            let key_columns = if index.key_columns.is_empty() {
+                index
+                    .column_ids
+                    .iter()
+                    .map(|column_id| TableIndexColumn {
+                        column_id: *column_id,
+                        order: TableIndexColumnOrder::Asc,
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                index.key_columns.clone()
+            };
+            if key_columns.is_empty() {
+                continue;
+            }
+
+            let Some(payload_fields) = btree_payload_fields(
+                table_meta,
+                &key_columns,
+                index.include_column_ids.as_slice(),
+                is_btree_covered_all_columns(&index.options),
+            ) else {
+                continue;
+            };
+
+            let mut prefix_values = Vec::new();
+            let mut prefix_len = 0;
+            for key_column in &key_columns {
+                let Ok(field) = table_meta.schema.field_of_column_id(key_column.column_id) else {
+                    prefix_values.clear();
+                    break;
+                };
+                let Some(column_index) =
+                    table_symbol_for_field(&metadata, scan.table_index, field.name())
+                else {
+                    prefix_values.clear();
+                    break;
+                };
+                let Some(value) = equality_by_column.get(&column_index) else {
+                    break;
+                };
+                prefix_values.push(value.clone());
+                prefix_len += 1;
+            }
+
+            if prefix_values.is_empty() || prefix_len >= key_columns.len() {
+                continue;
+            }
+
+            let order_by = scan.order_by.as_ref().unwrap();
+            if prefix_len + order_by.len() > key_columns.len() {
+                continue;
+            }
+            let mut order_matches = true;
+            for (offset, order_item) in order_by.iter().enumerate() {
+                let key_column = &key_columns[prefix_len + offset];
+                let Ok(field) = table_meta.schema.field_of_column_id(key_column.column_id) else {
+                    order_matches = false;
+                    break;
+                };
+                let Some(symbol) =
+                    table_symbol_for_field(&metadata, scan.table_index, field.name())
+                else {
+                    order_matches = false;
+                    break;
+                };
+                if symbol != order_item.index
+                    || key_order_is_asc(&key_column.order) != order_item.asc
+                    || order_item.nulls_first
+                {
+                    order_matches = false;
+                    break;
+                }
+            }
+            if !order_matches {
+                continue;
+            }
+
+            if !scan
+                .columns
+                .iter()
+                .filter_map(|symbol| match metadata.column(*symbol) {
+                    ColumnEntry::BaseTableColumn(BaseTableColumn { column_name, .. }) => {
+                        Some(column_name.as_str())
+                    }
+                    _ => None,
+                })
+                .all(|column_name| {
+                    payload_fields
+                        .iter()
+                        .any(|field| field.name() == column_name)
+                })
+            {
+                continue;
+            }
+            if !btree_filters_are_covered(filters.as_ref(), &payload_fields) {
+                continue;
+            }
+
+            let mut btree_key_columns = Vec::with_capacity(key_columns.len());
+            let mut valid_key_fields = true;
+            for key_column in &key_columns {
+                let Ok(field) = table_meta.schema.field_of_column_id(key_column.column_id) else {
+                    valid_key_fields = false;
+                    break;
+                };
+                btree_key_columns.push(BtreeIndexKeyColumn {
+                    field: field.clone(),
+                    order: to_btree_pushdown_order(&key_column.order),
+                });
+            }
+            if !valid_key_fields {
+                continue;
+            }
+
+            let _ = table_schema;
+            return Ok(Some(BtreeIndexInfo {
+                index_name: index.name.clone(),
+                index_version: index.version.clone(),
+                key_columns: btree_key_columns,
+                payload_fields,
+                equality_prefix: prefix_values,
+                limit: scan.limit,
+                filters,
+                use_block_btree_index_size_hint: btree_index_count == 1,
+            }));
+        }
+
+        Ok(None)
     }
 
     fn create_scan_push_down_filters(
@@ -1106,5 +1330,140 @@ impl PhysicalPlanBuilder {
             }
             Projection::InnerColumns(col_indices)
         }
+    }
+}
+
+fn is_btree_covered_all_columns(options: &BTreeMap<String, String>) -> bool {
+    options
+        .get(BTREE_INDEX_OPTION_COVERED_TYPE)
+        .is_some_and(|value| value.eq_ignore_ascii_case(BTREE_INDEX_COVERED_ALL_COLUMNS))
+}
+
+fn btree_payload_fields(
+    table_meta: &databend_common_meta_app::schema::TableMeta,
+    key_columns: &[TableIndexColumn],
+    include_column_ids: &[u32],
+    covered_all_columns: bool,
+) -> Option<Vec<databend_common_expression::TableField>> {
+    if covered_all_columns {
+        return Some(
+            table_meta
+                .schema
+                .remove_virtual_computed_fields()
+                .fields
+                .clone(),
+        );
+    }
+
+    let mut fields = Vec::with_capacity(key_columns.len() + include_column_ids.len());
+    let mut seen_column_ids = BTreeSet::new();
+    for key_column in key_columns {
+        if !seen_column_ids.insert(key_column.column_id) {
+            continue;
+        }
+        let Ok(field) = table_meta.schema.field_of_column_id(key_column.column_id) else {
+            return None;
+        };
+        fields.push(field.clone());
+    }
+    for column_id in include_column_ids {
+        if !seen_column_ids.insert(*column_id) {
+            continue;
+        }
+        let Ok(field) = table_meta.schema.field_of_column_id(*column_id) else {
+            return None;
+        };
+        fields.push(field.clone());
+    }
+    Some(fields)
+}
+
+fn btree_filters_are_covered(
+    filters: Option<&Filters>,
+    payload_fields: &[databend_common_expression::TableField],
+) -> bool {
+    let Some(filters) = filters else {
+        return true;
+    };
+    let covered_columns = payload_fields
+        .iter()
+        .map(|field| field.name())
+        .collect::<HashSet<_>>();
+    filters
+        .filter
+        .as_expr(&BUILTIN_FUNCTIONS)
+        .column_refs()
+        .keys()
+        .all(|name| covered_columns.contains(name))
+}
+
+fn key_order_is_asc(order: &TableIndexColumnOrder) -> bool {
+    matches!(order, TableIndexColumnOrder::Asc)
+}
+
+fn to_btree_pushdown_order(order: &TableIndexColumnOrder) -> BtreeIndexColumnOrder {
+    match order {
+        TableIndexColumnOrder::Asc => BtreeIndexColumnOrder::Asc,
+        TableIndexColumnOrder::Desc => BtreeIndexColumnOrder::Desc,
+    }
+}
+
+fn table_symbol_for_field(
+    metadata: &Metadata,
+    table_index: IndexType,
+    name: &str,
+) -> Option<Symbol> {
+    metadata.columns().iter().find_map(|entry| match entry {
+        ColumnEntry::BaseTableColumn(BaseTableColumn {
+            table_index: column_table_index,
+            column_name,
+            column_index,
+            path_indices,
+            ..
+        }) if *column_table_index == table_index
+            && path_indices.is_none()
+            && column_name == name =>
+        {
+            Some(*column_index)
+        }
+        _ => None,
+    })
+}
+
+fn collect_eq_column_constants(
+    expr: &ScalarExpr,
+    equality_by_column: &mut HashMap<Symbol, Scalar>,
+) {
+    if let ScalarExpr::FunctionCall(func) = expr
+        && matches!(func.func_name.as_str(), "and" | "and_filters")
+    {
+        for argument in &func.arguments {
+            collect_eq_column_constants(argument, equality_by_column);
+        }
+        return;
+    }
+
+    if let Some((column, value)) = extract_eq_column_constant(expr) {
+        equality_by_column.insert(column, value);
+    }
+}
+
+fn extract_eq_column_constant(expr: &ScalarExpr) -> Option<(Symbol, Scalar)> {
+    let ScalarExpr::FunctionCall(func) = expr else {
+        return None;
+    };
+    if func.func_name != "eq" || func.arguments.len() != 2 {
+        return None;
+    }
+    match (&func.arguments[0], &func.arguments[1]) {
+        (ScalarExpr::BoundColumnRef(column), ScalarExpr::ConstantExpr(constant))
+        | (ScalarExpr::BoundColumnRef(column), ScalarExpr::TypedConstantExpr(constant, _)) => {
+            Some((column.column.index, constant.value.clone()))
+        }
+        (ScalarExpr::ConstantExpr(constant), ScalarExpr::BoundColumnRef(column))
+        | (ScalarExpr::TypedConstantExpr(constant, _), ScalarExpr::BoundColumnRef(column)) => {
+            Some((column.column.index, constant.value.clone()))
+        }
+        _ => None,
     }
 }

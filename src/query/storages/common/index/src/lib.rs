@@ -23,6 +23,7 @@
 #![feature(never_type)]
 
 mod bloom_index;
+mod btree_index;
 mod eliminate_cast;
 pub mod filters;
 mod hnsw_index;
@@ -42,6 +43,28 @@ pub use bloom_index::BloomIndexResult;
 pub use bloom_index::BloomIndexType;
 pub use bloom_index::FilterEvalResult;
 pub use bloom_index::NgramArgs;
+pub use btree_index::BTREE_INDEX_FILE_VERSION;
+pub use btree_index::BTREE_INDEX_FOOTER_TAIL_SIZE;
+pub use btree_index::BtreeIndexDataBlockMeta;
+pub use btree_index::BtreeIndexFile;
+pub use btree_index::BtreeIndexFileMeta;
+pub use btree_index::BtreeIndexFileView;
+pub use btree_index::BtreeIndexFilterBlock;
+pub use btree_index::BtreeIndexFooter;
+pub use btree_index::BtreeIndexIndexBlock;
+pub use btree_index::BtreeIndexKeyOrder;
+pub use btree_index::BtreeIndexMeta;
+pub use btree_index::BtreeIndexRow;
+pub use btree_index::BtreeIndexSection;
+pub use btree_index::BtreeIndexSectionKind;
+pub use btree_index::BtreeIndexWriter;
+pub use btree_index::btree_equality_prefix;
+pub use btree_index::btree_footer_range;
+pub use btree_index::btree_index_section;
+pub use btree_index::decode_btree_footer_bytes;
+pub use btree_index::decode_btree_payload;
+pub use btree_index::encode_btree_key_component;
+pub use btree_index::encode_btree_payload;
 pub use eliminate_cast::eliminate_cast;
 pub use hnsw_index::DistanceType;
 pub use hnsw_index::FixedLengthPriorityQueue;

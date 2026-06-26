@@ -101,6 +101,17 @@ fn test_decode_v86_table_meta() -> anyhow::Result<()> {
             index_type: TableIndexType::Inverted,
             name: "idx1".to_string(),
             column_ids: vec![1, 2],
+            key_columns: vec![
+                mt::TableIndexColumn {
+                    column_id: 1,
+                    order: mt::TableIndexColumnOrder::Asc,
+                },
+                mt::TableIndexColumn {
+                    column_id: 2,
+                    order: mt::TableIndexColumnOrder::Asc,
+                },
+            ],
+            include_column_ids: vec![],
             sync_creation: true,
             version: "f10b230153e14f2c84603958d7f864f8".to_string(),
             options: btreemap! {s("tokenizer") => s("chinese")},

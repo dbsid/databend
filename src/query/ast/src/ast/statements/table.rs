@@ -26,6 +26,7 @@ use crate::ast::CreateOption;
 use crate::ast::Expr;
 use crate::ast::Identifier;
 use crate::ast::Query;
+use crate::ast::TableIndexColumn;
 use crate::ast::TableIndexType;
 use crate::ast::TableReference;
 use crate::ast::TimeTravelPoint;
@@ -1084,7 +1085,8 @@ impl Display for ColumnDefinition {
 pub struct TableIndexDefinition {
     pub index_name: Identifier,
     pub index_type: TableIndexType,
-    pub columns: Vec<Identifier>,
+    pub columns: Vec<TableIndexColumn>,
+    pub include_columns: Vec<Identifier>,
     pub sync_creation: bool,
     pub index_options: BTreeMap<String, String>,
 }
@@ -1099,6 +1101,12 @@ impl Display for TableIndexDefinition {
         write!(f, " (")?;
         write_comma_separated_list(f, &self.columns)?;
         write!(f, ")")?;
+
+        if !self.include_columns.is_empty() {
+            write!(f, " INCLUDE (")?;
+            write_comma_separated_list(f, &self.include_columns)?;
+            write!(f, ")")?;
+        }
 
         if !self.index_options.is_empty() {
             write!(f, " ")?;

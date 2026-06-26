@@ -31,6 +31,7 @@ use crate::SegmentLocation;
 use crate::io::AggIndexReader;
 use crate::io::BlockReader;
 use crate::io::VirtualColumnReader;
+use crate::operations::read::build_btree_index_source_pipeline;
 use crate::operations::read::build_fuse_source_pipeline;
 
 impl FuseTable {
@@ -95,46 +96,7 @@ impl FuseTable {
             }
         }
 
-        let block_reader = self.build_block_reader(ctx.clone(), plan, put_cache)?;
         let max_io_requests = self.adjust_io_request(&ctx)?;
-
-        let topk = plan
-            .push_downs
-            .as_ref()
-            .filter(|_| self.is_native()) // Only native format supports topk push down.
-            .and_then(|x| x.top_k(plan.schema().as_ref()));
-
-        let index_reader = Arc::new(
-            plan.push_downs
-                .as_ref()
-                .and_then(|p| p.agg_index.as_ref())
-                .map(|agg| {
-                    AggIndexReader::try_create(
-                        ctx.clone(),
-                        self.operator.clone(),
-                        agg,
-                        self.table_compression,
-                        put_cache,
-                    )
-                })
-                .transpose()?,
-        );
-
-        let virtual_reader = Arc::new(
-            PushDownInfo::virtual_columns_of_push_downs(&plan.push_downs)
-                .as_ref()
-                .map(|virtual_column| {
-                    VirtualColumnReader::try_create(
-                        ctx.clone(),
-                        self.operator.clone(),
-                        block_reader.schema(),
-                        plan,
-                        virtual_column.clone(),
-                        self.table_compression,
-                    )
-                })
-                .transpose()?,
-        );
 
         let enable_prune_pipeline = ctx.get_settings().get_enable_prune_pipeline()?;
         let rx = if !enable_prune_pipeline && !lazy_init_segments.is_empty() {
@@ -190,6 +152,63 @@ impl FuseTable {
         } else {
             self.pruned_result_receiver.lock().take()
         };
+
+        if let Some(btree_index) = plan
+            .push_downs
+            .as_ref()
+            .and_then(|push_downs| push_downs.btree_index.clone())
+        {
+            let max_threads = ctx.get_settings().get_max_threads()? as usize;
+            return build_btree_index_source_pipeline(
+                ctx.clone(),
+                self.operator.clone(),
+                pipeline,
+                plan,
+                btree_index,
+                max_threads,
+                rx,
+            );
+        }
+
+        let block_reader = self.build_block_reader(ctx.clone(), plan, put_cache)?;
+
+        let topk = plan
+            .push_downs
+            .as_ref()
+            .filter(|_| self.is_native()) // Only native format supports topk push down.
+            .and_then(|x| x.top_k(plan.schema().as_ref()));
+
+        let index_reader = Arc::new(
+            plan.push_downs
+                .as_ref()
+                .and_then(|p| p.agg_index.as_ref())
+                .map(|agg| {
+                    AggIndexReader::try_create(
+                        ctx.clone(),
+                        self.operator.clone(),
+                        agg,
+                        self.table_compression,
+                        put_cache,
+                    )
+                })
+                .transpose()?,
+        );
+
+        let virtual_reader = Arc::new(
+            PushDownInfo::virtual_columns_of_push_downs(&plan.push_downs)
+                .as_ref()
+                .map(|virtual_column| {
+                    VirtualColumnReader::try_create(
+                        ctx.clone(),
+                        self.operator.clone(),
+                        block_reader.schema(),
+                        plan,
+                        virtual_column.clone(),
+                        self.table_compression,
+                    )
+                })
+                .transpose()?,
+        );
 
         let max_threads = ctx.get_settings().get_max_threads()? as usize;
         let table_schema = self.schema_with_stream();

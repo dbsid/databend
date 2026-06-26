@@ -22,6 +22,7 @@ use databend_common_expression::DataSchema;
 use databend_common_expression::FunctionRegistry;
 use databend_common_expression::RemoteExpr;
 use databend_common_expression::SEARCH_MATCHED_COL_NAME;
+use databend_common_expression::Scalar;
 use databend_common_expression::TableDataType;
 use databend_common_expression::TableField;
 use databend_common_expression::TableSchema;
@@ -152,6 +153,40 @@ pub struct VectorIndexInfo {
     pub query_values: Vec<F32>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BtreeIndexColumnOrder {
+    Asc,
+    Desc,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct BtreeIndexKeyColumn {
+    pub field: TableField,
+    pub order: BtreeIndexColumnOrder,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct BtreeIndexInfo {
+    /// The index name.
+    pub index_name: String,
+    /// The index version.
+    pub index_version: String,
+    /// The ordered key columns.
+    pub key_columns: Vec<BtreeIndexKeyColumn>,
+    /// Payload fields stored in the row payload of the SST file.
+    pub payload_fields: Vec<TableField>,
+    /// Equality values for the leading key prefix.
+    pub equality_prefix: Vec<Scalar>,
+    /// Maximum rows to return from this index scan.
+    pub limit: Option<usize>,
+    /// Extra filters to apply on the covered payload before global limit.
+    pub filters: Option<Filters>,
+    /// Whether block-level `btree_index_size` can be used as the selected
+    /// index file length. It is only exact when the table has a single BTREE
+    /// index, because block meta currently stores the total BTREE index size.
+    pub use_block_btree_index_size_hint: bool,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ReadPartitionsPruningMode {
     #[default]
@@ -191,6 +226,8 @@ pub struct PushDownInfo {
     pub inverted_index: Option<InvertedIndexInfo>,
     /// Optional vector index
     pub vector_index: Option<VectorIndexInfo>,
+    /// Optional btree index
+    pub btree_index: Option<BtreeIndexInfo>,
     /// Used by table sample
     pub sample: Option<SampleConfig>,
     /// Controls how much pruning work a storage should do while collecting partitions.

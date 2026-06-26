@@ -261,6 +261,11 @@ fn test_decode_v129_table_meta() -> anyhow::Result<()> {
             index_type: TableIndexType::Vector,
             name: "v".to_string(),
             column_ids: vec![1],
+            key_columns: vec![databend_common_meta_app::schema::TableIndexColumn {
+                column_id: 1,
+                order: databend_common_meta_app::schema::TableIndexColumnOrder::Asc,
+            }],
+            include_column_ids: vec![],
             sync_creation: true,
             version: "74ec7d332680f9e60234c07f5def8d0a52b0fb55".to_string(),
             options: btreemap! {s("type") => s("hnsw")},

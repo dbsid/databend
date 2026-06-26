@@ -124,6 +124,8 @@ async fn test_spatial_index_pruning_geometry() -> anyhow::Result<()> {
         index_type: TableIndexType::Spatial,
         name: index_name.clone(),
         column_ids: vec![1],
+        key_columns: vec![],
+        include_column_ids: vec![],
         sync_creation: true,
         version: "v1".to_string(),
         options: BTreeMap::new(),

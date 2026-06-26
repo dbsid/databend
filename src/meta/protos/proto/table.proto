@@ -172,6 +172,8 @@ message TableIndex {
     INVERTED = 0;
     NGRAM = 1;
     VECTOR = 2;
+    SPATIAL = 3;
+    BTREE = 4;
   }
 
   string name = 1;
@@ -191,6 +193,24 @@ message TableIndex {
 
   // Type of table index: inverted, ngram
   IndexType index_type = 6;
+
+  repeated TableIndexColumn key_columns = 7;
+
+  repeated uint32 include_column_ids = 8;
+}
+
+message TableIndexColumn {
+  uint64 ver = 100;
+  uint64 min_reader_ver = 101;
+
+  enum Order {
+    ASC = 0;
+    DESC = 1;
+  }
+
+  uint32 column_id = 1;
+
+  Order order = 2;
 }
 
 // Save table name id list history.
@@ -235,6 +255,8 @@ message TableStatistics {
   optional uint64 vector_index_size = 10;
   // Size of virtual column in bytes
   optional uint64 virtual_column_size = 11;
+  // Size of btree index in bytes
+  optional uint64 btree_index_size = 12;
 }
 
 message DatabaseIdTableName {

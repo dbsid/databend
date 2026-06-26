@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod block_format;
+mod btree_index_source;
 mod fuse_rows_fetcher;
 pub mod fuse_source;
 mod native_data_source;
@@ -32,6 +33,7 @@ mod data_source_with_meta;
 mod partition_stream;
 mod util;
 
+pub use btree_index_source::build_btree_index_source_pipeline;
 pub use fuse_rows_fetcher::row_fetch_processor;
 pub use fuse_source::build_fuse_source_pipeline;
 pub use native_data_source_deserializer::NativeDeserializeDataTransform;

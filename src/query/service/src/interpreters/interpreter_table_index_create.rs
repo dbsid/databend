@@ -51,6 +51,8 @@ impl Interpreter for CreateTableIndexInterpreter {
     async fn execute2(&self) -> Result<PipelineBuildResult> {
         let index_name = self.plan.index_name.clone();
         let column_ids = self.plan.column_ids.clone();
+        let key_columns = self.plan.key_columns.clone();
+        let include_column_ids = self.plan.include_column_ids.clone();
         let sync_creation = self.plan.sync_creation;
         let table_id = self.plan.table_id;
         let catalog = self.ctx.get_catalog(&self.plan.catalog).await?;
@@ -65,6 +67,7 @@ impl Interpreter for CreateTableIndexInterpreter {
             ast::TableIndexType::Ngram => TableIndexType::Ngram,
             ast::TableIndexType::Vector => TableIndexType::Vector,
             ast::TableIndexType::Spatial => TableIndexType::Spatial,
+            ast::TableIndexType::Btree => TableIndexType::Btree,
         };
 
         let create_index_req = CreateTableIndexReq {
@@ -74,6 +77,8 @@ impl Interpreter for CreateTableIndexInterpreter {
             table_id,
             name: index_name,
             column_ids,
+            key_columns,
+            include_column_ids,
             sync_creation,
             options: self.plan.index_options.clone(),
         };

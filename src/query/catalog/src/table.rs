@@ -566,6 +566,7 @@ pub struct TableStatistics {
     pub bloom_index_size: Option<u64>,
     pub ngram_index_size: Option<u64>,
     pub inverted_index_size: Option<u64>,
+    pub btree_index_size: Option<u64>,
     pub vector_index_size: Option<u64>,
     pub virtual_column_size: Option<u64>,
 

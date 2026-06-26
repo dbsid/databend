@@ -62,6 +62,8 @@ use opendal::Operator;
 
 use crate::FuseStorageFormat;
 use crate::io::BloomIndexState;
+use crate::io::BtreeIndexBuilder;
+use crate::io::BtreeIndexState;
 use crate::io::TableMetaLocationGenerator;
 use crate::io::build_column_hlls;
 use crate::io::write::InvertedIndexBuilder;
@@ -165,6 +167,7 @@ pub struct BlockSerialization {
     pub block_raw_data: Vec<u8>,
     pub block_meta: BlockMeta,
     pub bloom_index_state: Option<BloomIndexState>,
+    pub btree_index_states: Vec<BtreeIndexState>,
     pub inverted_index_states: Vec<InvertedIndexState>,
     pub virtual_column_state: Option<VirtualColumnState>,
     pub vector_index_state: Option<VectorIndexState>,
@@ -187,6 +190,7 @@ pub struct BlockBuilder {
     pub bloom_columns_map: BTreeMap<FieldIndex, TableField>,
     pub ndv_columns_map: BTreeMap<FieldIndex, TableField>,
     pub ngram_args: Vec<NgramArgs>,
+    pub btree_index_builders: Vec<BtreeIndexBuilder>,
     pub inverted_index_builders: Vec<InvertedIndexBuilder>,
     pub virtual_column_builder: Option<VirtualColumnBuilder>,
     pub vector_index_builder: Option<VectorIndexBuilder>,
@@ -231,6 +235,16 @@ impl BlockBuilder {
         }
 
         let mut inverted_index_states = Vec::with_capacity(self.inverted_index_builders.len());
+        let mut btree_index_states = Vec::with_capacity(self.btree_index_builders.len());
+        for btree_index_builder in &self.btree_index_builders {
+            let btree_index_state = BtreeIndexState::from_data_block(
+                &self.source_schema,
+                &data_block,
+                &block_location,
+                btree_index_builder,
+            )?;
+            btree_index_states.push(btree_index_state);
+        }
         for inverted_index_builder in &self.inverted_index_builders {
             let inverted_index_state = InvertedIndexState::from_data_block(
                 &self.source_schema,
@@ -296,6 +310,12 @@ impl BlockBuilder {
         } else {
             None
         };
+        let btree_index_size = if !btree_index_states.is_empty() {
+            let size = btree_index_states.iter().map(|v| v.size).sum();
+            Some(size)
+        } else {
+            None
+        };
         let block_meta = BlockMeta {
             row_count,
             block_size,
@@ -320,6 +340,7 @@ impl BlockBuilder {
             spatial_stats,
             compression: self.write_settings.table_compression.into(),
             inverted_index_size,
+            btree_index_size,
             virtual_block_meta: None,
             create_on: Some(Utc::now()),
         };
@@ -337,6 +358,7 @@ impl BlockBuilder {
             block_raw_data: buffer,
             block_meta,
             bloom_index_state,
+            btree_index_states,
             inverted_index_states,
             virtual_column_state,
             vector_index_state,
@@ -379,6 +401,7 @@ impl BlockWriter {
         Self::write_down_bloom_index_state(dal, serialized.bloom_index_state).await?;
         Self::write_down_vector_index_state(dal, serialized.vector_index_state).await?;
         Self::write_down_spatial_index_state(dal, serialized.spatial_index_state).await?;
+        Self::write_down_btree_index_state(dal, serialized.btree_index_states).await?;
         Self::write_down_inverted_index_state(dal, serialized.inverted_index_states).await?;
         Self::write_down_virtual_column_state(dal, serialized.virtual_column_state).await?;
 
@@ -468,6 +491,17 @@ impl BlockWriter {
             metrics_inc_block_inverted_index_write_nums(1);
             metrics_inc_block_inverted_index_write_bytes(index_size);
             metrics_inc_block_inverted_index_write_milliseconds(start.elapsed().as_millis() as u64);
+        }
+        Ok(())
+    }
+
+    pub async fn write_down_btree_index_state(
+        dal: &Operator,
+        btree_index_states: Vec<BtreeIndexState>,
+    ) -> Result<()> {
+        for btree_index_state in btree_index_states {
+            let location = &btree_index_state.location.0;
+            write_data(btree_index_state.data, dal, location).await?;
         }
         Ok(())
     }

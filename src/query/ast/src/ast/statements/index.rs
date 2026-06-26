@@ -47,6 +47,7 @@ pub enum TableIndexType {
     Ngram,
     Vector,
     Spatial,
+    Btree,
 }
 
 impl Display for TableIndexType {
@@ -66,6 +67,9 @@ impl Display for TableIndexType {
             }
             TableIndexType::Spatial => {
                 write!(f, "SPATIAL")
+            }
+            TableIndexType::Btree => {
+                write!(f, "BTREE")
             }
         }
     }
@@ -135,9 +139,47 @@ pub struct CreateTableIndexStmt {
     pub database: Option<Identifier>,
     pub table: Identifier,
 
-    pub columns: Vec<Identifier>,
+    pub columns: Vec<TableIndexColumn>,
+    pub include_columns: Vec<Identifier>,
     pub sync_creation: bool,
     pub index_options: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut, Walk, WalkMut)]
+pub struct TableIndexColumn {
+    pub name: Identifier,
+    pub order: Option<TableIndexColumnOrder>,
+}
+
+impl From<Identifier> for TableIndexColumn {
+    fn from(name: Identifier) -> Self {
+        Self { name, order: None }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Drive, DriveMut, Walk, WalkMut)]
+pub enum TableIndexColumnOrder {
+    Asc,
+    Desc,
+}
+
+impl Display for TableIndexColumnOrder {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        match self {
+            TableIndexColumnOrder::Asc => write!(f, "ASC"),
+            TableIndexColumnOrder::Desc => write!(f, "DESC"),
+        }
+    }
+}
+
+impl Display for TableIndexColumn {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.name)?;
+        if let Some(order) = &self.order {
+            write!(f, " {order}")?;
+        }
+        Ok(())
+    }
 }
 
 impl Display for CreateTableIndexStmt {
@@ -166,6 +208,12 @@ impl Display for CreateTableIndexStmt {
         write!(f, " (")?;
         write_comma_separated_list(f, &self.columns)?;
         write!(f, ")")?;
+
+        if !self.include_columns.is_empty() {
+            write!(f, " INCLUDE (")?;
+            write_comma_separated_list(f, &self.include_columns)?;
+            write!(f, ")")?;
+        }
 
         if !self.index_options.is_empty() {
             write!(f, " ")?;

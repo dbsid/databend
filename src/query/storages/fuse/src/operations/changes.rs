@@ -491,6 +491,13 @@ impl FuseTable {
             (Some(latest_size), base_size) => Some(latest_size.abs_diff(base_size.unwrap_or(0))),
             (None, base) => base,
         };
+        let btree_index_size = match (
+            latest_summary.btree_index_size,
+            base_summary.btree_index_size,
+        ) {
+            (Some(latest_size), base_size) => Some(latest_size.abs_diff(base_size.unwrap_or(0))),
+            (None, base) => base,
+        };
         let vector_index_size = match (
             latest_summary.vector_index_size,
             base_summary.vector_index_size,
@@ -517,6 +524,7 @@ impl FuseTable {
                 bloom_index_size,
                 ngram_index_size,
                 inverted_index_size,
+                btree_index_size,
                 vector_index_size,
                 virtual_column_size,
                 number_of_blocks: Some(number_of_blocks),
@@ -534,6 +542,7 @@ impl FuseTable {
                 bloom_index_size: bloom_index_size.map(|size| size / 2),
                 ngram_index_size: ngram_index_size.map(|size| size / 2),
                 inverted_index_size: inverted_index_size.map(|size| size / 2),
+                btree_index_size: btree_index_size.map(|size| size / 2),
                 vector_index_size: vector_index_size.map(|size| size / 2),
                 virtual_column_size: virtual_column_size.map(|size| size / 2),
                 number_of_blocks: Some(number_of_blocks / 2),

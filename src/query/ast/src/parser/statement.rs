@@ -1595,8 +1595,9 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
             ~ ( IF ~ ^NOT ~ ^EXISTS )?
             ~ #ident
             ~ ON ~ #dot_separated_idents_1_to_3
-            ~ ^"(" ~ ^#comma_separated_list1(ident) ~ ^")"
-            ~ ( #table_option )?
+            ~ ^"(" ~ ^#comma_separated_list1(table_index_column) ~ ^")"
+            ~ ( INCLUDE ~ ^"(" ~ ^#comma_separated_list1(ident) ~ ^")" )?
+            ~ #table_index_option_clause?
         },
         |(
             _,
@@ -1611,6 +1612,7 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
             _,
             columns,
             _,
+            opt_include_columns,
             opt_index_options,
         )| {
             let create_option =
@@ -1623,6 +1625,9 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
                 database,
                 table,
                 columns,
+                include_columns: opt_include_columns
+                    .map(|(_, _, columns, _)| columns)
+                    .unwrap_or_default(),
                 sync_creation: opt_async.is_none(),
                 index_options: opt_index_options.unwrap_or_default(),
             }))
@@ -3693,19 +3698,63 @@ pub fn table_index_def(i: Input) -> IResult<TableIndexDefinition> {
             ASYNC?
             ~ #index_type ~ ^INDEX
             ~ #ident
-            ~ ^"(" ~ ^#comma_separated_list1(ident) ~ ^")"
-            ~ ( #table_option )?
+            ~ ^"(" ~ ^#comma_separated_list1(table_index_column) ~ ^")"
+            ~ ( INCLUDE ~ ^"(" ~ ^#comma_separated_list1(ident) ~ ^")" )?
+            ~ #table_index_option_clause?
         },
-        |(opt_async, index_type, _, index_name, _, columns, _, opt_index_options)| {
+        |(
+            opt_async,
+            index_type,
+            _,
+            index_name,
+            _,
+            columns,
+            _,
+            opt_include_columns,
+            opt_index_options,
+        )| {
             Ok(TableIndexDefinition {
                 index_name,
                 index_type,
                 columns,
+                include_columns: opt_include_columns
+                    .map(|(_, _, columns, _)| columns)
+                    .unwrap_or_default(),
                 sync_creation: opt_async.is_none(),
                 index_options: opt_index_options.unwrap_or_default(),
             })
         },
     )(i)
+}
+
+fn table_index_column(i: Input) -> IResult<TableIndexColumn> {
+    map(
+        rule! {
+            #ident ~ ( ASC | DESC )?
+        },
+        |(name, order)| TableIndexColumn {
+            name,
+            order: order.map(|token| {
+                if token.kind == ASC {
+                    TableIndexColumnOrder::Asc
+                } else {
+                    TableIndexColumnOrder::Desc
+                }
+            }),
+        },
+    )
+    .parse(i)
+}
+
+fn table_index_option_clause(i: Input) -> IResult<BTreeMap<String, String>> {
+    alt((
+        map(
+            rule! { WITH ~ "(" ~ #set_table_option ~ ")" },
+            |(_, _, options, _)| options,
+        ),
+        table_option,
+    ))
+    .parse(i)
 }
 
 pub fn constraint_def(i: Input) -> IResult<ConstraintDefinition> {
@@ -6619,6 +6668,7 @@ fn index_type(i: Input) -> IResult<TableIndexType> {
         value(TableIndexType::Ngram, rule! { NGRAM }),
         value(TableIndexType::Vector, rule! { VECTOR }),
         value(TableIndexType::Spatial, rule! { SPATIAL }),
+        value(TableIndexType::Btree, rule! { BTREE }),
     ))
     .parse(i)
 }

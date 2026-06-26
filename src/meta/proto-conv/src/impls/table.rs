@@ -384,6 +384,7 @@ impl FromToProto for mt::TableStatistics {
             bloom_index_size: p.bloom_index_size,
             ngram_index_size: p.ngram_index_size,
             inverted_index_size: p.inverted_index_size,
+            btree_index_size: p.btree_index_size,
             vector_index_size: p.vector_index_size,
             virtual_column_size: p.virtual_column_size,
         };
@@ -404,6 +405,7 @@ impl FromToProto for mt::TableStatistics {
             bloom_index_size: self.bloom_index_size,
             ngram_index_size: self.ngram_index_size,
             inverted_index_size: self.inverted_index_size,
+            btree_index_size: self.btree_index_size,
             vector_index_size: self.vector_index_size,
             virtual_column_size: self.virtual_column_size,
         };
@@ -445,7 +447,22 @@ impl FromToProto for mt::TableIndex {
             index_type: FromPrimitive::from_i32(p.index_type)
                 .ok_or_else(|| Incompatible::new(format!("invalid IndexType: {}", p.index_type)))?,
             name: p.name,
-            column_ids: p.column_ids,
+            column_ids: p.column_ids.clone(),
+            key_columns: if p.key_columns.is_empty() {
+                p.column_ids
+                    .iter()
+                    .map(|column_id| mt::TableIndexColumn {
+                        column_id: *column_id,
+                        order: mt::TableIndexColumnOrder::Asc,
+                    })
+                    .collect()
+            } else {
+                p.key_columns
+                    .into_iter()
+                    .map(mt::TableIndexColumn::from_pb)
+                    .collect::<Result<Vec<_>, _>>()?
+            },
+            include_column_ids: p.include_column_ids,
             sync_creation: p.sync_creation,
             version: p.version.clone(),
             options: p.options.clone(),
@@ -459,10 +476,45 @@ impl FromToProto for mt::TableIndex {
             min_reader_ver: MIN_READER_VER,
             name: self.name.clone(),
             column_ids: self.column_ids.clone(),
+            key_columns: self
+                .key_columns
+                .iter()
+                .map(mt::TableIndexColumn::to_pb)
+                .collect::<Result<Vec<_>, _>>()?,
+            include_column_ids: self.include_column_ids.clone(),
             sync_creation: self.sync_creation,
             version: self.version.clone(),
             options: self.options.clone(),
             index_type: self.index_type.clone() as i32,
+        };
+        Ok(p)
+    }
+}
+
+impl FromToProto for mt::TableIndexColumn {
+    type PB = pb::TableIndexColumn;
+    fn get_pb_ver(p: &Self::PB) -> u64 {
+        p.ver
+    }
+
+    fn from_pb(p: pb::TableIndexColumn) -> Result<Self, Incompatible> {
+        reader_check_msg(p.ver, p.min_reader_ver)?;
+
+        let v = Self {
+            column_id: p.column_id,
+            order: FromPrimitive::from_i32(p.order).ok_or_else(|| {
+                Incompatible::new(format!("invalid TableIndexColumnOrder: {}", p.order))
+            })?,
+        };
+        Ok(v)
+    }
+
+    fn to_pb(&self) -> Result<pb::TableIndexColumn, Incompatible> {
+        let p = pb::TableIndexColumn {
+            ver: VER,
+            min_reader_ver: MIN_READER_VER,
+            column_id: self.column_id,
+            order: self.order.clone() as i32,
         };
         Ok(p)
     }

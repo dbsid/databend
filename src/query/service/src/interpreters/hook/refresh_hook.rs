@@ -276,6 +276,7 @@ async fn generate_refresh_table_index_plan(
             TableIndexType::Ngram => ast::TableIndexType::Ngram,
             TableIndexType::Vector => ast::TableIndexType::Vector,
             TableIndexType::Spatial => ast::TableIndexType::Spatial,
+            TableIndexType::Btree => ast::TableIndexType::Btree,
         };
         let plan = RefreshTableIndexPlan {
             index_type,

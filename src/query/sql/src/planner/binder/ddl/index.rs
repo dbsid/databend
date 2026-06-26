@@ -30,6 +30,8 @@ use databend_common_ast::ast::RefreshIndexStmt;
 use databend_common_ast::ast::RefreshTableIndexStmt;
 use databend_common_ast::ast::SetExpr;
 use databend_common_ast::ast::Statement;
+use databend_common_ast::ast::TableIndexColumn as AstTableIndexColumn;
+use databend_common_ast::ast::TableIndexColumnOrder as AstTableIndexColumnOrder;
 use databend_common_ast::ast::TableIndexType as AstTableIndexType;
 use databend_common_ast::ast::TableReference;
 use databend_common_ast::parser::Dialect;
@@ -47,6 +49,8 @@ use databend_common_meta_app::schema::GetIndexReq;
 use databend_common_meta_app::schema::IndexMeta;
 use databend_common_meta_app::schema::IndexNameIdent;
 use databend_common_meta_app::schema::ListIndexesByIdReq;
+use databend_common_meta_app::schema::TableIndexColumn;
+use databend_common_meta_app::schema::TableIndexColumnOrder;
 use databend_common_meta_app::schema::TableIndexType;
 use databend_common_meta_app::tenant::Tenant;
 use databend_storages_common_table_meta::meta::Location;
@@ -77,6 +81,38 @@ use crate::plans::RelOperator;
 
 const MAXIMUM_BLOOM_SIZE: u64 = 10 * 1024 * 1024;
 const MINIMUM_BLOOM_SIZE: u64 = 512;
+
+pub(in crate::planner::binder) fn table_index_column_names(
+    columns: &[AstTableIndexColumn],
+) -> Vec<Identifier> {
+    columns.iter().map(|column| column.name.clone()).collect()
+}
+
+pub(in crate::planner::binder) fn asc_key_columns(
+    column_ids: &[ColumnId],
+) -> Vec<TableIndexColumn> {
+    column_ids
+        .iter()
+        .map(|column_id| TableIndexColumn {
+            column_id: *column_id,
+            order: TableIndexColumnOrder::Asc,
+        })
+        .collect()
+}
+
+pub(in crate::planner::binder) fn validate_no_btree_column_features(
+    index_type: &AstTableIndexType,
+    columns: &[AstTableIndexColumn],
+    include_columns: &[Identifier],
+) -> Result<()> {
+    if columns.iter().any(|column| column.order.is_some()) || !include_columns.is_empty() {
+        return Err(ErrorCode::UnsupportedIndex(format!(
+            "{} index does not support key column order or INCLUDE columns",
+            index_type
+        )));
+    }
+    Ok(())
+}
 
 // valid values for inverted index option tokenizer
 static INDEX_TOKENIZER_VALUES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
@@ -443,6 +479,7 @@ impl Binder {
             database,
             table,
             columns,
+            include_columns,
             sync_creation,
             index_options,
         } = stmt;
@@ -475,33 +512,90 @@ impl Binder {
         let table_id = table.get_id();
         let index_name = self.normalize_object_identifier(index_name);
 
-        let (column_ids, index_options, meta_index_type) = match index_type {
-            AstTableIndexType::Inverted => {
-                let column_ids =
-                    self.validate_inverted_index_columns(table_schema.clone(), columns)?;
-                let index_options = self.validate_inverted_index_options(index_options)?;
-                (column_ids, index_options, TableIndexType::Inverted)
-            }
-            AstTableIndexType::Ngram => {
-                let column_ids =
-                    self.validate_ngram_index_columns(table_schema.clone(), columns)?;
-                let index_options = self.validate_ngram_index_options(index_options)?;
-                (column_ids, index_options, TableIndexType::Ngram)
-            }
-            AstTableIndexType::Vector => {
-                let column_ids =
-                    self.validate_vector_index_columns(table_schema.clone(), columns)?;
-                let index_options = self.validate_vector_index_options(index_options)?;
-                (column_ids, index_options, TableIndexType::Vector)
-            }
-            AstTableIndexType::Spatial => {
-                let column_ids =
-                    self.validate_spatial_index_columns(table_schema.clone(), columns)?;
-                let index_options = self.validate_spatial_index_options(index_options)?;
-                (column_ids, index_options, TableIndexType::Spatial)
-            }
-            AstTableIndexType::Aggregating => unreachable!(),
-        };
+        let (column_ids, key_columns, include_column_ids, index_options, meta_index_type) =
+            match index_type {
+                AstTableIndexType::Inverted => {
+                    validate_no_btree_column_features(index_type, columns, include_columns)?;
+                    let columns = table_index_column_names(columns);
+                    let column_ids =
+                        self.validate_inverted_index_columns(table_schema.clone(), &columns)?;
+                    let index_options = self.validate_inverted_index_options(index_options)?;
+                    let key_columns = asc_key_columns(&column_ids);
+                    (
+                        column_ids,
+                        key_columns,
+                        vec![],
+                        index_options,
+                        TableIndexType::Inverted,
+                    )
+                }
+                AstTableIndexType::Ngram => {
+                    validate_no_btree_column_features(index_type, columns, include_columns)?;
+                    let columns = table_index_column_names(columns);
+                    let column_ids =
+                        self.validate_ngram_index_columns(table_schema.clone(), &columns)?;
+                    let index_options = self.validate_ngram_index_options(index_options)?;
+                    let key_columns = asc_key_columns(&column_ids);
+                    (
+                        column_ids,
+                        key_columns,
+                        vec![],
+                        index_options,
+                        TableIndexType::Ngram,
+                    )
+                }
+                AstTableIndexType::Vector => {
+                    validate_no_btree_column_features(index_type, columns, include_columns)?;
+                    let columns = table_index_column_names(columns);
+                    let column_ids =
+                        self.validate_vector_index_columns(table_schema.clone(), &columns)?;
+                    let index_options = self.validate_vector_index_options(index_options)?;
+                    let key_columns = asc_key_columns(&column_ids);
+                    (
+                        column_ids,
+                        key_columns,
+                        vec![],
+                        index_options,
+                        TableIndexType::Vector,
+                    )
+                }
+                AstTableIndexType::Spatial => {
+                    validate_no_btree_column_features(index_type, columns, include_columns)?;
+                    let columns = table_index_column_names(columns);
+                    let column_ids =
+                        self.validate_spatial_index_columns(table_schema.clone(), &columns)?;
+                    let index_options = self.validate_spatial_index_options(index_options)?;
+                    let key_columns = asc_key_columns(&column_ids);
+                    (
+                        column_ids,
+                        key_columns,
+                        vec![],
+                        index_options,
+                        TableIndexType::Spatial,
+                    )
+                }
+                AstTableIndexType::Btree => {
+                    let key_columns =
+                        self.validate_btree_index_columns(table_schema.clone(), columns)?;
+                    let column_ids = key_columns
+                        .iter()
+                        .map(|column| column.column_id)
+                        .collect::<Vec<_>>();
+                    let include_column_ids = self.validate_btree_index_include_columns(
+                        table_schema.clone(),
+                        include_columns,
+                    )?;
+                    let index_options = self.validate_btree_index_options(index_options)?;
+                    (
+                        column_ids,
+                        key_columns,
+                        include_column_ids,
+                        index_options,
+                        TableIndexType::Btree,
+                    )
+                }
+                AstTableIndexType::Aggregating => unreachable!(),
+            };
 
         let table_info = table.get_table_info();
         let column_ids_set = column_ids.iter().copied().collect::<HashSet<_>>();
@@ -519,6 +613,19 @@ impl Binder {
                 )));
             }
             if meta_index_type != table_index.index_type {
+                continue;
+            }
+            if matches!(meta_index_type, TableIndexType::Btree)
+                && table_index.key_columns == key_columns
+                && table_index.include_column_ids == include_column_ids
+                && table_index.options == index_options
+            {
+                return Err(ErrorCode::UnsupportedIndex(format!(
+                    "{} index with the same key columns, include columns and options already exists",
+                    index_type
+                )));
+            }
+            if matches!(meta_index_type, TableIndexType::Btree) {
                 continue;
             }
             let old_column_ids_set = table_index
@@ -549,6 +656,8 @@ impl Binder {
             catalog,
             index_name,
             column_ids,
+            key_columns,
+            include_column_ids,
             table_id,
             sync_creation: *sync_creation,
             index_options,
@@ -888,6 +997,97 @@ impl Binder {
     ) -> Result<BTreeMap<String, String>> {
         let options = BTreeMap::new();
         // todo
+        Ok(options)
+    }
+
+    pub(in crate::planner::binder) fn validate_btree_index_columns(
+        &self,
+        table_schema: TableSchemaRef,
+        columns: &[AstTableIndexColumn],
+    ) -> Result<Vec<TableIndexColumn>> {
+        let mut column_set = BTreeSet::new();
+        let mut key_columns = Vec::with_capacity(columns.len());
+        for column in columns {
+            match table_schema.field_with_name(&column.name.name) {
+                Ok(field) => {
+                    if column_set.contains(&field.column_id) {
+                        return Err(ErrorCode::UnsupportedIndex(format!(
+                            "Btree index column must be unique, but column {} is duplicate",
+                            column.name.name
+                        )));
+                    }
+                    column_set.insert(field.column_id);
+                    key_columns.push(TableIndexColumn {
+                        column_id: field.column_id,
+                        order: match column.order.unwrap_or(AstTableIndexColumnOrder::Asc) {
+                            AstTableIndexColumnOrder::Asc => TableIndexColumnOrder::Asc,
+                            AstTableIndexColumnOrder::Desc => TableIndexColumnOrder::Desc,
+                        },
+                    });
+                }
+                Err(_) => {
+                    return Err(ErrorCode::UnsupportedIndex(format!(
+                        "Table does not have column {}",
+                        column.name
+                    )));
+                }
+            }
+        }
+        Ok(key_columns)
+    }
+
+    pub(in crate::planner::binder) fn validate_btree_index_include_columns(
+        &self,
+        table_schema: TableSchemaRef,
+        columns: &[Identifier],
+    ) -> Result<Vec<ColumnId>> {
+        let mut column_set = BTreeSet::new();
+        let mut column_ids = Vec::with_capacity(columns.len());
+        for column in columns {
+            match table_schema.field_with_name(&column.name) {
+                Ok(field) => {
+                    if column_set.contains(&field.column_id) {
+                        return Err(ErrorCode::UnsupportedIndex(format!(
+                            "Btree index include column must be unique, but column {} is duplicate",
+                            column.name
+                        )));
+                    }
+                    column_set.insert(field.column_id);
+                    column_ids.push(field.column_id);
+                }
+                Err(_) => {
+                    return Err(ErrorCode::UnsupportedIndex(format!(
+                        "Table does not have column {}",
+                        column
+                    )));
+                }
+            }
+        }
+        Ok(column_ids)
+    }
+
+    pub(in crate::planner::binder) fn validate_btree_index_options(
+        &self,
+        index_options: &BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, String>> {
+        let mut options = BTreeMap::new();
+        for (opt, val) in index_options.iter() {
+            let key = opt.to_lowercase();
+            let value = val.to_lowercase();
+            match key.as_str() {
+                "compression" => {
+                    options.insert("compression".to_string(), value);
+                }
+                "index_covered_type" => {
+                    options.insert("index_covered_type".to_string(), value);
+                }
+                _ => {
+                    return Err(ErrorCode::IndexOptionInvalid(format!(
+                        "index option `{key}` is invalid key for create btree index statement",
+                    )));
+                }
+            }
+        }
         Ok(options)
     }
 

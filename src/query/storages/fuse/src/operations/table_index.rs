@@ -34,6 +34,7 @@ use databend_common_expression::TableSchema;
 use databend_common_expression::TableSchemaRef;
 use databend_common_expression::local_block_meta_serde;
 use databend_common_meta_app::schema::TableIndex;
+use databend_common_meta_app::schema::TableIndexColumnOrder;
 use databend_common_meta_app::schema::TableIndexType;
 use databend_common_meta_app::schema::TableMeta;
 use databend_common_pipeline::core::Pipeline;
@@ -69,6 +70,8 @@ use crate::index::filters::Filter;
 use crate::io::BlockReader;
 use crate::io::BlockWriter;
 use crate::io::BloomIndexState;
+use crate::io::BtreeIndexBuilder;
+use crate::io::BtreeIndexState;
 use crate::io::MetaReaders;
 use crate::io::SpatialIndexBuilder;
 use crate::io::TableMetaLocationGenerator;
@@ -96,7 +99,10 @@ pub async fn do_refresh_table_index(
 ) -> Result<u64> {
     if !matches!(
         index_type,
-        TableIndexType::Ngram | TableIndexType::Vector | TableIndexType::Spatial
+        TableIndexType::Ngram
+            | TableIndexType::Vector
+            | TableIndexType::Spatial
+            | TableIndexType::Btree
     ) {
         return Err(ErrorCode::RefreshIndexError(format!(
             "Refresh index type {} not support",
@@ -253,6 +259,15 @@ pub async fn do_refresh_table_index(
                 )
             });
         }
+        RefreshIndexArg::Btree(btree_index_arg) => {
+            pipeline.add_async_transformer(|| {
+                BtreeIndexTransform::new(
+                    operator.clone(),
+                    index_schema.clone(),
+                    btree_index_arg.clone(),
+                )
+            });
+        }
     }
 
     pipeline.try_resize(1)?;
@@ -361,6 +376,54 @@ fn build_refresh_index_arg(
             };
             Ok(RefreshIndexArg::Spatial(spatial_arg))
         }
+        TableIndexType::Btree => {
+            let index = table_meta.indexes.get(index_name).unwrap();
+            let key_columns = if index.key_columns.is_empty() {
+                index
+                    .column_ids
+                    .iter()
+                    .map(
+                        |column_id| databend_common_meta_app::schema::TableIndexColumn {
+                            column_id: *column_id,
+                            order: TableIndexColumnOrder::Asc,
+                        },
+                    )
+                    .collect::<Vec<_>>()
+            } else {
+                index.key_columns.clone()
+            };
+            let key_fields = key_columns
+                .iter()
+                .map(|column| {
+                    table_meta
+                        .schema
+                        .field_of_column_id(column.column_id)
+                        .map(|field| (field.clone(), column.order.clone()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let payload_fields = if is_btree_covered_all_columns(&index.options)
+                || index.include_column_ids.is_empty()
+            {
+                table_meta
+                    .schema
+                    .remove_virtual_computed_fields()
+                    .fields
+                    .clone()
+            } else {
+                index
+                    .include_column_ids
+                    .iter()
+                    .map(|column_id| table_meta.schema.field_of_column_id(*column_id).cloned())
+                    .collect::<Result<Vec<_>>>()?
+            };
+            Ok(RefreshIndexArg::Btree(RefreshBtreeIndexArg {
+                index_name: index_name.clone(),
+                index_version: index.version.clone(),
+                key_fields,
+                payload_fields,
+                options: index.options.clone(),
+            }))
+        }
         _ => unreachable!(),
     }
 }
@@ -408,7 +471,49 @@ async fn check_index_generated(
             )
             .await
         }
+        RefreshIndexArg::Btree(btree_index_arg) => {
+            check_btree_index_generated(
+                operator.clone(),
+                segment_idx,
+                block_idx,
+                block_meta,
+                stats,
+                btree_index_arg,
+            )
+            .await
+        }
     }
+}
+
+async fn check_btree_index_generated(
+    operator: Operator,
+    segment_idx: usize,
+    block_idx: usize,
+    block_meta: Arc<BlockMeta>,
+    stats: Option<Arc<SegmentStatistics>>,
+    btree_index_arg: &RefreshBtreeIndexArg,
+) -> Result<Option<RefreshIndexMeta>> {
+    let index_location = TableMetaLocationGenerator::gen_btree_index_location_from_block_location(
+        &block_meta.location.0,
+        &btree_index_arg.index_name,
+        &btree_index_arg.index_version,
+    );
+    if operator.stat(&index_location).await.is_ok() {
+        return Ok(None);
+    }
+    Ok(Some(RefreshIndexMeta {
+        index: BlockMetaIndex {
+            segment_idx,
+            block_idx,
+        },
+        block_meta,
+        column_hlls: stats
+            .as_ref()
+            .and_then(|v| v.block_hlls.get(block_idx))
+            .cloned(),
+        index_columns: None,
+        index_meta: None,
+    }))
 }
 
 async fn check_ngram_index_generated(
@@ -924,6 +1029,80 @@ pub struct SpatialIndexTransform {
     existing_names_prefix: Vec<String>,
 }
 
+pub struct BtreeIndexTransform {
+    operator: Operator,
+    source_schema: TableSchemaRef,
+    btree_index_arg: RefreshBtreeIndexArg,
+}
+
+impl BtreeIndexTransform {
+    fn new(
+        operator: Operator,
+        source_schema: TableSchemaRef,
+        btree_index_arg: RefreshBtreeIndexArg,
+    ) -> Self {
+        Self {
+            operator,
+            source_schema,
+            btree_index_arg,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncTransform for BtreeIndexTransform {
+    const NAME: &'static str = "BtreeIndexTransform";
+
+    #[async_backtrace::framed]
+    async fn transform(&mut self, data_block: DataBlock) -> Result<DataBlock> {
+        let RefreshIndexMeta {
+            index,
+            block_meta,
+            column_hlls,
+            index_columns: _,
+            index_meta: _,
+        } = data_block
+            .get_meta()
+            .and_then(RefreshIndexMeta::downcast_ref_from)
+            .unwrap();
+
+        let builder = BtreeIndexBuilder {
+            name: self.btree_index_arg.index_name.clone(),
+            version: self.btree_index_arg.index_version.clone(),
+            key_fields: self.btree_index_arg.key_fields.clone(),
+            payload_fields: self.btree_index_arg.payload_fields.clone(),
+            options: self.btree_index_arg.options.clone(),
+        };
+        let state = BtreeIndexState::from_data_block(
+            &self.source_schema,
+            &data_block,
+            &block_meta.location,
+            &builder,
+        )?;
+
+        let mut new_block_meta = Arc::unwrap_or_clone(block_meta.clone());
+        let old_size = new_block_meta.btree_index_size.unwrap_or_default();
+        new_block_meta.btree_index_size = Some(old_size + state.size);
+        BlockWriter::write_down_btree_index_state(&self.operator, vec![state]).await?;
+
+        let extended_block_meta = ExtendedBlockMeta {
+            block_meta: new_block_meta,
+            draft_virtual_block_meta: None,
+            column_hlls: column_hlls.clone().map(BlockHLLState::Serialized),
+        };
+
+        let entry = MutationLogEntry::ReplacedBlock {
+            index: index.clone(),
+            block_meta: Arc::new(extended_block_meta),
+        };
+        let meta = MutationLogs {
+            entries: vec![entry],
+        };
+        let new_block = DataBlock::empty_with_meta(Box::new(meta));
+        Ok(new_block)
+    }
+}
+
 impl SpatialIndexTransform {
     pub fn new(
         operator: Operator,
@@ -1044,6 +1223,7 @@ enum RefreshIndexArg {
     Ngram(RefreshNgramIndexArg),
     Vector(RefreshVectorIndexArg),
     Spatial(RefreshSpatialIndexArg),
+    Btree(RefreshBtreeIndexArg),
 }
 
 struct RefreshNgramIndexArg {
@@ -1063,4 +1243,19 @@ struct RefreshSpatialIndexArg {
     index_version: String,
     existing_column_ids: Vec<ColumnId>,
     existing_names_prefix: Vec<String>,
+}
+
+#[derive(Clone)]
+struct RefreshBtreeIndexArg {
+    index_name: String,
+    index_version: String,
+    key_fields: Vec<(TableField, TableIndexColumnOrder)>,
+    payload_fields: Vec<TableField>,
+    options: BTreeMap<String, String>,
+}
+
+fn is_btree_covered_all_columns(options: &BTreeMap<String, String>) -> bool {
+    options
+        .get("index_covered_type")
+        .is_some_and(|value| value.eq_ignore_ascii_case("covered_all_columns_in_schema"))
 }

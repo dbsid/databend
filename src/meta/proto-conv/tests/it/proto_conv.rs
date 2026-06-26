@@ -265,6 +265,7 @@ fn new_table_statistics() -> databend_common_meta_app::schema::TableStatistics {
         bloom_index_size: None,
         ngram_index_size: None,
         inverted_index_size: None,
+        btree_index_size: None,
         vector_index_size: None,
         virtual_column_size: None,
         number_of_segments: Some(1),
@@ -324,6 +325,17 @@ fn new_table_index() -> databend_common_meta_app::schema::TableIndex {
         index_type: TableIndexType::Ngram,
         name: "idx1".to_string(),
         column_ids: vec![1, 2],
+        key_columns: vec![
+            databend_common_meta_app::schema::TableIndexColumn {
+                column_id: 1,
+                order: databend_common_meta_app::schema::TableIndexColumnOrder::Asc,
+            },
+            databend_common_meta_app::schema::TableIndexColumn {
+                column_id: 2,
+                order: databend_common_meta_app::schema::TableIndexColumnOrder::Asc,
+            },
+        ],
+        include_column_ids: vec![],
         sync_creation: true,
         version: "f10b230153e14f2c84603958d7f864f8".to_string(),
         options: btreemap! {s("tokenizer") => s("chinese")},

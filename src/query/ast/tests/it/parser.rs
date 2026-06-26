@@ -134,6 +134,7 @@ fn test_statement() {
         r#"CREATE OR REPLACE AGGREGATING INDEX idx1 AS SELECT SUM(a), b FROM t1 WHERE b > 3 GROUP BY b;"#,
         r#"CREATE OR REPLACE INVERTED INDEX idx2 ON t1 (a, b);"#,
         r#"CREATE OR REPLACE NGRAM INDEX idx2 ON t1 (a, b);"#,
+        r#"CREATE BTREE INDEX IF NOT EXISTS idx_w ON t1 (wallet_address, platform_id, last_active_time DESC) INCLUDE (balance, tag_black_hole) WITH (COMPRESSION='ZSTD');"#,
         r#"create table a (c decimal(38, 0))"#,
         r#"create table a (c decimal(38))"#,
         r#"create table a (c1 decimal(38), c2 int) partition by (c1, c2) PROPERTIES ("read.split.target-size"='134217728', "read.split.metadata-target-size"='33554432');"#,

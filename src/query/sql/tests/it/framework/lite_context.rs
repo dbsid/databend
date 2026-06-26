@@ -1058,6 +1058,7 @@ impl LiteTableContext {
                                         bloom_index_size: None,
                                         ngram_index_size: None,
                                         inverted_index_size: None,
+                                        btree_index_size: None,
                                         vector_index_size: None,
                                         virtual_column_size: None,
                                         number_of_blocks: Some(1),

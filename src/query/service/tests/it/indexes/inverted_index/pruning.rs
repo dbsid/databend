@@ -524,6 +524,8 @@ async fn test_block_pruner() -> anyhow::Result<()> {
         tenant,
         name: index_name.clone(),
         column_ids: vec![1, 2, 3],
+        key_columns: vec![],
+        include_column_ids: vec![],
         sync_creation: false,
         options: index_options.clone(),
         index_type: TableIndexType::Inverted,

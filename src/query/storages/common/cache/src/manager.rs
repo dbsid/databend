@@ -35,6 +35,8 @@ use crate::Unit;
 use crate::caches::BlockMetaCache;
 use crate::caches::BloomIndexFilterCache;
 use crate::caches::BloomIndexMetaCache;
+use crate::caches::BtreeIndexFileCache;
+use crate::caches::BtreeIndexMetaCache;
 use crate::caches::CacheValue;
 use crate::caches::ColumnArrayCache;
 use crate::caches::ColumnDataCache;
@@ -109,6 +111,8 @@ pub struct CacheManager {
     column_oriented_segment_info_cache: CacheSlot<ColumnOrientedSegmentInfoCache>,
     bloom_index_filter_cache: CacheSlot<BloomIndexFilterCache>,
     bloom_index_meta_cache: CacheSlot<BloomIndexMetaCache>,
+    btree_index_meta_cache: CacheSlot<BtreeIndexMetaCache>,
+    btree_index_file_cache: CacheSlot<BtreeIndexFileCache>,
     inverted_index_meta_cache: CacheSlot<InvertedIndexMetaCache>,
     inverted_index_file_cache: CacheSlot<InvertedIndexFileCache>,
     vector_index_meta_cache: CacheSlot<VectorIndexMetaCache>,
@@ -232,6 +236,8 @@ impl CacheManager {
                 compact_segment_info_cache: CacheSlot::new(None),
                 bloom_index_filter_cache: CacheSlot::new(None),
                 bloom_index_meta_cache: CacheSlot::new(None),
+                btree_index_meta_cache: CacheSlot::new(None),
+                btree_index_file_cache: CacheSlot::new(None),
                 column_oriented_segment_info_cache: CacheSlot::new(None),
                 inverted_index_meta_cache: CacheSlot::new(None),
                 inverted_index_file_cache: CacheSlot::new(None),
@@ -319,6 +325,49 @@ impl CacheManager {
                     &inverted_index_meta_on_disk_cache_path,
                     on_disk_cache_queue_size,
                     config.disk_cache_inverted_index_meta_size as usize,
+                    DiskCacheKeyReloadPolicy::Fuzzy,
+                    on_disk_cache_sync_data,
+                    ee_mode,
+                )?
+            };
+
+            let btree_index_meta_cache = {
+                let btree_index_meta_on_disk_cache_path =
+                    PathBuf::from(&config.disk_cache_config.path)
+                        .join(tenant_id.clone())
+                        .join("btree_index_meta_v1");
+                Self::new_hybrid_cache_slot(
+                    HYBRID_CACHE_BTREE_INDEX_FILE_META_DATA,
+                    config.btree_index_meta_count as usize,
+                    Unit::Count,
+                    &btree_index_meta_on_disk_cache_path,
+                    on_disk_cache_queue_size,
+                    config.disk_cache_btree_index_meta_size as usize,
+                    DiskCacheKeyReloadPolicy::Fuzzy,
+                    on_disk_cache_sync_data,
+                    ee_mode,
+                )?
+            };
+
+            let btree_index_file_size = if config.btree_index_filter_memory_ratio != 0 {
+                (*max_server_memory_usage as usize)
+                    * config.btree_index_filter_memory_ratio as usize
+                    / 100
+            } else {
+                config.btree_index_filter_size as usize
+            };
+            let btree_index_file_cache = {
+                let btree_index_file_on_disk_cache_path =
+                    PathBuf::from(&config.disk_cache_config.path)
+                        .join(tenant_id.clone())
+                        .join("btree_index_file_v1");
+                Self::new_hybrid_cache_slot(
+                    HYBRID_CACHE_BTREE_INDEX_FILE,
+                    btree_index_file_size,
+                    Unit::Bytes,
+                    &btree_index_file_on_disk_cache_path,
+                    on_disk_cache_queue_size,
+                    config.disk_cache_btree_index_data_size as usize,
                     DiskCacheKeyReloadPolicy::Fuzzy,
                     on_disk_cache_sync_data,
                     ee_mode,
@@ -488,6 +537,8 @@ impl CacheManager {
                 column_oriented_segment_info_cache,
                 bloom_index_filter_cache,
                 bloom_index_meta_cache,
+                btree_index_meta_cache,
+                btree_index_file_cache,
                 inverted_index_meta_cache,
                 inverted_index_file_cache,
                 vector_index_meta_cache,
@@ -596,6 +647,21 @@ impl CacheManager {
             HYBRID_CACHE_INVERTED_INDEX_FILE | IN_MEMORY_HYBRID_CACHE_INVERTED_INDEX_FILE => {
                 Self::set_hybrid_cache_bytes_capacity(
                     &self.inverted_index_file_cache,
+                    new_capacity,
+                    name,
+                );
+            }
+            HYBRID_CACHE_BTREE_INDEX_FILE_META_DATA
+            | IN_MEMORY_HYBRID_CACHE_BTREE_INDEX_FILE_META_DATA => {
+                Self::set_hybrid_cache_items_capacity(
+                    &self.btree_index_meta_cache,
+                    new_capacity,
+                    name,
+                );
+            }
+            HYBRID_CACHE_BTREE_INDEX_FILE | IN_MEMORY_HYBRID_CACHE_BTREE_INDEX_FILE => {
+                Self::set_hybrid_cache_bytes_capacity(
+                    &self.btree_index_file_cache,
                     new_capacity,
                     name,
                 );
@@ -803,6 +869,14 @@ impl CacheManager {
         self.get_hybrid_cache(self.inverted_index_file_cache.get())
     }
 
+    pub fn get_btree_index_meta_cache(&self) -> Option<BtreeIndexMetaCache> {
+        self.get_hybrid_cache(self.btree_index_meta_cache.get())
+    }
+
+    pub fn get_btree_index_file_cache(&self) -> Option<BtreeIndexFileCache> {
+        self.get_hybrid_cache(self.btree_index_file_cache.get())
+    }
+
     pub fn get_vector_index_meta_cache(&self) -> Option<VectorIndexMetaCache> {
         self.get_hybrid_cache(self.vector_index_meta_cache.get())
     }
@@ -968,6 +1042,11 @@ const IN_MEMORY_HYBRID_CACHE_INVERTED_INDEX_FILE: &str = "memory_cache_inverted_
 const HYBRID_CACHE_INVERTED_INDEX_FILE_META_DATA: &str = "cache_inverted_index_file_meta_data";
 const IN_MEMORY_HYBRID_CACHE_INVERTED_INDEX_FILE_META_DATA: &str =
     "memory_cache_inverted_index_file_meta_data";
+const HYBRID_CACHE_BTREE_INDEX_FILE: &str = "cache_btree_index_file";
+const IN_MEMORY_HYBRID_CACHE_BTREE_INDEX_FILE: &str = "memory_cache_btree_index_file";
+const HYBRID_CACHE_BTREE_INDEX_FILE_META_DATA: &str = "cache_btree_index_file_meta_data";
+const IN_MEMORY_HYBRID_CACHE_BTREE_INDEX_FILE_META_DATA: &str =
+    "memory_cache_btree_index_file_meta_data";
 const HYBRID_CACHE_VECTOR_INDEX_FILE: &str = "cache_vector_index_file";
 const IN_MEMORY_HYBRID_CACHE_VECTOR_INDEX_FILE: &str = "memory_cache_vector_index_file";
 const HYBRID_CACHE_VECTOR_INDEX_FILE_META_DATA: &str = "cache_vector_index_file_meta_data";
@@ -1035,6 +1114,8 @@ mod tests {
             disk_cache_table_bloom_index_meta_size: 1024 * 1024,
             disk_cache_inverted_index_meta_size: 1024 * 1024,
             disk_cache_inverted_index_data_size: 1024 * 1024,
+            disk_cache_btree_index_meta_size: 1024 * 1024,
+            disk_cache_btree_index_data_size: 1024 * 1024,
             disk_cache_vector_index_meta_size: 1024 * 1024,
             disk_cache_vector_index_data_size: 1024 * 1024,
             disk_cache_spatial_index_meta_size: 1024 * 1024,
@@ -1051,6 +1132,8 @@ mod tests {
             disk_cache_table_bloom_index_meta_size: 0,
             disk_cache_inverted_index_meta_size: 0,
             disk_cache_inverted_index_data_size: 0,
+            disk_cache_btree_index_meta_size: 0,
+            disk_cache_btree_index_data_size: 0,
             disk_cache_vector_index_meta_size: 0,
             disk_cache_vector_index_data_size: 0,
             disk_cache_spatial_index_meta_size: 0,
@@ -1079,6 +1162,14 @@ mod tests {
                 .is_some()
             && cache_manager
                 .get_inverted_index_file_cache()
+                .on_disk_cache()
+                .is_some()
+            && cache_manager
+                .get_btree_index_meta_cache()
+                .on_disk_cache()
+                .is_some()
+            && cache_manager
+                .get_btree_index_file_cache()
                 .on_disk_cache()
                 .is_some()
             && cache_manager
@@ -1122,6 +1213,14 @@ mod tests {
                 .is_none()
             && cache_manager
                 .get_inverted_index_file_cache()
+                .on_disk_cache()
+                .is_none()
+            && cache_manager
+                .get_btree_index_meta_cache()
+                .on_disk_cache()
+                .is_none()
+            && cache_manager
+                .get_btree_index_file_cache()
                 .on_disk_cache()
                 .is_none()
             && cache_manager

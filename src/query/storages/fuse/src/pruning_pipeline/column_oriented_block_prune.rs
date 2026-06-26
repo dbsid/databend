@@ -283,6 +283,7 @@ impl AsyncSink for ColumnOrientedBlockPruneSink {
                         bloom_filter_index_size,
                         None,
                         0,
+                        None,
                         row_count,
                         columns_meta,
                         Some(columns_stat),

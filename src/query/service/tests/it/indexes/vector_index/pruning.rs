@@ -125,6 +125,8 @@ async fn test_block_pruner() -> anyhow::Result<()> {
         index_type: TableIndexType::Vector,
         name: index_name.clone(),
         column_ids: vec![index_column_id],
+        key_columns: vec![],
+        include_column_ids: vec![],
         sync_creation: true,
         version: index_version.clone(),
         options: index_options.clone(),

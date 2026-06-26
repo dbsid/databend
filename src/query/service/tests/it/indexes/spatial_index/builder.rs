@@ -79,6 +79,8 @@ fn build_spatial_index(
             index_type: TableIndexType::Spatial,
             name: index_name,
             column_ids: vec![geom_column_id],
+            key_columns: vec![],
+            include_column_ids: vec![],
             sync_creation: true,
             version: "v1".to_string(),
             options: BTreeMap::new(),

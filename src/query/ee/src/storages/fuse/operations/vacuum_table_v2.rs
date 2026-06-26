@@ -416,6 +416,8 @@ mod tests {
             index_type: TableIndexType::Inverted,
             name: "idx".to_string(),
             column_ids: vec![0],
+            key_columns: vec![],
+            include_column_ids: vec![],
             sync_creation: true,
             version: "123456789".to_string(),
             options: BTreeMap::new(),

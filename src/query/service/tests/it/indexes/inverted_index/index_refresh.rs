@@ -79,6 +79,8 @@ async fn test_fuse_do_refresh_inverted_index() -> anyhow::Result<()> {
         tenant,
         name: index_name.clone(),
         column_ids: vec![0, 1],
+        key_columns: vec![],
+        include_column_ids: vec![],
         sync_creation: false,
         options: options.clone(),
         index_type: TableIndexType::Inverted,

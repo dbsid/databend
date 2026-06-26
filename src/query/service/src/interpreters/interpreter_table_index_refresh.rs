@@ -87,7 +87,11 @@ impl Interpreter for RefreshTableIndexInterpreter {
             )));
         }
         let index_version = index.version.clone();
-        let index_schema = table_schema.project(&field_indices);
+        let index_schema = if matches!(self.plan.index_type, ast::TableIndexType::Btree) {
+            table_schema.remove_virtual_computed_fields()
+        } else {
+            table_schema.project(&field_indices)
+        };
 
         let fuse_table = FuseTable::try_from_table(table.as_ref())?;
 
@@ -96,6 +100,7 @@ impl Interpreter for RefreshTableIndexInterpreter {
             ast::TableIndexType::Ngram => TableIndexType::Ngram,
             ast::TableIndexType::Vector => TableIndexType::Vector,
             ast::TableIndexType::Spatial => TableIndexType::Spatial,
+            ast::TableIndexType::Btree => TableIndexType::Btree,
             ast::TableIndexType::Aggregating => unreachable!(),
         };
 
@@ -114,6 +119,18 @@ impl Interpreter for RefreshTableIndexInterpreter {
                         &mut build_res.main_pipeline,
                     )
                     .await?
+            }
+            ast::TableIndexType::Btree => {
+                do_refresh_table_index(
+                    fuse_table,
+                    self.ctx.clone(),
+                    index_name,
+                    index_type,
+                    index_schema.into(),
+                    segment_locs,
+                    &mut build_res.main_pipeline,
+                )
+                .await?
             }
             _ => {
                 do_refresh_table_index(

@@ -818,6 +818,8 @@ impl ClusterDiscovery {
                 "table_prune_partitions_count": cfg.cache.table_prune_partitions_count,
                 "inverted_index_meta_count": cfg.cache.inverted_index_meta_count,
                 "inverted_index_filter_size": cfg.cache.inverted_index_filter_size,
+                "btree_index_meta_count": cfg.cache.btree_index_meta_count,
+                "btree_index_filter_size": cfg.cache.btree_index_filter_size,
                 "vector_index_meta_count": cfg.cache.vector_index_meta_count,
                 "vector_index_filter_size": cfg.cache.vector_index_filter_size,
                 "data_cache_in_memory_bytes": cfg.cache.data_cache_in_memory_bytes,

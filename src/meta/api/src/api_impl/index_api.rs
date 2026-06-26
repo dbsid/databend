@@ -305,8 +305,37 @@ where
                     CreateOption::CreateOrReplace => {}
                 }
             }
+            let key_columns = if req.key_columns.is_empty() {
+                req.column_ids
+                    .iter()
+                    .map(
+                        |column_id| databend_common_meta_app::schema::TableIndexColumn {
+                            column_id: *column_id,
+                            order: databend_common_meta_app::schema::TableIndexColumnOrder::Asc,
+                        },
+                    )
+                    .collect::<Vec<_>>()
+            } else {
+                req.key_columns.clone()
+            };
+            let include_column_ids = req.include_column_ids.clone();
+
             // check the index column id exists
             for column_id in &req.column_ids {
+                if table_meta.schema.is_column_deleted(*column_id) {
+                    return Err(KVAppError::AppError(AppError::IndexColumnIdNotFound(
+                        IndexColumnIdNotFound::new(*column_id, &req.name),
+                    )));
+                }
+            }
+            for column in &key_columns {
+                if table_meta.schema.is_column_deleted(column.column_id) {
+                    return Err(KVAppError::AppError(AppError::IndexColumnIdNotFound(
+                        IndexColumnIdNotFound::new(column.column_id, &req.name),
+                    )));
+                }
+            }
+            for column_id in &include_column_ids {
                 if table_meta.schema.is_column_deleted(*column_id) {
                     return Err(KVAppError::AppError(AppError::IndexColumnIdNotFound(
                         IndexColumnIdNotFound::new(*column_id, &req.name),
@@ -333,7 +362,11 @@ where
             let mut old_version = None;
             let mut mark_delete_op = None;
             if let Some(old_index) = indexes.get(&req.name) {
-                if old_index.column_ids == req.column_ids && old_index.options == req.options {
+                if old_index.column_ids == req.column_ids
+                    && old_index.key_columns == key_columns
+                    && old_index.include_column_ids == include_column_ids
+                    && old_index.options == req.options
+                {
                     old_version = Some(old_index.version.clone());
                 } else {
                     let (m_key, m_value) = mark_table_index_as_deleted(
@@ -352,6 +385,8 @@ where
                 index_type: req.index_type.clone(),
                 name: req.name.clone(),
                 column_ids: req.column_ids.clone(),
+                key_columns,
+                include_column_ids,
                 sync_creation: req.sync_creation,
                 version,
                 options: req.options.clone(),

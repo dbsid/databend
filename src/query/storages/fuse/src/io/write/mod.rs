@@ -15,6 +15,7 @@
 mod block_statistics_writer;
 mod block_writer;
 mod bloom_index_writer;
+mod btree_index_writer;
 mod inverted_index_writer;
 mod meta_writer;
 mod spatial_index_writer;
@@ -32,6 +33,9 @@ pub use block_writer::serialize_block;
 pub use block_writer::write_data;
 pub use bloom_index_writer::BloomIndexRebuilder;
 pub use bloom_index_writer::BloomIndexState;
+pub(crate) use btree_index_writer::BtreeIndexBuilder;
+pub(crate) use btree_index_writer::BtreeIndexState;
+pub(crate) use btree_index_writer::create_btree_index_builders;
 pub use inverted_index_writer::InvertedIndexBuilder;
 pub(crate) use inverted_index_writer::InvertedIndexState;
 pub use inverted_index_writer::InvertedIndexWriter;

@@ -31,6 +31,7 @@ use crate::FuseTable;
 use crate::io::BlockBuilder;
 use crate::io::SpatialIndexBuilder;
 use crate::io::VectorIndexBuilder;
+use crate::io::create_btree_index_builders;
 use crate::io::create_inverted_index_builders;
 use crate::statistics::ClusterStatsGenerator;
 
@@ -104,6 +105,7 @@ impl FuseTable {
             true,
         )?;
         let inverted_index_builders = create_inverted_index_builders(&self.table_info.meta);
+        let btree_index_builders = create_btree_index_builders(&self.table_info.meta);
         let vector_index_builder =
             VectorIndexBuilder::try_create(&self.table_info.meta.indexes, new_schema.clone(), true);
         let spatial_index_builder = SpatialIndexBuilder::try_create(
@@ -121,6 +123,7 @@ impl FuseTable {
             bloom_columns_map,
             ndv_columns_map,
             ngram_args,
+            btree_index_builders,
             inverted_index_builders,
             vector_index_builder,
             spatial_index_builder,

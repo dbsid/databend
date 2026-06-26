@@ -42,6 +42,17 @@ fn test_decode_v125_table_index() -> anyhow::Result<()> {
         index_type: TableIndexType::Ngram,
         name: "idx1".to_string(),
         column_ids: vec![1, 2],
+        key_columns: vec![
+            databend_common_meta_app::schema::TableIndexColumn {
+                column_id: 1,
+                order: databend_common_meta_app::schema::TableIndexColumnOrder::Asc,
+            },
+            databend_common_meta_app::schema::TableIndexColumn {
+                column_id: 2,
+                order: databend_common_meta_app::schema::TableIndexColumnOrder::Asc,
+            },
+        ],
+        include_column_ids: vec![],
         sync_creation: true,
         version: "f10b230153e14f2c84603958d7f864f8".to_string(),
         options: btreemap! {s("tokenizer") => s("chinese")},

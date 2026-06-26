@@ -16,6 +16,7 @@ use std::marker::PhantomData;
 
 use databend_common_exception::Result;
 use databend_common_expression::DataBlock;
+use databend_storages_common_index::BTREE_INDEX_FILE_VERSION;
 use databend_storages_common_table_meta::meta::Location;
 use databend_storages_common_table_meta::meta::SegmentInfo;
 use databend_storages_common_table_meta::meta::SegmentStatistics;
@@ -30,6 +31,7 @@ use uuid::Uuid;
 use uuid::Version;
 
 use crate::FUSE_TBL_AGG_INDEX_PREFIX;
+use crate::FUSE_TBL_BTREE_INDEX_PREFIX;
 use crate::FUSE_TBL_INVERTED_INDEX_PREFIX;
 use crate::FUSE_TBL_LAST_SNAPSHOT_HINT_V2;
 use crate::FUSE_TBL_SEGMENT_STATISTICS_PREFIX;
@@ -71,6 +73,7 @@ pub struct TableMetaLocationGenerator {
     bloom_index_location_prefix: String,
     snapshot_location_prefix: String,
     agg_index_location_prefix: String,
+    btree_index_location_prefix: String,
     inverted_index_location_prefix: String,
     vector_index_location_prefix: String,
     spatial_index_location_prefix: String,
@@ -87,6 +90,7 @@ impl TableMetaLocationGenerator {
         let segment_info_location_prefix = format!("{}/{}/", &prefix, FUSE_TBL_SEGMENT_PREFIX);
         let snapshot_location_prefix = format!("{}/{}/", &prefix, FUSE_TBL_SNAPSHOT_PREFIX);
         let agg_index_location_prefix = format!("{}/{}/", &prefix, FUSE_TBL_AGG_INDEX_PREFIX);
+        let btree_index_location_prefix = format!("{}/{}/", &prefix, FUSE_TBL_BTREE_INDEX_PREFIX);
         let inverted_index_location_prefix =
             format!("{}/{}/", &prefix, FUSE_TBL_INVERTED_INDEX_PREFIX);
         let vector_index_location_prefix = format!("{}/{}/", &prefix, FUSE_TBL_VECTOR_INDEX_PREFIX);
@@ -102,6 +106,7 @@ impl TableMetaLocationGenerator {
             bloom_index_location_prefix,
             snapshot_location_prefix,
             agg_index_location_prefix,
+            btree_index_location_prefix,
             inverted_index_location_prefix,
             vector_index_location_prefix,
             spatial_index_location_prefix,
@@ -303,6 +308,42 @@ impl TableMetaLocationGenerator {
 
     pub fn agg_index_location_prefix(&self) -> &str {
         &self.agg_index_location_prefix
+    }
+
+    pub fn btree_index_location_prefix(&self) -> &str {
+        &self.btree_index_location_prefix
+    }
+
+    pub fn gen_specific_btree_index_prefix(&self, index_name: &str, index_version: &str) -> String {
+        let short_ver: String = index_version.chars().take(7).collect();
+        format!(
+            "{}/{}/{}",
+            self.btree_index_location_prefix(),
+            index_name,
+            short_ver,
+        )
+    }
+
+    pub fn gen_btree_index_location_from_block_location(
+        loc: &str,
+        index_name: &str,
+        index_version: &str,
+    ) -> String {
+        let splits = loc.split('/').collect::<Vec<_>>();
+        let len = splits.len();
+        let prefix = splits[..len - 2].join("/");
+        let block_name = trim_object_prefix(splits[len - 1]);
+        let id: String = block_name.chars().take(32).collect();
+        let short_ver: String = index_version.chars().take(7).collect();
+        format!(
+            "{}/{}/{}/{}/{}_v{}.sst",
+            prefix,
+            FUSE_TBL_BTREE_INDEX_PREFIX,
+            index_name,
+            short_ver,
+            id,
+            BTREE_INDEX_FILE_VERSION,
+        )
     }
 
     pub fn inverted_index_location_prefix(&self) -> &str {

@@ -15,6 +15,7 @@
 mod agg_index;
 mod block;
 pub mod bloom;
+mod btree_index;
 mod index_loader;
 mod inverted_index;
 pub mod meta;
@@ -36,6 +37,9 @@ pub use block::NativeSourceData;
 pub use block::RowSelection;
 pub use block::column_chunks_to_record_batch;
 pub use bloom::BloomBlockFilterReader;
+pub use btree_index::load_btree_index_data_block;
+pub use btree_index::load_btree_index_file;
+pub use btree_index::load_btree_index_meta;
 pub use inverted_index::InvertedIndexReader;
 pub use meta::CompactSegmentInfoReader;
 pub use meta::MetaReaders;

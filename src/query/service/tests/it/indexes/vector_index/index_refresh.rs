@@ -100,6 +100,8 @@ async fn test_fuse_do_refresh_vector_index() -> anyhow::Result<()> {
         tenant: tenant.clone(),
         name: index_name1.clone(),
         column_ids: vec![1], // embedding1
+        key_columns: vec![],
+        include_column_ids: vec![],
         sync_creation: false,
         options: options1,
         index_type: TableIndexType::Vector,
@@ -119,6 +121,8 @@ async fn test_fuse_do_refresh_vector_index() -> anyhow::Result<()> {
         tenant: tenant.clone(),
         name: index_name2.clone(),
         column_ids: vec![2], // embedding2
+        key_columns: vec![],
+        include_column_ids: vec![],
         sync_creation: false,
         options: options2,
         index_type: TableIndexType::Vector,
@@ -178,6 +182,8 @@ async fn test_fuse_do_refresh_vector_index() -> anyhow::Result<()> {
         tenant: tenant.clone(),
         name: index_name1.clone(),
         column_ids: vec![1], // embedding1
+        key_columns: vec![],
+        include_column_ids: vec![],
         sync_creation: false,
         options: new_options1,
         index_type: TableIndexType::Vector,
