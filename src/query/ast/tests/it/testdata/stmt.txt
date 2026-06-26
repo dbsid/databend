@@ -2293,23 +2293,30 @@ CreateTableIndex(
             ident_type: None,
         },
         columns: [
-            Identifier {
-                span: Some(
-                    45..46,
-                ),
-                name: "a",
-                quote: None,
-                ident_type: None,
+            TableIndexColumn {
+                name: Identifier {
+                    span: Some(
+                        45..46,
+                    ),
+                    name: "a",
+                    quote: None,
+                    ident_type: None,
+                },
+                order: None,
             },
-            Identifier {
-                span: Some(
-                    48..49,
-                ),
-                name: "b",
-                quote: None,
-                ident_type: None,
+            TableIndexColumn {
+                name: Identifier {
+                    span: Some(
+                        48..49,
+                    ),
+                    name: "b",
+                    quote: None,
+                    ident_type: None,
+                },
+                order: None,
             },
         ],
+        include_columns: [],
         sync_creation: true,
         index_options: {},
     },
@@ -2344,25 +2351,122 @@ CreateTableIndex(
             ident_type: None,
         },
         columns: [
+            TableIndexColumn {
+                name: Identifier {
+                    span: Some(
+                        42..43,
+                    ),
+                    name: "a",
+                    quote: None,
+                    ident_type: None,
+                },
+                order: None,
+            },
+            TableIndexColumn {
+                name: Identifier {
+                    span: Some(
+                        45..46,
+                    ),
+                    name: "b",
+                    quote: None,
+                    ident_type: None,
+                },
+                order: None,
+            },
+        ],
+        include_columns: [],
+        sync_creation: true,
+        index_options: {},
+    },
+)
+
+
+---------- Input ----------
+CREATE BTREE INDEX IF NOT EXISTS idx_w ON t1 (wallet_address, platform_id, last_active_time DESC) INCLUDE (balance, tag_black_hole) WITH (COMPRESSION='ZSTD');
+---------- Output ---------
+CREATE BTREE INDEX IF NOT EXISTS idx_w ON t1 (wallet_address, platform_id, last_active_time DESC) INCLUDE (balance, tag_black_hole) WITH (compression = 'ZSTD')
+---------- AST ------------
+CreateTableIndex(
+    CreateTableIndexStmt {
+        create_option: CreateIfNotExists,
+        index_name: Identifier {
+            span: Some(
+                33..38,
+            ),
+            name: "idx_w",
+            quote: None,
+            ident_type: None,
+        },
+        index_type: Btree,
+        catalog: None,
+        database: None,
+        table: Identifier {
+            span: Some(
+                42..44,
+            ),
+            name: "t1",
+            quote: None,
+            ident_type: None,
+        },
+        columns: [
+            TableIndexColumn {
+                name: Identifier {
+                    span: Some(
+                        46..60,
+                    ),
+                    name: "wallet_address",
+                    quote: None,
+                    ident_type: None,
+                },
+                order: None,
+            },
+            TableIndexColumn {
+                name: Identifier {
+                    span: Some(
+                        62..73,
+                    ),
+                    name: "platform_id",
+                    quote: None,
+                    ident_type: None,
+                },
+                order: None,
+            },
+            TableIndexColumn {
+                name: Identifier {
+                    span: Some(
+                        75..91,
+                    ),
+                    name: "last_active_time",
+                    quote: None,
+                    ident_type: None,
+                },
+                order: Some(
+                    Desc,
+                ),
+            },
+        ],
+        include_columns: [
             Identifier {
                 span: Some(
-                    42..43,
+                    107..114,
                 ),
-                name: "a",
+                name: "balance",
                 quote: None,
                 ident_type: None,
             },
             Identifier {
                 span: Some(
-                    45..46,
+                    116..130,
                 ),
-                name: "b",
+                name: "tag_black_hole",
                 quote: None,
                 ident_type: None,
             },
         ],
         sync_creation: true,
-        index_options: {},
+        index_options: {
+            "compression": "ZSTD",
+        },
     },
 )
 
@@ -3809,7 +3913,7 @@ CreateTable(
 ---------- Input ----------
 create table if not exists a.b (a string, b string, inverted index idx1 (a,b) tokenizer='chinese');
 ---------- Output ---------
-CREATE TABLE IF NOT EXISTS a.b (a STRING, b STRING, INVERTED INDEX idx1 (a, b) tokenizer = 'chinese')
+CREATE TABLE IF NOT EXISTS a.b (a STRING, b STRING, INVERTED INDEX idx1 (a, b) WITH (tokenizer = 'chinese'))
 ---------- AST ------------
 CreateTable(
     CreateTableStmt {
@@ -3880,23 +3984,30 @@ CreateTable(
                             },
                             index_type: Inverted,
                             columns: [
-                                Identifier {
-                                    span: Some(
-                                        73..74,
-                                    ),
-                                    name: "a",
-                                    quote: None,
-                                    ident_type: None,
+                                TableIndexColumn {
+                                    name: Identifier {
+                                        span: Some(
+                                            73..74,
+                                        ),
+                                        name: "a",
+                                        quote: None,
+                                        ident_type: None,
+                                    },
+                                    order: None,
                                 },
-                                Identifier {
-                                    span: Some(
-                                        75..76,
-                                    ),
-                                    name: "b",
-                                    quote: None,
-                                    ident_type: None,
+                                TableIndexColumn {
+                                    name: Identifier {
+                                        span: Some(
+                                            75..76,
+                                        ),
+                                        name: "b",
+                                        quote: None,
+                                        ident_type: None,
+                                    },
+                                    order: None,
                                 },
                             ],
+                            include_columns: [],
                             sync_creation: true,
                             index_options: {
                                 "tokenizer": "chinese",
@@ -3923,7 +4034,7 @@ CreateTable(
 ---------- Input ----------
 create table if not exists a.b (a string, b string, ngram index idx1 (a,b) gram_size=5);
 ---------- Output ---------
-CREATE TABLE IF NOT EXISTS a.b (a STRING, b STRING, NGRAM INDEX idx1 (a, b) gram_size = '5')
+CREATE TABLE IF NOT EXISTS a.b (a STRING, b STRING, NGRAM INDEX idx1 (a, b) WITH (gram_size = '5'))
 ---------- AST ------------
 CreateTable(
     CreateTableStmt {
@@ -3994,23 +4105,30 @@ CreateTable(
                             },
                             index_type: Ngram,
                             columns: [
-                                Identifier {
-                                    span: Some(
-                                        70..71,
-                                    ),
-                                    name: "a",
-                                    quote: None,
-                                    ident_type: None,
+                                TableIndexColumn {
+                                    name: Identifier {
+                                        span: Some(
+                                            70..71,
+                                        ),
+                                        name: "a",
+                                        quote: None,
+                                        ident_type: None,
+                                    },
+                                    order: None,
                                 },
-                                Identifier {
-                                    span: Some(
-                                        72..73,
-                                    ),
-                                    name: "b",
-                                    quote: None,
-                                    ident_type: None,
+                                TableIndexColumn {
+                                    name: Identifier {
+                                        span: Some(
+                                            72..73,
+                                        ),
+                                        name: "b",
+                                        quote: None,
+                                        ident_type: None,
+                                    },
+                                    order: None,
                                 },
                             ],
+                            include_columns: [],
                             sync_creation: true,
                             index_options: {
                                 "gram_size": "5",

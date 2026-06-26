@@ -25,8 +25,8 @@ use crate::ast::CreateOption;
 use crate::ast::Identifier;
 use crate::ast::Query;
 use crate::ast::write_comma_separated_list;
+use crate::ast::write_comma_separated_string_map;
 use crate::ast::write_dot_separated_list;
-use crate::ast::write_space_separated_string_map;
 
 #[derive(Debug, Clone, PartialEq, Drive, DriveMut, Walk, WalkMut)]
 pub struct CreateIndexStmt {
@@ -216,8 +216,9 @@ impl Display for CreateTableIndexStmt {
         }
 
         if !self.index_options.is_empty() {
-            write!(f, " ")?;
-            write_space_separated_string_map(f, &self.index_options)?;
+            write!(f, " WITH (")?;
+            write_comma_separated_string_map(f, &self.index_options)?;
+            write!(f, ")")?;
         }
 
         Ok(())

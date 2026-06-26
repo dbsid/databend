@@ -1109,8 +1109,9 @@ impl Display for TableIndexDefinition {
         }
 
         if !self.index_options.is_empty() {
-            write!(f, " ")?;
-            write_space_separated_string_map(f, &self.index_options)?;
+            write!(f, " WITH (")?;
+            write_comma_separated_string_map(f, &self.index_options)?;
+            write!(f, ")")?;
         }
 
         Ok(())
