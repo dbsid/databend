@@ -172,8 +172,11 @@ impl BtreeIndexFileMeta {
     }
 
     pub fn blocks_for_prefix(&self, prefix: &[u8]) -> Vec<BtreeIndexDataBlockMeta> {
+        let range = data_block_prefix_range(&self.index_block.data_blocks, prefix);
         self.index_block
             .data_blocks
+            .get(range)
+            .unwrap_or_default()
             .iter()
             .filter(|block| block_matches_prefix(block, prefix))
             .cloned()
@@ -274,13 +277,10 @@ impl BtreeIndexFileView {
     }
 
     fn blocks_for_prefix(&self, prefix: &[u8]) -> impl Iterator<Item = &BtreeIndexDataBlockMeta> {
-        self.index_block.data_blocks.iter().filter(move |block| {
-            let first = block.first_key.as_slice();
-            let last = block.last_key.as_slice();
-            first.starts_with(prefix)
-                || last.starts_with(prefix)
-                || (first < prefix && prefix <= last)
-        })
+        let range = data_block_prefix_range(&self.index_block.data_blocks, prefix);
+        self.index_block.data_blocks[range]
+            .iter()
+            .filter(move |block| block_matches_prefix(block, prefix))
     }
 
     fn blocks_for_range(
@@ -517,6 +517,31 @@ fn block_matches_prefix(block: &BtreeIndexDataBlockMeta, prefix: &[u8]) -> bool 
     let first = block.first_key.as_slice();
     let last = block.last_key.as_slice();
     first.starts_with(prefix) || last.starts_with(prefix) || (first < prefix && prefix <= last)
+}
+
+fn data_block_prefix_range(blocks: &[BtreeIndexDataBlockMeta], prefix: &[u8]) -> Range<usize> {
+    let start = blocks.partition_point(|block| block.last_key.as_slice() < prefix);
+    let end = match prefix_upper_bound(prefix) {
+        Some(upper_bound) => {
+            start
+                + blocks[start..]
+                    .partition_point(|block| block.first_key.as_slice() < upper_bound.as_slice())
+        }
+        None => blocks.len(),
+    };
+    start..end
+}
+
+fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut upper_bound = prefix.to_vec();
+    for idx in (0..upper_bound.len()).rev() {
+        if upper_bound[idx] != u8::MAX {
+            upper_bound[idx] += 1;
+            upper_bound.truncate(idx + 1);
+            return Some(upper_bound);
+        }
+    }
+    None
 }
 
 pub fn btree_index_section(
@@ -1093,6 +1118,34 @@ mod tests {
         assert_eq!(rows.len(), 10);
         assert_eq!(rows[0].encoded_key.as_slice(), b"wallet-1|00");
         assert_eq!(rows[9].encoded_key.as_slice(), b"wallet-1|09");
+        Ok(())
+    }
+
+    #[test]
+    fn test_btree_index_prefix_blocks_seek_to_matching_range() -> Result<()> {
+        let meta = BtreeIndexMeta {
+            columns: vec![],
+            metadata: BTreeMap::new(),
+        };
+        let mut writer =
+            BtreeIndexWriter::new(meta, "schema", "wallet ASC", "none").with_data_block_size(1);
+        for key in ["wallet-0|00", "wallet-1|00", "wallet-1|01", "wallet-2|00"] {
+            let (key, value) = row(key, "payload");
+            writer.add_row(key, value);
+        }
+
+        let data = writer.finish()?;
+        let view = BtreeIndexFileView::open(data)?;
+
+        let range = data_block_prefix_range(&view.index_block().data_blocks, b"wallet-1|");
+        assert_eq!(range, 1..3);
+        let block_keys = view
+            .blocks_for_prefix(b"wallet-1|")
+            .map(|block| block.first_key.as_slice())
+            .collect::<Vec<_>>();
+        assert_eq!(block_keys, vec![b"wallet-1|00".as_slice(), b"wallet-1|01"]);
+        let rows = view.lookup_prefix(b"wallet-1|", Some(100))?;
+        assert_eq!(rows.len(), 2);
         Ok(())
     }
 
