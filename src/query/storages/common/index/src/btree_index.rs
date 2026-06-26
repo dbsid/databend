@@ -806,14 +806,31 @@ pub fn encode_btree_payload(payload: &[Scalar]) -> Result<Vec<u8>> {
 }
 
 pub fn decode_btree_payload(payload: &[u8]) -> Result<Vec<Scalar>> {
+    let mut row = Vec::new();
+    visit_btree_payload(payload, |_, scalar| {
+        row.push(scalar);
+        Ok(())
+    })?;
+    Ok(row)
+}
+
+pub fn visit_btree_payload<F>(payload: &[u8], mut visitor: F) -> Result<usize>
+where F: FnMut(usize, Scalar) -> Result<()> {
     if !is_offset_encoded_payload(payload) {
-        return decode_from_slice(payload, "btree row payload");
+        let row = decode_from_slice::<Vec<Scalar>>(payload, "btree row payload")?;
+        let column_count = row.len();
+        for (index, scalar) in row.into_iter().enumerate() {
+            visitor(index, scalar)?;
+        }
+        return Ok(column_count);
     }
 
     let view = BtreePayloadView::parse(payload)?;
-    (0..view.column_count())
-        .map(|index| view.decode_column(index))
-        .collect()
+    let column_count = view.column_count();
+    for index in 0..column_count {
+        visitor(index, view.decode_column(index)?)?;
+    }
+    Ok(column_count)
 }
 
 pub fn decode_btree_payload_projection(
@@ -1190,6 +1207,15 @@ mod tests {
         let decoded = decode_btree_payload(&payload)?;
         assert_eq!(decoded.len(), 3);
         assert_eq!(decoded[0], Scalar::String("wallet-a".to_string()));
+
+        let mut visited = Vec::new();
+        let column_count = visit_btree_payload(&payload, |index, scalar| {
+            visited.push((index, scalar));
+            Ok(())
+        })?;
+        assert_eq!(column_count, 3);
+        assert_eq!(visited[0], (0, Scalar::String("wallet-a".to_string())));
+        assert_eq!(visited[2], (2, Scalar::String("token-a".to_string())));
         Ok(())
     }
 }

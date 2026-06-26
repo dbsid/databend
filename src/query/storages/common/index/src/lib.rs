@@ -66,6 +66,7 @@ pub use btree_index::decode_btree_payload;
 pub use btree_index::decode_btree_payload_projection;
 pub use btree_index::encode_btree_key_component;
 pub use btree_index::encode_btree_payload;
+pub use btree_index::visit_btree_payload;
 pub use eliminate_cast::eliminate_cast;
 pub use hnsw_index::DistanceType;
 pub use hnsw_index::FixedLengthPriorityQueue;
