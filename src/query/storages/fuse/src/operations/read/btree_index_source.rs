@@ -374,11 +374,12 @@ impl BtreeIndexSource {
         let prefix_equalities = self.btree_prefix_payload_equalities()?;
         let fast_predicates = compile_btree_fast_predicates(&expr, &prefix_equalities);
         let key_fields = self.btree_key_fields_by_payload_index()?;
-        let (key_predicates, fast_predicates) = if let Some(predicates) = fast_predicates {
+        let (mut key_predicates, fast_predicates) = if let Some(predicates) = fast_predicates {
             split_btree_fast_predicates(predicates, &key_fields)?
         } else {
             (Vec::new(), None)
         };
+        key_predicates.sort_by_key(|predicate| predicate.component_index);
         let mut payload_field_indexes = if let Some(predicates) = &fast_predicates {
             predicates
                 .iter()
@@ -1372,21 +1373,56 @@ fn evaluate_btree_key_predicates(
     predicates: &[BtreeIndexKeyPredicate],
     encoded_key: &[u8],
 ) -> bool {
-    let Some(max_component_index) = predicates
-        .iter()
-        .map(|predicate| predicate.component_index)
-        .max()
-    else {
+    if predicates.is_empty() {
         return true;
-    };
-    let Some(components) = encoded_key_components(encoded_key, max_component_index + 1) else {
-        return false;
-    };
-    predicates.iter().all(|predicate| {
-        components
-            .get(predicate.component_index)
-            .is_some_and(|component| evaluate_btree_key_predicate_component(predicate, component))
-    })
+    }
+
+    let mut offset = 0usize;
+    let mut component_index = 0usize;
+    let mut predicate_index = 0usize;
+    while predicate_index < predicates.len() {
+        let len_bytes = match encoded_key.get(offset..offset + 4) {
+            Some(len_bytes) => len_bytes,
+            None => return false,
+        };
+        let len = match <[u8; 4]>::try_from(len_bytes) {
+            Ok(len_bytes) => u32::from_be_bytes(len_bytes) as usize,
+            Err(_) => return false,
+        };
+        let value_start = offset + 4;
+        let Some(value_end) = value_start.checked_add(len) else {
+            return false;
+        };
+        let Some(component) = encoded_key.get(value_start..value_end) else {
+            return false;
+        };
+        let Some(separator) = encoded_key.get(value_end) else {
+            return false;
+        };
+        if *separator != 0xff {
+            return false;
+        }
+
+        while predicates
+            .get(predicate_index)
+            .is_some_and(|predicate| predicate.component_index == component_index)
+        {
+            if !evaluate_btree_key_predicate_component(&predicates[predicate_index], component) {
+                return false;
+            }
+            predicate_index += 1;
+        }
+
+        offset = value_end + 1;
+        component_index += 1;
+        if predicates
+            .get(predicate_index)
+            .is_some_and(|predicate| predicate.component_index < component_index)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn evaluate_btree_key_predicate_component(
@@ -1511,25 +1547,6 @@ fn encoded_key_component(encoded_key: &[u8], component_index: usize) -> Option<&
         offset = value_end + 1;
     }
     None
-}
-
-fn encoded_key_components(encoded_key: &[u8], component_count: usize) -> Option<Vec<&[u8]>> {
-    let mut components = Vec::with_capacity(component_count);
-    let mut offset = 0usize;
-    for _ in 0..component_count {
-        let len_bytes = encoded_key.get(offset..offset + 4)?;
-        let len = u32::from_be_bytes(len_bytes.try_into().ok()?) as usize;
-        let value_start = offset + 4;
-        let value_end = value_start.checked_add(len)?;
-        let component = encoded_key.get(value_start..value_end)?;
-        let separator = encoded_key.get(value_end)?;
-        if *separator != 0xff {
-            return None;
-        }
-        components.push(component);
-        offset = value_end + 1;
-    }
-    Some(components)
 }
 
 fn encode_prefix(btree_index: &BtreeIndexInfo) -> Result<Vec<u8>> {
