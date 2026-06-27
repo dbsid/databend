@@ -17,17 +17,17 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use databend_common_base::runtime::Runtime;
+use databend_common_catalog::plan::BtreeIndexInfo;
 use databend_common_catalog::plan::PushDownInfo;
 use databend_common_catalog::plan::ReadPartitionsPruningMode;
-use databend_common_catalog::plan::block_id_in_segment;
 use databend_common_catalog::query_kind::QueryKind;
 use databend_common_catalog::table_context::TableContext;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
-use databend_common_expression::BLOCK_NAME_COL_NAME;
 use databend_common_expression::ColumnId;
 use databend_common_expression::RemoteExpr;
 use databend_common_expression::SEGMENT_NAME_COL_NAME;
+use databend_common_expression::Scalar;
 use databend_common_expression::TableSchemaRef;
 use databend_common_functions::BUILTIN_FUNCTIONS;
 use databend_common_metrics::storage::metrics_inc_blocks_topn_pruning_after;
@@ -266,6 +266,7 @@ pub struct FusePruner {
     pub inverse_range_index: Option<RangeIndex>,
     pub deleted_segments: Vec<DeletedSegmentInfo>,
     pub block_meta_cache: Option<SegmentBlockMetasCache>,
+    pub btree_cluster_prefix: Option<Vec<Scalar>>,
 }
 
 impl FusePruner {
@@ -334,6 +335,12 @@ impl FusePruner {
         spatial_index_columns: HashSet<ColumnId>,
         bloom_index_builder: Option<BloomIndexRebuilder>,
     ) -> Result<Self> {
+        let btree_cluster_prefix = cluster_key_meta.as_ref().and_then(|_| {
+            push_down
+                .as_ref()
+                .and_then(|push_down| push_down.btree_index.as_ref())
+                .and_then(|btree_index| btree_cluster_prefix(btree_index, &cluster_keys))
+        });
         let max_concurrency = {
             let max_io_requests = ctx.get_settings().get_max_storage_io_requests()? as usize;
             // Prevent us from miss-configured max_storage_io_requests setting, e.g. 0
@@ -374,6 +381,7 @@ impl FusePruner {
             inverse_range_index: None,
             deleted_segments: vec![],
             block_meta_cache: CacheManager::instance().get_segment_block_metas_cache(),
+            btree_cluster_prefix,
         })
     }
 
@@ -420,6 +428,7 @@ impl FusePruner {
 
             let mut batch = segment_locs.drain(0..batch_size).collect::<Vec<_>>();
             let inverse_range_index = self.get_inverse_range_index();
+            let btree_cluster_prefix = self.btree_cluster_prefix.clone();
             works.push(self.pruning_ctx.pruning_runtime.spawn({
                 let block_pruner = block_pruner.clone();
                 let segment_pruner = segment_pruner.clone();
@@ -474,9 +483,6 @@ impl FusePruner {
                         }
                     } else {
                         let sample_probability = table_sample(&push_down)?;
-                        let use_btree_index = push_down
-                            .as_ref()
-                            .is_some_and(|push_down| push_down.btree_index.is_some());
                         for (location, info) in pruned_segments {
                             let mut block_metas =
                                 Self::extract_block_metas(&location.location.0, &info, true)?;
@@ -515,12 +521,15 @@ impl FusePruner {
                                     block_metas = Arc::new(sample_block_metas);
                                 }
                             }
-                            if use_btree_index {
-                                res.extend(Self::btree_block_metas_without_block_pruning(
-                                    &location,
+                            if let Some(cluster_prefix) = &btree_cluster_prefix {
+                                let block_meta_indexes =
+                                    block_pruner.internal_column_pruning(&block_metas);
+                                res.extend(block_pruner.btree_cluster_pruning(
+                                    location.clone(),
                                     block_metas,
-                                    pruning_ctx.internal_column_pruner.as_ref(),
-                                ));
+                                    block_meta_indexes,
+                                    cluster_prefix,
+                                )?);
                             } else {
                                 res.extend(
                                     block_pruner.pruning(location.clone(), block_metas).await?,
@@ -550,42 +559,6 @@ impl FusePruner {
             let metas = self.topn_pruning(metas)?;
             self.vector_pruning(metas).await
         }
-    }
-
-    fn btree_block_metas_without_block_pruning(
-        segment_location: &SegmentLocation,
-        block_metas: Arc<Vec<Arc<BlockMeta>>>,
-        internal_column_pruner: Option<&Arc<InternalColumnPruner>>,
-    ) -> Vec<(BlockMetaIndex, Arc<BlockMeta>)> {
-        let block_num = block_metas.len();
-        block_metas
-            .iter()
-            .enumerate()
-            .filter(|(_, block_meta)| {
-                internal_column_pruner.is_none_or(|pruner| {
-                    pruner.should_keep(BLOCK_NAME_COL_NAME, &block_meta.location.0)
-                })
-            })
-            .map(|(block_idx, block_meta)| {
-                (
-                    BlockMetaIndex {
-                        segment_idx: segment_location.segment_idx,
-                        block_idx,
-                        range: None,
-                        page_size: block_meta.page_size() as usize,
-                        block_id: block_id_in_segment(block_num, block_idx),
-                        block_location: block_meta.location.0.clone(),
-                        segment_location: segment_location.location.0.clone(),
-                        snapshot_location: segment_location.snapshot_loc.clone(),
-                        matched_rows: None,
-                        matched_scores: None,
-                        vector_scores: None,
-                        virtual_block_meta: None,
-                    },
-                    block_meta.clone(),
-                )
-            })
-            .collect()
     }
 
     fn extract_block_metas(
@@ -847,78 +820,136 @@ pub fn table_sample(push_down_info: &Option<PushDownInfo>) -> Result<Option<f64>
     Ok(sample_probability)
 }
 
+fn btree_cluster_prefix(
+    btree_index: &BtreeIndexInfo,
+    cluster_keys: &[RemoteExpr<String>],
+) -> Option<Vec<Scalar>> {
+    let mut prefix = Vec::with_capacity(btree_index.equality_prefix.len());
+    for cluster_key in cluster_keys {
+        if prefix.len() == btree_index.equality_prefix.len() {
+            break;
+        }
+
+        let Some(value) = btree_cluster_prefix_value(btree_index, cluster_key) else {
+            break;
+        };
+        prefix.push(value);
+    }
+
+    (!prefix.is_empty()).then_some(prefix)
+}
+
+fn btree_cluster_prefix_value(
+    btree_index: &BtreeIndexInfo,
+    cluster_key: &RemoteExpr<String>,
+) -> Option<Scalar> {
+    match cluster_key {
+        RemoteExpr::ColumnRef { id, .. } => btree_equality_value(btree_index, id).cloned(),
+        RemoteExpr::FunctionCall { id, args, .. }
+            if id.name().as_ref() == "is_null" && args.len() == 1 =>
+        {
+            let RemoteExpr::ColumnRef { id, .. } = &args[0] else {
+                return None;
+            };
+            btree_equality_value(btree_index, id)
+                .map(|value| Scalar::Boolean(matches!(value, Scalar::Null)))
+        }
+        _ => None,
+    }
+}
+
+fn btree_equality_value<'a>(btree_index: &'a BtreeIndexInfo, column: &str) -> Option<&'a Scalar> {
+    btree_index
+        .key_columns
+        .iter()
+        .zip(btree_index.equality_prefix.iter())
+        .find_map(|(key_column, value)| (key_column.field.name() == column).then_some(value))
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
-    use databend_storages_common_table_meta::meta::BlockMeta;
-    use databend_storages_common_table_meta::meta::Compression;
+    use databend_common_catalog::plan::BtreeIndexColumnOrder;
+    use databend_common_catalog::plan::BtreeIndexKeyColumn;
+    use databend_common_expression::FunctionID;
+    use databend_common_expression::TableDataType;
+    use databend_common_expression::TableField;
+    use databend_common_expression::types::DataType;
+    use databend_common_expression::types::NumberDataType;
+    use databend_common_expression::types::NumberScalar;
 
     use super::*;
 
     #[test]
-    fn test_btree_block_metas_without_block_pruning_preserves_block_meta_index() {
-        let segment_location = SegmentLocation {
-            segment_idx: 7,
-            location: ("segments/segment-1.meta".to_string(), 1),
-            snapshot_loc: Some("snapshots/snapshot-1.meta".to_string()),
+    fn test_btree_cluster_prefix_supports_is_null_cluster_key() {
+        let btree_index = BtreeIndexInfo {
+            index_name: "idx".to_string(),
+            index_version: "v1".to_string(),
+            key_columns: vec![
+                key_column("platform_id"),
+                key_column("wallet_address"),
+                key_column("tag_black_hole"),
+                key_column("last_active_time"),
+            ],
+            payload_fields: vec![],
+            equality_prefix: vec![
+                Scalar::Number(NumberScalar::UInt64(14)),
+                Scalar::String("0xwallet".to_string()),
+                Scalar::Null,
+            ],
+            limit: Some(100),
+            filters: None,
+            use_block_btree_index_size_hint: false,
         };
-        let block_metas = Arc::new(vec![
-            Arc::new(test_block_meta("blocks/block-0.parquet", 11)),
-            Arc::new(test_block_meta("blocks/block-1.parquet", 13)),
-            Arc::new(test_block_meta("blocks/block-2.parquet", 17)),
+        let cluster_keys = vec![
+            column_ref("platform_id"),
+            column_ref("wallet_address"),
+            is_null(column_ref("tag_black_hole")),
+            RemoteExpr::FunctionCall {
+                span: None,
+                id: Box::new(FunctionID::Builtin {
+                    name: "negate".to_string(),
+                    id: 0,
+                }),
+                generics: vec![],
+                args: vec![column_ref("last_active_time")],
+                return_type: DataType::Number(NumberDataType::Int64),
+            },
+        ];
+
+        let prefix = btree_cluster_prefix(&btree_index, &cluster_keys).unwrap();
+        assert_eq!(prefix, vec![
+            Scalar::Number(NumberScalar::UInt64(14)),
+            Scalar::String("0xwallet".to_string()),
+            Scalar::Boolean(true),
         ]);
+    }
 
-        let metas = FusePruner::btree_block_metas_without_block_pruning(
-            &segment_location,
-            block_metas.clone(),
-            None,
-        );
-
-        assert_eq!(metas.len(), 3);
-        for (idx, (block_meta_index, block_meta)) in metas.iter().enumerate() {
-            assert!(Arc::ptr_eq(block_meta, &block_metas[idx]));
-            assert_eq!(block_meta_index.segment_idx, 7);
-            assert_eq!(block_meta_index.block_idx, idx);
-            assert_eq!(block_meta_index.block_id, block_metas.len() - idx - 1);
-            assert_eq!(block_meta_index.range, None);
-            assert_eq!(block_meta_index.page_size, block_meta.row_count as usize);
-            assert_eq!(block_meta_index.block_location, block_meta.location.0);
-            assert_eq!(block_meta_index.segment_location, "segments/segment-1.meta");
-            assert_eq!(
-                block_meta_index.snapshot_location.as_deref(),
-                Some("snapshots/snapshot-1.meta")
-            );
-            assert_eq!(block_meta_index.matched_rows, None);
-            assert_eq!(block_meta_index.matched_scores, None);
-            assert_eq!(block_meta_index.vector_scores, None);
-            assert_eq!(block_meta_index.virtual_block_meta, None);
+    fn key_column(name: &str) -> BtreeIndexKeyColumn {
+        BtreeIndexKeyColumn {
+            field: TableField::new(name, TableDataType::String),
+            order: BtreeIndexColumnOrder::Asc,
         }
     }
 
-    fn test_block_meta(location: &str, row_count: u64) -> BlockMeta {
-        BlockMeta {
-            row_count,
-            block_size: row_count * 100,
-            file_size: row_count * 100,
-            col_stats: HashMap::new(),
-            col_metas: HashMap::new(),
-            cluster_stats: None,
-            location: (location.to_string(), 1),
-            bloom_filter_index_location: None,
-            bloom_filter_index_size: 0,
-            inverted_index_size: None,
-            btree_index_size: Some(128),
-            ngram_filter_index_size: None,
-            vector_index_size: None,
-            vector_index_location: None,
-            spatial_index_size: None,
-            spatial_index_location: None,
-            spatial_stats: None,
-            virtual_block_meta: None,
-            compression: Compression::Lz4,
-            create_on: None,
+    fn column_ref(name: &str) -> RemoteExpr<String> {
+        RemoteExpr::ColumnRef {
+            span: None,
+            id: name.to_string(),
+            data_type: DataType::String,
+            display_name: name.to_string(),
+        }
+    }
+
+    fn is_null(expr: RemoteExpr<String>) -> RemoteExpr<String> {
+        RemoteExpr::FunctionCall {
+            span: None,
+            id: Box::new(FunctionID::Builtin {
+                name: "is_null".to_string(),
+                id: 0,
+            }),
+            generics: vec![],
+            args: vec![expr],
+            return_type: DataType::Boolean,
         }
     }
 }

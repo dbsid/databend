@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp::Ordering;
 use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
@@ -22,12 +23,14 @@ use databend_common_catalog::plan::block_id_in_segment;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_expression::BLOCK_NAME_COL_NAME;
+use databend_common_expression::Scalar;
 use databend_common_expression::types::F32;
 use databend_common_metrics::storage::*;
 use databend_storages_common_pruner::BlockMetaIndex;
 use databend_storages_common_pruner::RangeIndexInput;
 use databend_storages_common_pruner::VirtualBlockMetaIndex;
 use databend_storages_common_table_meta::meta::BlockMeta;
+use databend_storages_common_table_meta::meta::ClusterStatistics;
 use futures_util::future;
 use log::info;
 use tokio::sync::OwnedSemaphorePermit;
@@ -522,6 +525,151 @@ impl BlockPruner {
         info!("[FUSE-PRUNER] sync block prune elapsed: {elapsed}");
 
         Ok(result)
+    }
+
+    pub fn btree_cluster_pruning(
+        &self,
+        segment_location: SegmentLocation,
+        block_metas: Arc<Vec<Arc<BlockMeta>>>,
+        block_meta_indexes: Vec<(usize, Arc<BlockMeta>)>,
+        cluster_prefix: &[Scalar],
+    ) -> Result<Vec<(BlockMetaIndex, Arc<BlockMeta>)>> {
+        let pruning_stats = self.pruning_ctx.pruning_stats.clone();
+        let pruning_cost = self.pruning_ctx.pruning_cost.clone();
+
+        let start = Instant::now();
+
+        let mut result = Vec::with_capacity(block_meta_indexes.len());
+        let block_num = block_metas.len();
+        for (block_idx, block_meta) in block_meta_indexes {
+            metrics_inc_blocks_range_pruning_before(1);
+            metrics_inc_bytes_block_range_pruning_before(block_meta.block_size);
+            pruning_stats.set_blocks_range_pruning_before(1);
+
+            let keep = pruning_cost.measure(PruningCostKind::BlocksRange, || {
+                cluster_prefix_may_intersect(&block_meta.cluster_stats, cluster_prefix)
+            });
+            if keep {
+                metrics_inc_blocks_range_pruning_after(1);
+                metrics_inc_bytes_block_range_pruning_after(block_meta.block_size);
+                pruning_stats.set_blocks_range_pruning_after(1);
+
+                result.push((
+                    BlockMetaIndex {
+                        segment_idx: segment_location.segment_idx,
+                        block_idx,
+                        range: None,
+                        page_size: block_meta.page_size() as usize,
+                        block_id: block_id_in_segment(block_num, block_idx),
+                        block_location: block_meta.as_ref().location.0.clone(),
+                        segment_location: segment_location.location.0.clone(),
+                        snapshot_location: segment_location.snapshot_loc.clone(),
+                        matched_rows: None,
+                        matched_scores: None,
+                        vector_scores: None,
+                        virtual_block_meta: None,
+                    },
+                    block_meta.clone(),
+                ))
+            }
+        }
+
+        let elapsed = start.elapsed().as_millis() as u64;
+        metrics_inc_pruning_milliseconds(elapsed);
+        info!("[FUSE-PRUNER] btree cluster block prune elapsed: {elapsed}");
+
+        Ok(result)
+    }
+}
+
+fn cluster_prefix_may_intersect(
+    cluster_stats: &Option<ClusterStatistics>,
+    prefix: &[Scalar],
+) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+
+    let Some(cluster_stats) = cluster_stats else {
+        return true;
+    };
+
+    let Some(min_cmp) = compare_cluster_tuple_prefix(cluster_stats.min(), prefix) else {
+        return true;
+    };
+    let Some(max_cmp) = compare_cluster_tuple_prefix(cluster_stats.max(), prefix) else {
+        return true;
+    };
+
+    min_cmp != Ordering::Greater && max_cmp != Ordering::Less
+}
+
+fn compare_cluster_tuple_prefix(tuple: &[Scalar], prefix: &[Scalar]) -> Option<Ordering> {
+    if tuple.len() < prefix.len() {
+        return None;
+    }
+
+    for (left, right) in tuple.iter().zip(prefix) {
+        let ordering = left.partial_cmp(right)?;
+        if ordering != Ordering::Equal {
+            return Some(ordering);
+        }
+    }
+    Some(Ordering::Equal)
+}
+
+#[cfg(test)]
+mod tests {
+    use databend_common_expression::Scalar;
+    use databend_storages_common_table_meta::meta::ClusterStatistics;
+
+    use super::cluster_prefix_may_intersect;
+
+    #[test]
+    fn test_btree_cluster_prefix_prunes_outside_cluster_range() {
+        let cluster_stats = Some(cluster_stats(
+            vec![string("14"), string("wallet-a"), Scalar::Boolean(true)],
+            vec![string("14"), string("wallet-z"), Scalar::Boolean(true)],
+        ));
+
+        assert!(cluster_prefix_may_intersect(&cluster_stats, &[
+            string("14"),
+            string("wallet-m"),
+            Scalar::Boolean(true)
+        ]));
+        assert!(!cluster_prefix_may_intersect(&cluster_stats, &[
+            string("14"),
+            string("wallet-0"),
+            Scalar::Boolean(true)
+        ]));
+        assert!(!cluster_prefix_may_intersect(&cluster_stats, &[
+            string("14"),
+            string("wallet-zz"),
+            Scalar::Boolean(true)
+        ]));
+    }
+
+    #[test]
+    fn test_btree_cluster_prefix_pruning_is_conservative_without_comparable_stats() {
+        assert!(cluster_prefix_may_intersect(&None, &[string("14")]));
+        assert!(cluster_prefix_may_intersect(
+            &Some(cluster_stats(vec![string("14")], vec![string("14")])),
+            &[string("14"), string("wallet")]
+        ));
+        assert!(cluster_prefix_may_intersect(
+            &Some(cluster_stats(vec![Scalar::Boolean(false)], vec![
+                Scalar::Boolean(true)
+            ])),
+            &[string("14")]
+        ));
+    }
+
+    fn cluster_stats(min: Vec<Scalar>, max: Vec<Scalar>) -> ClusterStatistics {
+        ClusterStatistics::new(0, min, max, 0, None)
+    }
+
+    fn string(value: &str) -> Scalar {
+        Scalar::String(value.to_string())
     }
 }
 

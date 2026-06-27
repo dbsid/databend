@@ -641,7 +641,17 @@ impl FuseTable {
             pruner.table_schema.clone(),
         )?;
         let runtime_filter_prune_context_for_block = runtime_filter_prune_context.clone();
-        if pruner.pruning_ctx.bloom_pruner.is_some()
+        if let Some(btree_cluster_prefix) = &pruner.btree_cluster_prefix {
+            let btree_cluster_prefix = btree_cluster_prefix.clone();
+            prune_pipeline.add_transform(|input, output| {
+                SyncBlockPruneTransform::create_for_btree(
+                    input,
+                    output,
+                    block_pruner.clone(),
+                    btree_cluster_prefix.clone(),
+                )
+            })?;
+        } else if pruner.pruning_ctx.bloom_pruner.is_some()
             || pruner.pruning_ctx.inverted_index_pruner.is_some()
             || pruner.pruning_ctx.spatial_index_pruner.is_some()
             || pruner.pruning_ctx.virtual_column_pruner.is_some()
