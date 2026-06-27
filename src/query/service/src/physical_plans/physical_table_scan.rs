@@ -1518,11 +1518,11 @@ fn btree_candidate_score_is_better(
     if candidate.prefix_len != best.prefix_len {
         return candidate.prefix_len > best.prefix_len;
     }
-    if candidate.extra_filter_key_columns != best.extra_filter_key_columns {
-        return candidate.extra_filter_key_columns > best.extra_filter_key_columns;
-    }
     if candidate.preserves_order != best.preserves_order {
         return candidate.preserves_order;
+    }
+    if candidate.extra_filter_key_columns != best.extra_filter_key_columns {
+        return candidate.extra_filter_key_columns > best.extra_filter_key_columns;
     }
     if candidate.payload_width != best.payload_width {
         return candidate.payload_width < best.payload_width;
@@ -1720,7 +1720,7 @@ mod tests {
     }
 
     #[test]
-    fn test_btree_candidate_score_prefers_extra_filter_key_columns() {
+    fn test_btree_candidate_score_prefers_order_preserving_before_extra_filter_keys() {
         let no_extra_filter_keys = BtreeIndexCandidateScore {
             prefix_len: 2,
             extra_filter_key_columns: 0,
@@ -1732,6 +1732,31 @@ mod tests {
             prefix_len: 2,
             extra_filter_key_columns: 2,
             preserves_order: false,
+            payload_width: 10,
+            key_width: 5,
+        };
+
+        assert!(btree_candidate_score_is_better(
+            &no_extra_filter_keys,
+            "idx_plain",
+            &with_extra_filter_keys,
+            "idx_with_tags"
+        ));
+    }
+
+    #[test]
+    fn test_btree_candidate_score_prefers_extra_filter_key_columns_on_order_tie() {
+        let no_extra_filter_keys = BtreeIndexCandidateScore {
+            prefix_len: 2,
+            extra_filter_key_columns: 0,
+            preserves_order: true,
+            payload_width: 3,
+            key_width: 3,
+        };
+        let with_extra_filter_keys = BtreeIndexCandidateScore {
+            prefix_len: 2,
+            extra_filter_key_columns: 2,
+            preserves_order: true,
             payload_width: 10,
             key_width: 5,
         };
