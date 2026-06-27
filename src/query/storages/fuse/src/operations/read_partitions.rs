@@ -97,7 +97,6 @@ use crate::pruning::VectorIndexPruner;
 use crate::pruning::create_segment_location_vector;
 use crate::pruning::table_sample;
 use crate::pruning_pipeline::AsyncBlockPruneTransform;
-use crate::pruning_pipeline::AttachBlockMetaIndexTransform;
 use crate::pruning_pipeline::ColumnOrientedBlockPruneSink;
 use crate::pruning_pipeline::ExtractSegmentTransform;
 use crate::pruning_pipeline::LazySegmentReceiverSource;
@@ -642,15 +641,7 @@ impl FuseTable {
             pruner.table_schema.clone(),
         )?;
         let runtime_filter_prune_context_for_block = runtime_filter_prune_context.clone();
-        if pruner
-            .push_down
-            .as_ref()
-            .is_some_and(|push_down| push_down.btree_index.is_some())
-        {
-            prune_pipeline.add_transform(|input, output| {
-                AttachBlockMetaIndexTransform::create(input, output, block_pruner.clone())
-            })?;
-        } else if pruner.pruning_ctx.bloom_pruner.is_some()
+        if pruner.pruning_ctx.bloom_pruner.is_some()
             || pruner.pruning_ctx.inverted_index_pruner.is_some()
             || pruner.pruning_ctx.spatial_index_pruner.is_some()
             || pruner.pruning_ctx.virtual_column_pruner.is_some()

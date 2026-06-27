@@ -19,6 +19,7 @@ use std::sync::Arc;
 use databend_common_base::runtime::Runtime;
 use databend_common_catalog::plan::PushDownInfo;
 use databend_common_catalog::plan::ReadPartitionsPruningMode;
+use databend_common_catalog::plan::block_id_in_segment;
 use databend_common_catalog::query_kind::QueryKind;
 use databend_common_catalog::table_context::TableContext;
 use databend_common_exception::ErrorCode;
@@ -556,7 +557,8 @@ impl FusePruner {
         block_metas: Arc<Vec<Arc<BlockMeta>>>,
         internal_column_pruner: Option<&Arc<InternalColumnPruner>>,
     ) -> Vec<(BlockMetaIndex, Arc<BlockMeta>)> {
-        let block_meta_indexes = block_metas
+        let block_num = block_metas.len();
+        block_metas
             .iter()
             .enumerate()
             .filter(|(_, block_meta)| {
@@ -564,13 +566,26 @@ impl FusePruner {
                     pruner.should_keep(BLOCK_NAME_COL_NAME, &block_meta.location.0)
                 })
             })
-            .map(|(block_idx, block_meta)| (block_idx, block_meta.clone()))
-            .collect();
-        BlockPruner::attach_block_meta_indexes_without_pruning(
-            segment_location.clone(),
-            block_metas,
-            block_meta_indexes,
-        )
+            .map(|(block_idx, block_meta)| {
+                (
+                    BlockMetaIndex {
+                        segment_idx: segment_location.segment_idx,
+                        block_idx,
+                        range: None,
+                        page_size: block_meta.page_size() as usize,
+                        block_id: block_id_in_segment(block_num, block_idx),
+                        block_location: block_meta.location.0.clone(),
+                        segment_location: segment_location.location.0.clone(),
+                        snapshot_location: segment_location.snapshot_loc.clone(),
+                        matched_rows: None,
+                        matched_scores: None,
+                        vector_scores: None,
+                        virtual_block_meta: None,
+                    },
+                    block_meta.clone(),
+                )
+            })
+            .collect()
     }
 
     fn extract_block_metas(
