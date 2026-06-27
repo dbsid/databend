@@ -1342,6 +1342,11 @@ fn collect_btree_fast_predicates(
         }
         "not" if function.args.len() == 1 => {
             if let Some(column) = extract_is_not_null_column(&function.args[0]) {
+                if prefix_equality_scalar(prefix_equalities, column)
+                    .is_some_and(|scalar| matches!(scalar, Scalar::Null))
+                {
+                    return Some(());
+                }
                 predicates.push(BtreeIndexFastPredicate::IsNull { column });
                 Some(())
             } else {
@@ -1352,17 +1357,19 @@ fn collect_btree_fast_predicates(
             let Expr::ColumnRef(column) = &function.args[0] else {
                 return None;
             };
+            if prefix_equality_scalar(prefix_equalities, column.id)
+                .is_some_and(|scalar| !matches!(scalar, Scalar::Null))
+            {
+                return Some(());
+            }
             predicates.push(BtreeIndexFastPredicate::IsNotNull { column: column.id });
             Some(())
         }
         "eq" | "noteq" | "gt" | "gte" | "lt" | "lte" if function.args.len() == 2 => {
             let (column, constant, op) = extract_fast_compare(&function.args, name.as_ref())?;
             if matches!(op, BtreeIndexFastCompareOp::Eq)
-                && prefix_equalities
-                    .iter()
-                    .any(|(prefix_column, prefix_scalar)| {
-                        *prefix_column == column && prefix_scalar == &constant
-                    })
+                && prefix_equality_scalar(prefix_equalities, column)
+                    .is_some_and(|prefix_scalar| prefix_scalar == &constant)
             {
                 return Some(());
             }
@@ -1375,6 +1382,12 @@ fn collect_btree_fast_predicates(
         }
         _ => None,
     }
+}
+
+fn prefix_equality_scalar(prefix_equalities: &[(usize, Scalar)], column: usize) -> Option<&Scalar> {
+    prefix_equalities
+        .iter()
+        .find_map(|(prefix_column, scalar)| (*prefix_column == column).then_some(scalar))
 }
 
 fn extract_is_not_null_column(expr: &Expr<usize>) -> Option<usize> {
@@ -2030,6 +2043,27 @@ mod tests {
             op: BtreeIndexFastCompareOp::Gt,
             ..
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_fast_filter_compiler_skips_prefix_is_null() -> Result<()> {
+        let tag_is_not_null = check_function(
+            None,
+            "is_not_null",
+            &[],
+            &[Expr::ColumnRef(ColumnRef {
+                span: None,
+                id: 0usize,
+                data_type: DataType::Nullable(Box::new(DataType::Number(NumberDataType::UInt8))),
+                display_name: "tag_black_hole".to_string(),
+            })],
+            &BUILTIN_FUNCTIONS,
+        )?;
+        let tag_is_null = check_function(None, "not", &[], &[tag_is_not_null], &BUILTIN_FUNCTIONS)?;
+
+        let predicates = compile_btree_fast_predicates(&tag_is_null, &[(0, Scalar::Null)]).unwrap();
+        assert!(predicates.is_empty());
         Ok(())
     }
 
