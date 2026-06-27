@@ -852,6 +852,43 @@ fn btree_cluster_prefix_value(
             btree_equality_value(btree_index, id)
                 .map(|value| Scalar::Boolean(matches!(value, Scalar::Null)))
         }
+        RemoteExpr::FunctionCall { id, args, .. }
+            if id.name().as_ref() == "not" && args.len() == 1 =>
+        {
+            let RemoteExpr::FunctionCall { id, args, .. } = &args[0] else {
+                return None;
+            };
+            if id.name().as_ref() != "is_not_null" || args.len() != 1 {
+                return None;
+            }
+            let RemoteExpr::ColumnRef { id, .. } = &args[0] else {
+                return None;
+            };
+            btree_equality_value(btree_index, id)
+                .map(|value| Scalar::Boolean(matches!(value, Scalar::Null)))
+        }
+        RemoteExpr::FunctionCall { id, args, .. }
+            if id.name().as_ref() == "substr" && args.len() == 3 =>
+        {
+            let RemoteExpr::ColumnRef { id, .. } = &args[0] else {
+                return None;
+            };
+            let Some(start) = remote_expr_positive_integer(&args[1]) else {
+                return None;
+            };
+            let Some(length) = remote_expr_positive_integer(&args[2]) else {
+                return None;
+            };
+            if start != 1 {
+                return None;
+            }
+            let Some(Scalar::String(value)) = btree_equality_value(btree_index, id) else {
+                return None;
+            };
+            Some(Scalar::String(
+                value.chars().take(length as usize).collect(),
+            ))
+        }
         _ => None,
     }
 }
@@ -862,6 +899,17 @@ fn btree_equality_value<'a>(btree_index: &'a BtreeIndexInfo, column: &str) -> Op
         .iter()
         .zip(btree_index.equality_prefix.iter())
         .find_map(|(key_column, value)| (key_column.field.name() == column).then_some(value))
+}
+
+fn remote_expr_positive_integer(expr: &RemoteExpr<String>) -> Option<u64> {
+    match expr {
+        RemoteExpr::Constant {
+            scalar: Scalar::Number(number),
+            ..
+        } => number.integer_to_i128()?.try_into().ok(),
+        RemoteExpr::Cast { expr, .. } => remote_expr_positive_integer(expr),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -922,6 +970,79 @@ mod tests {
         ]);
     }
 
+    #[test]
+    fn test_btree_cluster_prefix_supports_truncated_string_cluster_key() {
+        let btree_index = BtreeIndexInfo {
+            index_name: "idx".to_string(),
+            index_version: "v1".to_string(),
+            key_columns: vec![key_column("platform_id"), key_column("wallet_address")],
+            payload_fields: vec![],
+            equality_prefix: vec![
+                Scalar::Number(NumberScalar::Int32(14)),
+                Scalar::String("0x97bbda765cf177c5e1d60d41140fcbb064abed7f".to_string()),
+            ],
+            limit: Some(100),
+            filters: None,
+            use_block_btree_index_size_hint: false,
+        };
+        let cluster_keys = vec![column_ref("platform_id"), RemoteExpr::FunctionCall {
+            span: None,
+            id: Box::new(FunctionID::Builtin {
+                name: "substr".to_string(),
+                id: 0,
+            }),
+            generics: vec![],
+            args: vec![
+                column_ref("wallet_address"),
+                cast_int_const(1),
+                cast_uint_const(8),
+            ],
+            return_type: DataType::String,
+        }];
+
+        let prefix = btree_cluster_prefix(&btree_index, &cluster_keys).unwrap();
+        assert_eq!(prefix, vec![
+            Scalar::Number(NumberScalar::Int32(14)),
+            Scalar::String("0x97bbda".to_string()),
+        ]);
+    }
+
+    #[test]
+    fn test_btree_cluster_prefix_supports_normalized_is_null_cluster_key() {
+        let btree_index = BtreeIndexInfo {
+            index_name: "idx".to_string(),
+            index_version: "v1".to_string(),
+            key_columns: vec![key_column("tag_black_hole")],
+            payload_fields: vec![],
+            equality_prefix: vec![Scalar::Null],
+            limit: Some(100),
+            filters: None,
+            use_block_btree_index_size_hint: false,
+        };
+        let cluster_keys = vec![RemoteExpr::FunctionCall {
+            span: None,
+            id: Box::new(FunctionID::Builtin {
+                name: "not".to_string(),
+                id: 0,
+            }),
+            generics: vec![],
+            args: vec![RemoteExpr::FunctionCall {
+                span: None,
+                id: Box::new(FunctionID::Builtin {
+                    name: "is_not_null".to_string(),
+                    id: 0,
+                }),
+                generics: vec![],
+                args: vec![column_ref("tag_black_hole")],
+                return_type: DataType::Boolean,
+            }],
+            return_type: DataType::Boolean,
+        }];
+
+        let prefix = btree_cluster_prefix(&btree_index, &cluster_keys).unwrap();
+        assert_eq!(prefix, vec![Scalar::Boolean(true)]);
+    }
+
     fn key_column(name: &str) -> BtreeIndexKeyColumn {
         BtreeIndexKeyColumn {
             field: TableField::new(name, TableDataType::String),
@@ -948,6 +1069,32 @@ mod tests {
             generics: vec![],
             args: vec![expr],
             return_type: DataType::Boolean,
+        }
+    }
+
+    fn cast_int_const(value: i64) -> RemoteExpr<String> {
+        RemoteExpr::Cast {
+            span: None,
+            is_try: false,
+            expr: Box::new(RemoteExpr::Constant {
+                span: None,
+                scalar: Scalar::Number(NumberScalar::Int64(value)),
+                data_type: DataType::Number(NumberDataType::Int64),
+            }),
+            dest_type: DataType::Number(NumberDataType::Int64),
+        }
+    }
+
+    fn cast_uint_const(value: u64) -> RemoteExpr<String> {
+        RemoteExpr::Cast {
+            span: None,
+            is_try: false,
+            expr: Box::new(RemoteExpr::Constant {
+                span: None,
+                scalar: Scalar::Number(NumberScalar::UInt64(value)),
+                data_type: DataType::Number(NumberDataType::UInt64),
+            }),
+            dest_type: DataType::Number(NumberDataType::UInt64),
         }
     }
 }
