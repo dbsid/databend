@@ -52,7 +52,7 @@ INSERT INTO t_all VALUES
 (14, 'wallet-a', 20, 2.00, NULL),
 (14, 'wallet-b', 30, 3.00, NULL)
 
-query IRI
+query ITI
 SELECT platform_id, wallet_address, last_active_time
 FROM t_all
 WHERE platform_id = 14 AND wallet_address = 'wallet-a' AND tag_black_hole IS NULL
@@ -87,7 +87,7 @@ WITH (
 statement ok
 REFRESH BTREE INDEX idx_wallet_refresh_all ON t_refresh
 
-query IRI
+query ITI
 SELECT platform_id, wallet_address, last_active_time
 FROM t_refresh
 WHERE platform_id = 14 AND wallet_address = 'wallet-a' AND tag_black_hole IS NULL
@@ -95,6 +95,70 @@ ORDER BY last_active_time DESC
 LIMIT 1
 ----
 14 wallet-a 20
+
+statement ok
+CREATE TABLE t_plan_order_choice (
+    platform_id INT,
+    wallet_address VARCHAR,
+    last_active_time BIGINT,
+    balance DECIMAL(10, 2),
+    tag_whale TINYINT,
+    payload VARCHAR
+) ENGINE = FUSE
+
+statement ok
+CREATE BTREE INDEX idx_plan_ordered_all
+ON t_plan_order_choice(platform_id, wallet_address, last_active_time DESC)
+WITH (
+    COMPRESSION = 'ZSTD',
+    INDEX_COVERED_TYPE = 'COVERED_ALL_COLUMNS_IN_SCHEMA'
+)
+
+statement ok
+CREATE BTREE INDEX idx_plan_filter_only_all
+ON t_plan_order_choice(platform_id, wallet_address, tag_whale, balance DESC)
+WITH (
+    COMPRESSION = 'ZSTD',
+    INDEX_COVERED_TYPE = 'COVERED_ALL_COLUMNS_IN_SCHEMA'
+)
+
+query T
+EXPLAIN SELECT * FROM t_plan_order_choice
+WHERE platform_id = 14 AND wallet_address = 'wallet-a' AND tag_whale > 0
+ORDER BY last_active_time DESC
+LIMIT 1
+----
+Sort(PresortedMerge)
+<slt:ignore>push downs: [filters: [t_plan_order_choice.platform_id (#0) = 14 and t_plan_order_choice.tag_whale (#4) > 0 and t_plan_order_choice.wallet_address (#1) = 'wallet-a'], limit: 1]
+<slt:ignore>btree index: [idx_plan_ordered_all@<slt:ignore>]
+
+statement ok
+CREATE TABLE t_plan_filter_only (
+    platform_id INT,
+    wallet_address VARCHAR,
+    last_active_time BIGINT,
+    balance DECIMAL(10, 2),
+    tag_whale TINYINT,
+    payload VARCHAR
+) ENGINE = FUSE
+
+statement ok
+CREATE BTREE INDEX idx_plan_filter_only_all
+ON t_plan_filter_only(platform_id, wallet_address, tag_whale, balance DESC)
+WITH (
+    COMPRESSION = 'ZSTD',
+    INDEX_COVERED_TYPE = 'COVERED_ALL_COLUMNS_IN_SCHEMA'
+)
+
+query T
+EXPLAIN SELECT * FROM t_plan_filter_only
+WHERE platform_id = 14 AND wallet_address = 'wallet-a' AND tag_whale > 0
+ORDER BY last_active_time DESC
+LIMIT 1
+----
+Sort(Single)
+<slt:ignore>push downs: [filters: [t_plan_filter_only.platform_id (#0) = 14 and t_plan_filter_only.tag_whale (#4) > 0 and t_plan_filter_only.wallet_address (#1) = 'wallet-a'], limit: NONE]
+<slt:ignore>btree index: [idx_plan_filter_only_all@<slt:ignore>]
 
 statement ok
 DROP DATABASE test_btree_index
