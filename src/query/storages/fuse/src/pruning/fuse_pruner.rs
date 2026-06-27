@@ -19,10 +19,12 @@ use std::sync::Arc;
 use databend_common_base::runtime::Runtime;
 use databend_common_catalog::plan::PushDownInfo;
 use databend_common_catalog::plan::ReadPartitionsPruningMode;
+use databend_common_catalog::plan::block_id_in_segment;
 use databend_common_catalog::query_kind::QueryKind;
 use databend_common_catalog::table_context::TableContext;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
+use databend_common_expression::BLOCK_NAME_COL_NAME;
 use databend_common_expression::ColumnId;
 use databend_common_expression::RemoteExpr;
 use databend_common_expression::SEGMENT_NAME_COL_NAME;
@@ -472,6 +474,9 @@ impl FusePruner {
                         }
                     } else {
                         let sample_probability = table_sample(&push_down)?;
+                        let use_btree_index = push_down
+                            .as_ref()
+                            .is_some_and(|push_down| push_down.btree_index.is_some());
                         for (location, info) in pruned_segments {
                             let mut block_metas =
                                 Self::extract_block_metas(&location.location.0, &info, true)?;
@@ -510,7 +515,17 @@ impl FusePruner {
                                     block_metas = Arc::new(sample_block_metas);
                                 }
                             }
-                            res.extend(block_pruner.pruning(location.clone(), block_metas).await?);
+                            if use_btree_index {
+                                res.extend(Self::btree_block_metas_without_block_pruning(
+                                    &location,
+                                    block_metas,
+                                    pruning_ctx.internal_column_pruner.as_ref(),
+                                ));
+                            } else {
+                                res.extend(
+                                    block_pruner.pruning(location.clone(), block_metas).await?,
+                                );
+                            }
                         }
                     }
                     Result::<_>::Ok((res, deleted_segments))
@@ -535,6 +550,42 @@ impl FusePruner {
             let metas = self.topn_pruning(metas)?;
             self.vector_pruning(metas).await
         }
+    }
+
+    fn btree_block_metas_without_block_pruning(
+        segment_location: &SegmentLocation,
+        block_metas: Arc<Vec<Arc<BlockMeta>>>,
+        internal_column_pruner: Option<&Arc<InternalColumnPruner>>,
+    ) -> Vec<(BlockMetaIndex, Arc<BlockMeta>)> {
+        let block_num = block_metas.len();
+        block_metas
+            .iter()
+            .enumerate()
+            .filter(|(_, block_meta)| {
+                internal_column_pruner.is_none_or(|pruner| {
+                    pruner.should_keep(BLOCK_NAME_COL_NAME, &block_meta.location.0)
+                })
+            })
+            .map(|(block_idx, block_meta)| {
+                (
+                    BlockMetaIndex {
+                        segment_idx: segment_location.segment_idx,
+                        block_idx,
+                        range: None,
+                        page_size: block_meta.page_size() as usize,
+                        block_id: block_id_in_segment(block_num, block_idx),
+                        block_location: block_meta.location.0.clone(),
+                        segment_location: segment_location.location.0.clone(),
+                        snapshot_location: segment_location.snapshot_loc.clone(),
+                        matched_rows: None,
+                        matched_scores: None,
+                        vector_scores: None,
+                        virtual_block_meta: None,
+                    },
+                    block_meta.clone(),
+                )
+            })
+            .collect()
     }
 
     fn extract_block_metas(
@@ -794,4 +845,80 @@ pub fn table_sample(push_down_info: &Option<PushDownInfo>) -> Result<Option<f64>
         }
     }
     Ok(sample_probability)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use databend_storages_common_table_meta::meta::BlockMeta;
+    use databend_storages_common_table_meta::meta::Compression;
+
+    use super::*;
+
+    #[test]
+    fn test_btree_block_metas_without_block_pruning_preserves_block_meta_index() {
+        let segment_location = SegmentLocation {
+            segment_idx: 7,
+            location: ("segments/segment-1.meta".to_string(), 1),
+            snapshot_loc: Some("snapshots/snapshot-1.meta".to_string()),
+        };
+        let block_metas = Arc::new(vec![
+            Arc::new(test_block_meta("blocks/block-0.parquet", 11)),
+            Arc::new(test_block_meta("blocks/block-1.parquet", 13)),
+            Arc::new(test_block_meta("blocks/block-2.parquet", 17)),
+        ]);
+
+        let metas = FusePruner::btree_block_metas_without_block_pruning(
+            &segment_location,
+            block_metas.clone(),
+            None,
+        );
+
+        assert_eq!(metas.len(), 3);
+        for (idx, (block_meta_index, block_meta)) in metas.iter().enumerate() {
+            assert!(Arc::ptr_eq(block_meta, &block_metas[idx]));
+            assert_eq!(block_meta_index.segment_idx, 7);
+            assert_eq!(block_meta_index.block_idx, idx);
+            assert_eq!(block_meta_index.block_id, block_metas.len() - idx - 1);
+            assert_eq!(block_meta_index.range, None);
+            assert_eq!(block_meta_index.page_size, block_meta.row_count as usize);
+            assert_eq!(block_meta_index.block_location, block_meta.location.0);
+            assert_eq!(block_meta_index.segment_location, "segments/segment-1.meta");
+            assert_eq!(
+                block_meta_index.snapshot_location.as_deref(),
+                Some("snapshots/snapshot-1.meta")
+            );
+            assert_eq!(block_meta_index.matched_rows, None);
+            assert_eq!(block_meta_index.matched_scores, None);
+            assert_eq!(block_meta_index.vector_scores, None);
+            assert_eq!(block_meta_index.virtual_block_meta, None);
+        }
+    }
+
+    fn test_block_meta(location: &str, row_count: u64) -> BlockMeta {
+        BlockMeta {
+            row_count,
+            block_size: row_count * 100,
+            file_size: row_count * 100,
+            col_stats: HashMap::new(),
+            col_metas: HashMap::new(),
+            cluster_stats: None,
+            location: (location.to_string(), 1),
+            bloom_filter_index_location: None,
+            bloom_filter_index_size: 0,
+            inverted_index_size: None,
+            btree_index_size: Some(128),
+            ngram_filter_index_size: None,
+            vector_index_size: None,
+            vector_index_location: None,
+            spatial_index_size: None,
+            spatial_index_location: None,
+            spatial_stats: None,
+            virtual_block_meta: None,
+            compression: Compression::Lz4,
+            create_on: None,
+        }
+    }
 }
