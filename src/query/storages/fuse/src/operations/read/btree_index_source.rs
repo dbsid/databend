@@ -874,7 +874,12 @@ fn split_btree_fast_predicates(
             payload_predicates.push(predicate);
         }
     }
-    Ok((key_predicates, Some(payload_predicates)))
+    let payload_predicates = if payload_predicates.is_empty() {
+        None
+    } else {
+        Some(payload_predicates)
+    };
+    Ok((key_predicates, payload_predicates))
 }
 
 impl BtreeIndexFastPredicate {
@@ -2112,7 +2117,7 @@ mod tests {
             &[None, Some(key_field)],
         )?;
         assert_eq!(key_predicates.len(), 1);
-        assert_eq!(payload_predicates.unwrap().len(), 0);
+        assert!(payload_predicates.is_none());
 
         let key = encoded_test_key(&[
             (
@@ -2156,7 +2161,7 @@ mod tests {
             &[None, Some(key_field)],
         )?;
         assert_eq!(key_predicates.len(), 1);
-        assert_eq!(payload_predicates.unwrap().len(), 0);
+        assert!(payload_predicates.is_none());
 
         let key = encoded_test_key(&[
             (
@@ -2243,7 +2248,7 @@ mod tests {
             &[Some(key_field)],
         )?;
         assert_eq!(key_predicates.len(), 1);
-        assert_eq!(payload_predicates.unwrap().len(), 0);
+        assert!(payload_predicates.is_none());
 
         let key = encoded_test_key(&[(
             Scalar::Decimal(DecimalScalar::Decimal128(100, size)),
