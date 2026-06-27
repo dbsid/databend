@@ -25,6 +25,7 @@ use databend_common_exception::Result;
 use databend_common_expression::BLOCK_NAME_COL_NAME;
 use databend_common_expression::Scalar;
 use databend_common_expression::types::F32;
+use databend_common_expression::types::NumberScalar;
 use databend_common_metrics::storage::*;
 use databend_storages_common_pruner::BlockMetaIndex;
 use databend_storages_common_pruner::RangeIndexInput;
@@ -610,7 +611,7 @@ fn compare_cluster_tuple_prefix(tuple: &[Scalar], prefix: &[Scalar]) -> Option<O
     }
 
     for (left, right) in tuple.iter().zip(prefix) {
-        let ordering = left.partial_cmp(right)?;
+        let ordering = compare_cluster_scalar(left, right)?;
         if ordering != Ordering::Equal {
             return Some(ordering);
         }
@@ -618,9 +619,29 @@ fn compare_cluster_tuple_prefix(tuple: &[Scalar], prefix: &[Scalar]) -> Option<O
     Some(Ordering::Equal)
 }
 
+fn compare_cluster_scalar(left: &Scalar, right: &Scalar) -> Option<Ordering> {
+    match (left, right) {
+        (Scalar::Number(left), Scalar::Number(right)) => compare_number_scalar(left, right),
+        (Scalar::String(left), Scalar::String(right))
+            if left.starts_with(right) || right.starts_with(left) =>
+        {
+            Some(Ordering::Equal)
+        }
+        _ => left.partial_cmp(right),
+    }
+}
+
+fn compare_number_scalar(left: &NumberScalar, right: &NumberScalar) -> Option<Ordering> {
+    match (left.integer_to_i128(), right.integer_to_i128()) {
+        (Some(left), Some(right)) => Some(left.cmp(&right)),
+        _ => left.to_f64().partial_cmp(&right.to_f64()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use databend_common_expression::Scalar;
+    use databend_common_expression::types::NumberScalar;
     use databend_storages_common_table_meta::meta::ClusterStatistics;
 
     use super::cluster_prefix_may_intersect;
@@ -644,7 +665,7 @@ mod tests {
         ]));
         assert!(!cluster_prefix_may_intersect(&cluster_stats, &[
             string("14"),
-            string("wallet-zz"),
+            string("wallet-{"),
             Scalar::Boolean(true)
         ]));
     }
@@ -664,8 +685,46 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_btree_cluster_prefix_compares_different_number_widths() {
+        let cluster_stats = Some(cluster_stats(
+            vec![number(NumberScalar::Int32(14)), string("wallet-a")],
+            vec![number(NumberScalar::Int32(14)), string("wallet-z")],
+        ));
+
+        assert!(cluster_prefix_may_intersect(&cluster_stats, &[
+            number(NumberScalar::UInt64(14)),
+            string("wallet-m")
+        ]));
+        assert!(!cluster_prefix_may_intersect(&cluster_stats, &[
+            number(NumberScalar::Int64(15)),
+            string("wallet-m")
+        ]));
+    }
+
+    #[test]
+    fn test_btree_cluster_prefix_keeps_truncated_string_stats() {
+        let cluster_stats = Some(cluster_stats(
+            vec![number(NumberScalar::Int32(14)), string("0x97bbda")],
+            vec![number(NumberScalar::Int32(14)), string("0x97bbda")],
+        ));
+
+        assert!(cluster_prefix_may_intersect(&cluster_stats, &[
+            number(NumberScalar::Int64(14)),
+            string("0x97bbda765cf177c5e1d60d41140fcbb064abed7f"),
+        ]));
+        assert!(!cluster_prefix_may_intersect(&cluster_stats, &[
+            number(NumberScalar::Int64(14)),
+            string("0x97bbdb765cf177c5e1d60d41140fcbb064abed7f"),
+        ]));
+    }
+
     fn cluster_stats(min: Vec<Scalar>, max: Vec<Scalar>) -> ClusterStatistics {
         ClusterStatistics::new(0, min, max, 0, None)
+    }
+
+    fn number(value: NumberScalar) -> Scalar {
+        Scalar::Number(value)
     }
 
     fn string(value: &str) -> Scalar {
