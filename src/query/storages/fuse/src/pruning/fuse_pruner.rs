@@ -335,12 +335,10 @@ impl FusePruner {
         spatial_index_columns: HashSet<ColumnId>,
         bloom_index_builder: Option<BloomIndexRebuilder>,
     ) -> Result<Self> {
-        let btree_cluster_prefix = cluster_key_meta.as_ref().and_then(|_| {
-            push_down
-                .as_ref()
-                .and_then(|push_down| push_down.btree_index.as_ref())
-                .and_then(|btree_index| btree_cluster_prefix(btree_index, &cluster_keys))
-        });
+        let btree_cluster_prefix = push_down
+            .as_ref()
+            .and_then(|push_down| push_down.btree_index.as_ref())
+            .and_then(|btree_index| btree_cluster_prefix(btree_index, &cluster_keys));
         let max_concurrency = {
             let max_io_requests = ctx.get_settings().get_max_storage_io_requests()? as usize;
             // Prevent us from miss-configured max_storage_io_requests setting, e.g. 0

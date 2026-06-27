@@ -927,34 +927,34 @@ impl FuseTable {
         let spatial_index_columns =
             Self::create_spatial_index_columns(&self.table_info.meta.indexes);
 
-        let pruner =
-            if !self.is_native() || self.cluster_type().is_none_or(|v| v != ClusterType::Linear) {
-                FusePruner::create(
-                    &ctx,
-                    dal,
-                    table_schema.clone(),
-                    &push_downs,
-                    self.bloom_index_cols(),
-                    ngram_args,
-                    spatial_index_columns,
-                    bloom_index_builder,
-                )?
-            } else {
-                let cluster_keys = self.linear_cluster_keys(ctx.clone());
+        let pruner = if self.cluster_type().is_none_or(|v| v != ClusterType::Linear) {
+            FusePruner::create(
+                &ctx,
+                dal,
+                table_schema.clone(),
+                &push_downs,
+                self.bloom_index_cols(),
+                ngram_args,
+                spatial_index_columns,
+                bloom_index_builder,
+            )?
+        } else {
+            let cluster_keys = self.linear_cluster_keys(ctx.clone());
+            let cluster_key_meta = self.is_native().then(|| self.cluster_key_meta()).flatten();
 
-                FusePruner::create_with_pages(
-                    &ctx,
-                    dal,
-                    table_schema,
-                    &push_downs,
-                    self.cluster_key_meta(),
-                    cluster_keys,
-                    self.bloom_index_cols(),
-                    ngram_args,
-                    spatial_index_columns,
-                    bloom_index_builder,
-                )?
-            };
+            FusePruner::create_with_pages(
+                &ctx,
+                dal,
+                table_schema,
+                &push_downs,
+                cluster_key_meta,
+                cluster_keys,
+                self.bloom_index_cols(),
+                ngram_args,
+                spatial_index_columns,
+                bloom_index_builder,
+            )?
+        };
         Ok(pruner)
     }
 
