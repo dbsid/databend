@@ -73,6 +73,7 @@ use databend_common_sql::evaluator::BlockOperator;
 use databend_common_sql::executor::cast_expr_to_non_null_boolean;
 use databend_common_sql::executor::table_read_plan::ToReadDataSourcePlan;
 use databend_common_sql::plans::FunctionCall;
+use databend_common_sql::plans::SortItem;
 use databend_common_storages_fuse::FuseTable;
 use databend_common_storages_fuse::operations::need_reserve_block_info;
 use rand::distributions::Bernoulli;
@@ -904,6 +905,14 @@ impl PhysicalPlanBuilder {
 
         let btree_index =
             self.try_build_btree_index_info(scan, table_schema, user_filters.clone())?;
+        if btree_index
+            .as_ref()
+            .is_some_and(|btree_index| btree_index.limit.is_none())
+        {
+            // A filter-only BTREE access path does not preserve the query ORDER BY,
+            // so neither the source nor FUSE block pruning may consume the LIMIT.
+            limit = None;
+        }
         let prewhere = if btree_index.is_some() {
             // The BTREE source scans row payloads from the covered SST and applies the
             // complete pushed filter there, so the normal block-read prewhere path is
@@ -1022,39 +1031,27 @@ impl PhysicalPlanBuilder {
             }
 
             let order_by = scan.order_by.as_ref().unwrap();
-            if prefix_len + order_by.len() > key_columns.len() {
-                continue;
-            }
-            let mut order_matches = true;
-            for (offset, order_item) in order_by.iter().enumerate() {
-                let key_column = &key_columns[prefix_len + offset];
-                let Ok(field) = table_meta.schema.field_of_column_id(key_column.column_id) else {
-                    order_matches = false;
-                    break;
-                };
-                let Some(symbol) =
-                    table_symbol_for_field(&metadata, scan.table_index, field.name())
-                else {
-                    order_matches = false;
-                    break;
-                };
-                if symbol != order_item.index
-                    || key_order_is_asc(&key_column.order) != order_item.asc
-                    || order_item.nulls_first
-                {
-                    order_matches = false;
-                    break;
-                }
-            }
-            if !order_matches {
-                continue;
-            }
+            let preserves_order = btree_index_matches_scan_order(
+                table_meta,
+                &metadata,
+                scan.table_index,
+                &key_columns,
+                prefix_len,
+                order_by,
+            );
             let extra_filter_key_columns = btree_extra_filter_key_column_count(
                 table_meta,
                 &key_columns,
-                prefix_len + order_by.len(),
+                if preserves_order {
+                    prefix_len + order_by.len()
+                } else {
+                    prefix_len
+                },
                 &filter_column_names,
             );
+            if !preserves_order && extra_filter_key_columns == 0 {
+                continue;
+            }
 
             if !scan
                 .columns
@@ -1100,13 +1097,14 @@ impl PhysicalPlanBuilder {
                 key_columns: btree_key_columns,
                 payload_fields,
                 equality_prefix: prefix_values,
-                limit: scan.limit,
+                limit: preserves_order.then_some(scan.limit).flatten(),
                 filters: filters.clone(),
                 use_block_btree_index_size_hint: btree_index_count == 1,
             };
             let score = BtreeIndexCandidateScore {
                 prefix_len,
                 extra_filter_key_columns,
+                preserves_order,
                 payload_width: btree_index_info.payload_fields.len(),
                 key_width: btree_index_info.key_columns.len(),
             };
@@ -1438,6 +1436,7 @@ fn btree_filters_are_covered(
 struct BtreeIndexCandidateScore {
     prefix_len: usize,
     extra_filter_key_columns: usize,
+    preserves_order: bool,
     payload_width: usize,
     key_width: usize,
 }
@@ -1479,6 +1478,37 @@ fn btree_extra_filter_key_column_count(
         .count()
 }
 
+fn btree_index_matches_scan_order(
+    table_meta: &databend_common_meta_app::schema::TableMeta,
+    metadata: &Metadata,
+    table_index: IndexType,
+    key_columns: &[TableIndexColumn],
+    prefix_len: usize,
+    order_by: &[SortItem],
+) -> bool {
+    if prefix_len + order_by.len() > key_columns.len() {
+        return false;
+    }
+
+    for (offset, order_item) in order_by.iter().enumerate() {
+        let key_column = &key_columns[prefix_len + offset];
+        let Ok(field) = table_meta.schema.field_of_column_id(key_column.column_id) else {
+            return false;
+        };
+        let Some(symbol) = table_symbol_for_field(metadata, table_index, field.name()) else {
+            return false;
+        };
+        if symbol != order_item.index
+            || key_order_is_asc(&key_column.order) != order_item.asc
+            || order_item.nulls_first
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
 fn btree_candidate_score_is_better(
     candidate: &BtreeIndexCandidateScore,
     candidate_name: &str,
@@ -1490,6 +1520,9 @@ fn btree_candidate_score_is_better(
     }
     if candidate.extra_filter_key_columns != best.extra_filter_key_columns {
         return candidate.extra_filter_key_columns > best.extra_filter_key_columns;
+    }
+    if candidate.preserves_order != best.preserves_order {
+        return candidate.preserves_order;
     }
     if candidate.payload_width != best.payload_width {
         return candidate.payload_width < best.payload_width;
@@ -1666,12 +1699,14 @@ mod tests {
         let shorter_payload = BtreeIndexCandidateScore {
             prefix_len: 2,
             extra_filter_key_columns: 0,
+            preserves_order: true,
             payload_width: 3,
             key_width: 3,
         };
         let longer_prefix = BtreeIndexCandidateScore {
             prefix_len: 3,
             extra_filter_key_columns: 0,
+            preserves_order: false,
             payload_width: 20,
             key_width: 4,
         };
@@ -1689,12 +1724,14 @@ mod tests {
         let no_extra_filter_keys = BtreeIndexCandidateScore {
             prefix_len: 2,
             extra_filter_key_columns: 0,
+            preserves_order: true,
             payload_width: 3,
             key_width: 3,
         };
         let with_extra_filter_keys = BtreeIndexCandidateScore {
             prefix_len: 2,
             extra_filter_key_columns: 2,
+            preserves_order: false,
             payload_width: 10,
             key_width: 5,
         };
@@ -1708,16 +1745,43 @@ mod tests {
     }
 
     #[test]
+    fn test_btree_candidate_score_prefers_order_preserving_on_tie() {
+        let filter_only = BtreeIndexCandidateScore {
+            prefix_len: 2,
+            extra_filter_key_columns: 1,
+            preserves_order: false,
+            payload_width: 3,
+            key_width: 4,
+        };
+        let ordered = BtreeIndexCandidateScore {
+            prefix_len: 2,
+            extra_filter_key_columns: 1,
+            preserves_order: true,
+            payload_width: 20,
+            key_width: 5,
+        };
+
+        assert!(btree_candidate_score_is_better(
+            &ordered,
+            "idx_ordered",
+            &filter_only,
+            "idx_filter_only"
+        ));
+    }
+
+    #[test]
     fn test_btree_candidate_score_prefers_narrower_payload_on_tie() {
         let wide_payload = BtreeIndexCandidateScore {
             prefix_len: 2,
             extra_filter_key_columns: 1,
+            preserves_order: true,
             payload_width: 20,
             key_width: 5,
         };
         let narrow_payload = BtreeIndexCandidateScore {
             prefix_len: 2,
             extra_filter_key_columns: 1,
+            preserves_order: true,
             payload_width: 8,
             key_width: 5,
         };
