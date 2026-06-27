@@ -34,39 +34,40 @@ use crate::filters::BloomFilter;
 use crate::filters::Filter;
 use crate::filters::FilterBuilder;
 
-const BTREE_INDEX_MAGIC: &[u8; 8] = b"DBBTREE1";
-pub const BTREE_INDEX_FILE_VERSION: u32 = 2;
-pub const DEFAULT_BTREE_INDEX_DATA_BLOCK_SIZE: usize = 64 * 1024;
-pub const DEFAULT_BTREE_INDEX_BLOOM_BITS_PER_KEY: u64 = 10;
-const BTREE_INDEX_BLOOM_SEED: u64 = 0;
+const ORDERED_INDEX_MAGIC: &[u8; 8] = b"DBORDIDX";
+const LEGACY_ORDERED_INDEX_MAGIC: &[u8; 8] = &[0x44, 0x42, 0x42, 0x54, 0x52, 0x45, 0x45, 0x31];
+pub const ORDERED_INDEX_FILE_VERSION: u32 = 2;
+pub const DEFAULT_ORDERED_INDEX_DATA_BLOCK_SIZE: usize = 64 * 1024;
+pub const DEFAULT_ORDERED_INDEX_BLOOM_BITS_PER_KEY: u64 = 10;
+const ORDERED_INDEX_BLOOM_SEED: u64 = 0;
 const FOOTER_LEN_SIZE: usize = 4;
-const MAGIC_SIZE: usize = BTREE_INDEX_MAGIC.len();
-const BTREE_ROW_PAYLOAD_MAGIC: &[u8; 4] = b"DBP1";
-const BTREE_ROW_PAYLOAD_HEADER_SIZE: usize = BTREE_ROW_PAYLOAD_MAGIC.len() + 4;
-pub const BTREE_INDEX_FOOTER_TAIL_SIZE: usize = FOOTER_LEN_SIZE + MAGIC_SIZE;
+const MAGIC_SIZE: usize = ORDERED_INDEX_MAGIC.len();
+const ORDERED_ROW_PAYLOAD_MAGIC: &[u8; 4] = b"DBP1";
+const ORDERED_ROW_PAYLOAD_HEADER_SIZE: usize = ORDERED_ROW_PAYLOAD_MAGIC.len() + 4;
+pub const ORDERED_INDEX_FOOTER_TAIL_SIZE: usize = FOOTER_LEN_SIZE + MAGIC_SIZE;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BtreeIndexMeta {
+pub struct OrderedIndexMeta {
     pub columns: Vec<(String, SingleColumnMeta)>,
     pub metadata: BTreeMap<String, String>,
 }
 
-pub type BtreeIndexFile = IndexFile;
+pub type OrderedIndexFile = IndexFile;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BtreeIndexRow {
+pub struct OrderedIndexRow {
     pub encoded_key: Vec<u8>,
     pub encoded_row_payload: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum BtreeIndexKeyOrder {
+pub enum OrderedIndexKeyOrder {
     Asc,
     Desc,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum BtreeIndexSectionKind {
+pub enum OrderedIndexSectionKind {
     Data = 0,
     Filter = 1,
     Index = 2,
@@ -74,26 +75,26 @@ pub enum BtreeIndexSectionKind {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BtreeIndexSection {
-    pub kind: BtreeIndexSectionKind,
+pub struct OrderedIndexSection {
+    pub kind: OrderedIndexSectionKind,
     pub offset: u64,
     pub length: u64,
     pub checksum: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BtreeIndexFooter {
+pub struct OrderedIndexFooter {
     pub version: u32,
     pub schema: String,
     pub key_order: String,
     pub compression: String,
-    pub meta: BtreeIndexMeta,
+    pub meta: OrderedIndexMeta,
     pub checksum: u32,
-    pub sections: Vec<BtreeIndexSection>,
+    pub sections: Vec<OrderedIndexSection>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BtreeIndexDataBlockMeta {
+pub struct OrderedIndexDataBlockMeta {
     pub first_key: Vec<u8>,
     pub last_key: Vec<u8>,
     pub offset: u64,
@@ -104,46 +105,46 @@ pub struct BtreeIndexDataBlockMeta {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BtreeIndexFilterBlock {
+pub struct OrderedIndexFilterBlock {
     pub equality_prefix_bloom: Vec<u8>,
     pub equality_prefix_count: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BtreeIndexIndexBlock {
-    pub data_blocks: Vec<BtreeIndexDataBlockMeta>,
+pub struct OrderedIndexIndexBlock {
+    pub data_blocks: Vec<OrderedIndexDataBlockMeta>,
 }
 
 #[derive(Clone, Debug)]
-pub struct BtreeIndexFileView {
+pub struct OrderedIndexFileView {
     data: Bytes,
-    footer: BtreeIndexFooter,
-    index_block: BtreeIndexIndexBlock,
-    filter_block: BtreeIndexFilterBlock,
+    footer: OrderedIndexFooter,
+    index_block: OrderedIndexIndexBlock,
+    filter_block: OrderedIndexFilterBlock,
     compression: CommonCompression,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BtreeIndexFileMeta {
-    pub footer: BtreeIndexFooter,
-    pub index_block: BtreeIndexIndexBlock,
-    pub filter_block: BtreeIndexFilterBlock,
+pub struct OrderedIndexFileMeta {
+    pub footer: OrderedIndexFooter,
+    pub index_block: OrderedIndexIndexBlock,
+    pub filter_block: OrderedIndexFilterBlock,
 }
 
-impl BtreeIndexFileMeta {
+impl OrderedIndexFileMeta {
     pub fn from_sections(
-        footer: BtreeIndexFooter,
+        footer: OrderedIndexFooter,
         index_block: Bytes,
         filter_block: Bytes,
     ) -> Result<Self> {
-        let index_section = btree_index_section(&footer, BtreeIndexSectionKind::Index)?;
-        validate_section_checksum(index_section, &index_block, "btree index block")?;
-        let filter_section = btree_index_section(&footer, BtreeIndexSectionKind::Filter)?;
-        validate_section_checksum(filter_section, &filter_block, "btree filter block")?;
-        let index_block: BtreeIndexIndexBlock =
-            decode_from_slice(&index_block, "btree index block")?;
-        let filter_block: BtreeIndexFilterBlock =
-            decode_from_slice(&filter_block, "btree filter block")?;
+        let index_section = ordered_index_section(&footer, OrderedIndexSectionKind::Index)?;
+        validate_section_checksum(index_section, &index_block, "ordered index block")?;
+        let filter_section = ordered_index_section(&footer, OrderedIndexSectionKind::Filter)?;
+        validate_section_checksum(filter_section, &filter_block, "ordered filter block")?;
+        let index_block: OrderedIndexIndexBlock =
+            decode_from_slice(&index_block, "ordered index block")?;
+        let filter_block: OrderedIndexFilterBlock =
+            decode_from_slice(&filter_block, "ordered filter block")?;
         Ok(Self {
             footer,
             index_block,
@@ -151,15 +152,15 @@ impl BtreeIndexFileMeta {
         })
     }
 
-    pub fn footer(&self) -> &BtreeIndexFooter {
+    pub fn footer(&self) -> &OrderedIndexFooter {
         &self.footer
     }
 
-    pub fn index_block(&self) -> &BtreeIndexIndexBlock {
+    pub fn index_block(&self) -> &OrderedIndexIndexBlock {
         &self.index_block
     }
 
-    pub fn filter_block(&self) -> &BtreeIndexFilterBlock {
+    pub fn filter_block(&self) -> &OrderedIndexFilterBlock {
         &self.filter_block
     }
 
@@ -171,7 +172,7 @@ impl BtreeIndexFileMeta {
         filter.contains(prefix)
     }
 
-    pub fn blocks_for_prefix(&self, prefix: &[u8]) -> Vec<BtreeIndexDataBlockMeta> {
+    pub fn blocks_for_prefix(&self, prefix: &[u8]) -> Vec<OrderedIndexDataBlockMeta> {
         let range = data_block_prefix_range(&self.index_block.data_blocks, prefix);
         self.index_block
             .data_blocks
@@ -189,27 +190,27 @@ impl BtreeIndexFileMeta {
 
     pub fn decode_data_block(
         &self,
-        meta: &BtreeIndexDataBlockMeta,
+        meta: &OrderedIndexDataBlockMeta,
         bytes: &[u8],
-    ) -> Result<Vec<BtreeIndexRow>> {
+    ) -> Result<Vec<OrderedIndexRow>> {
         let compression = self.compression()?;
-        decode_btree_data_block(meta, bytes, compression).map(|block| block.rows)
+        decode_ordered_data_block(meta, bytes, compression).map(|block| block.rows)
     }
 }
 
-impl BtreeIndexFileView {
+impl OrderedIndexFileView {
     pub fn open(data: Bytes) -> Result<Self> {
         let footer = decode_footer(&data)?;
         validate_checksum(&data, &footer)?;
         let compression = parse_compression(&footer.compression)?;
 
-        let index_section = btree_index_section(&footer, BtreeIndexSectionKind::Index)?;
-        let index_block: BtreeIndexIndexBlock =
-            decode_section(&data, index_section, "btree index block")?;
+        let index_section = ordered_index_section(&footer, OrderedIndexSectionKind::Index)?;
+        let index_block: OrderedIndexIndexBlock =
+            decode_section(&data, index_section, "ordered index block")?;
 
-        let filter_section = btree_index_section(&footer, BtreeIndexSectionKind::Filter)?;
-        let filter_block: BtreeIndexFilterBlock =
-            decode_section(&data, filter_section, "btree filter block")?;
+        let filter_section = ordered_index_section(&footer, OrderedIndexSectionKind::Filter)?;
+        let filter_block: OrderedIndexFilterBlock =
+            decode_section(&data, filter_section, "ordered filter block")?;
 
         Ok(Self {
             data,
@@ -220,15 +221,15 @@ impl BtreeIndexFileView {
         })
     }
 
-    pub fn footer(&self) -> &BtreeIndexFooter {
+    pub fn footer(&self) -> &OrderedIndexFooter {
         &self.footer
     }
 
-    pub fn index_block(&self) -> &BtreeIndexIndexBlock {
+    pub fn index_block(&self) -> &OrderedIndexIndexBlock {
         &self.index_block
     }
 
-    pub fn filter_block(&self) -> &BtreeIndexFilterBlock {
+    pub fn filter_block(&self) -> &OrderedIndexFilterBlock {
         &self.filter_block
     }
 
@@ -240,13 +241,17 @@ impl BtreeIndexFileView {
         filter.contains(prefix)
     }
 
-    pub fn lookup_exact(&self, key: &[u8]) -> Result<Vec<BtreeIndexRow>> {
+    pub fn lookup_exact(&self, key: &[u8]) -> Result<Vec<OrderedIndexRow>> {
         let mut rows = self.lookup_range(key..key)?;
         rows.retain(|row| row.encoded_key.as_slice() == key);
         Ok(rows)
     }
 
-    pub fn lookup_prefix(&self, prefix: &[u8], limit: Option<usize>) -> Result<Vec<BtreeIndexRow>> {
+    pub fn lookup_prefix(
+        &self,
+        prefix: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<OrderedIndexRow>> {
         let mut result = Vec::new();
         for block_meta in self.blocks_for_prefix(prefix) {
             let block = self.read_data_block(block_meta)?;
@@ -262,7 +267,7 @@ impl BtreeIndexFileView {
         Ok(result)
     }
 
-    pub fn lookup_range(&self, range: Range<&[u8]>) -> Result<Vec<BtreeIndexRow>> {
+    pub fn lookup_range(&self, range: Range<&[u8]>) -> Result<Vec<OrderedIndexRow>> {
         let mut result = Vec::new();
         for block_meta in self.blocks_for_range(range.clone()) {
             let block = self.read_data_block(block_meta)?;
@@ -276,7 +281,7 @@ impl BtreeIndexFileView {
         Ok(result)
     }
 
-    fn blocks_for_prefix(&self, prefix: &[u8]) -> impl Iterator<Item = &BtreeIndexDataBlockMeta> {
+    fn blocks_for_prefix(&self, prefix: &[u8]) -> impl Iterator<Item = &OrderedIndexDataBlockMeta> {
         let range = data_block_prefix_range(&self.index_block.data_blocks, prefix);
         self.index_block.data_blocks[range]
             .iter()
@@ -286,7 +291,7 @@ impl BtreeIndexFileView {
     fn blocks_for_range(
         &self,
         range: Range<&[u8]>,
-    ) -> impl Iterator<Item = &BtreeIndexDataBlockMeta> {
+    ) -> impl Iterator<Item = &OrderedIndexDataBlockMeta> {
         self.index_block.data_blocks.iter().filter(move |block| {
             let first = block.first_key.as_slice();
             let last = block.last_key.as_slice();
@@ -294,39 +299,39 @@ impl BtreeIndexFileView {
         })
     }
 
-    fn read_data_block(&self, meta: &BtreeIndexDataBlockMeta) -> Result<BtreeIndexDataBlock> {
+    fn read_data_block(&self, meta: &OrderedIndexDataBlockMeta) -> Result<OrderedIndexDataBlock> {
         let start = meta.offset as usize;
         let end = start + meta.length as usize;
         if end > self.data.len() {
             return Err(ErrorCode::StorageOther(format!(
-                "invalid btree index data block range {}..{}, file length {}",
+                "invalid ordered index data block range {}..{}, file length {}",
                 start,
                 end,
                 self.data.len()
             )));
         }
-        decode_btree_data_block(meta, &self.data[start..end], self.compression)
+        decode_ordered_data_block(meta, &self.data[start..end], self.compression)
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct BtreeIndexDataBlock {
-    rows: Vec<BtreeIndexRow>,
+struct OrderedIndexDataBlock {
+    rows: Vec<OrderedIndexRow>,
 }
 
-pub struct BtreeIndexWriter {
-    meta: BtreeIndexMeta,
+pub struct OrderedIndexWriter {
+    meta: OrderedIndexMeta,
     schema: String,
     key_order: String,
     compression: String,
     data_block_size: usize,
-    rows: Vec<BtreeIndexRow>,
+    rows: Vec<OrderedIndexRow>,
     equality_prefixes: Vec<Bytes>,
 }
 
-impl BtreeIndexWriter {
+impl OrderedIndexWriter {
     pub fn new(
-        meta: BtreeIndexMeta,
+        meta: OrderedIndexMeta,
         schema: impl Into<String>,
         key_order: impl Into<String>,
         compression: impl Into<String>,
@@ -336,7 +341,7 @@ impl BtreeIndexWriter {
             schema: schema.into(),
             key_order: key_order.into(),
             compression: compression.into(),
-            data_block_size: DEFAULT_BTREE_INDEX_DATA_BLOCK_SIZE,
+            data_block_size: DEFAULT_ORDERED_INDEX_DATA_BLOCK_SIZE,
             rows: Vec::new(),
             equality_prefixes: Vec::new(),
         }
@@ -348,7 +353,7 @@ impl BtreeIndexWriter {
     }
 
     pub fn add_row(&mut self, encoded_key: Bytes, encoded_row_payload: Bytes) {
-        self.rows.push(BtreeIndexRow {
+        self.rows.push(OrderedIndexRow {
             encoded_key: encoded_key.to_vec(),
             encoded_row_payload: encoded_row_payload.to_vec(),
         });
@@ -398,75 +403,75 @@ impl BtreeIndexWriter {
         let filter_section_offset = data.len() as u64;
         let mut bloom_builder = BloomBuilder::create(
             std::cmp::max(
-                self.equality_prefixes.len() as u64 * DEFAULT_BTREE_INDEX_BLOOM_BITS_PER_KEY,
+                self.equality_prefixes.len() as u64 * DEFAULT_ORDERED_INDEX_BLOOM_BITS_PER_KEY,
                 1,
             ),
-            BTREE_INDEX_BLOOM_SEED,
+            ORDERED_INDEX_BLOOM_SEED,
         );
         for prefix in &self.equality_prefixes {
             bloom_builder.add_key(prefix);
         }
         let equality_prefix_bloom = bloom_builder.build()?.to_bytes()?;
-        let filter_block = BtreeIndexFilterBlock {
+        let filter_block = OrderedIndexFilterBlock {
             equality_prefix_bloom,
             equality_prefix_count: self.equality_prefixes.len() as u64,
         };
         let data_section_checksum = crc32fast::hash(&data[data_section_offset as usize..]);
-        let filter_bytes = encode_to_vec(&filter_block, "btree filter block")?;
+        let filter_bytes = encode_to_vec(&filter_block, "ordered filter block")?;
         let filter_section_checksum = crc32fast::hash(&filter_bytes);
         data.extend(filter_bytes);
         let filter_section_length = data.len() as u64 - filter_section_offset;
 
         let index_section_offset = data.len() as u64;
-        let index_block = BtreeIndexIndexBlock {
+        let index_block = OrderedIndexIndexBlock {
             data_blocks: data_block_metas,
         };
-        let index_bytes = encode_to_vec(&index_block, "btree index block")?;
+        let index_bytes = encode_to_vec(&index_block, "ordered index block")?;
         let index_section_checksum = crc32fast::hash(&index_bytes);
         data.extend(index_bytes);
         let index_section_length = data.len() as u64 - index_section_offset;
 
         let footer_section_offset = data.len() as u64;
         let checksum = crc32fast::hash(&data);
-        let footer = BtreeIndexFooter {
-            version: BTREE_INDEX_FILE_VERSION,
+        let footer = OrderedIndexFooter {
+            version: ORDERED_INDEX_FILE_VERSION,
             schema: self.schema,
             key_order: self.key_order,
             compression: self.compression,
             meta: self.meta,
             checksum,
             sections: vec![
-                BtreeIndexSection {
-                    kind: BtreeIndexSectionKind::Data,
+                OrderedIndexSection {
+                    kind: OrderedIndexSectionKind::Data,
                     offset: data_section_offset,
                     length: data_section_length,
                     checksum: data_section_checksum,
                 },
-                BtreeIndexSection {
-                    kind: BtreeIndexSectionKind::Filter,
+                OrderedIndexSection {
+                    kind: OrderedIndexSectionKind::Filter,
                     offset: filter_section_offset,
                     length: filter_section_length,
                     checksum: filter_section_checksum,
                 },
-                BtreeIndexSection {
-                    kind: BtreeIndexSectionKind::Index,
+                OrderedIndexSection {
+                    kind: OrderedIndexSectionKind::Index,
                     offset: index_section_offset,
                     length: index_section_length,
                     checksum: index_section_checksum,
                 },
-                BtreeIndexSection {
-                    kind: BtreeIndexSectionKind::Footer,
+                OrderedIndexSection {
+                    kind: OrderedIndexSectionKind::Footer,
                     offset: footer_section_offset,
                     length: 0,
                     checksum: 0,
                 },
             ],
         };
-        let mut footer_bytes = encode_to_vec(&footer, "btree footer")?;
+        let mut footer_bytes = encode_to_vec(&footer, "ordered footer")?;
         let footer_len = footer_bytes.len() as u32;
         data.append(&mut footer_bytes);
         data.extend(footer_len.to_le_bytes());
-        data.extend(BTREE_INDEX_MAGIC);
+        data.extend(ORDERED_INDEX_MAGIC);
 
         Ok(data.into())
     }
@@ -474,8 +479,8 @@ impl BtreeIndexWriter {
 
 fn push_data_block(
     data: &mut Vec<u8>,
-    data_block_metas: &mut Vec<BtreeIndexDataBlockMeta>,
-    pending_rows: &mut Vec<BtreeIndexRow>,
+    data_block_metas: &mut Vec<OrderedIndexDataBlockMeta>,
+    pending_rows: &mut Vec<OrderedIndexRow>,
     compression: CommonCompression,
 ) -> Result<()> {
     debug_assert!(!pending_rows.is_empty());
@@ -485,18 +490,18 @@ fn push_data_block(
     let offset = data.len() as u64;
     let rows = std::mem::take(pending_rows);
     let row_count = rows.len() as u32;
-    let block = BtreeIndexDataBlock { rows };
-    let block_bytes = encode_to_vec(&block, "btree data block")?;
+    let block = OrderedIndexDataBlock { rows };
+    let block_bytes = encode_to_vec(&block, "ordered data block")?;
     let uncompressed_length = block_bytes.len() as u64;
     let mut compressed_bytes = Vec::new();
     let compressed_length = compression
         .compress(&block_bytes, &mut compressed_bytes)
         .map_err(|e| {
-            ErrorCode::StorageOther(format!("failed to compress btree data block: {e}"))
+            ErrorCode::StorageOther(format!("failed to compress ordered data block: {e}"))
         })?;
     let checksum = crc32fast::hash(&compressed_bytes);
     data.extend(compressed_bytes);
-    data_block_metas.push(BtreeIndexDataBlockMeta {
+    data_block_metas.push(OrderedIndexDataBlockMeta {
         first_key,
         last_key,
         offset,
@@ -513,13 +518,13 @@ fn parse_compression(compression: &str) -> Result<CommonCompression> {
     Ok(CommonCompression::from(table_compression))
 }
 
-fn block_matches_prefix(block: &BtreeIndexDataBlockMeta, prefix: &[u8]) -> bool {
+fn block_matches_prefix(block: &OrderedIndexDataBlockMeta, prefix: &[u8]) -> bool {
     let first = block.first_key.as_slice();
     let last = block.last_key.as_slice();
     first.starts_with(prefix) || last.starts_with(prefix) || (first < prefix && prefix <= last)
 }
 
-fn data_block_prefix_range(blocks: &[BtreeIndexDataBlockMeta], prefix: &[u8]) -> Range<usize> {
+fn data_block_prefix_range(blocks: &[OrderedIndexDataBlockMeta], prefix: &[u8]) -> Range<usize> {
     let start = blocks.partition_point(|block| block.last_key.as_slice() < prefix);
     let end = match prefix_upper_bound(prefix) {
         Some(upper_bound) => {
@@ -544,32 +549,32 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-pub fn btree_index_section(
-    footer: &BtreeIndexFooter,
-    kind: BtreeIndexSectionKind,
-) -> Result<&BtreeIndexSection> {
+pub fn ordered_index_section(
+    footer: &OrderedIndexFooter,
+    kind: OrderedIndexSectionKind,
+) -> Result<&OrderedIndexSection> {
     footer
         .sections
         .iter()
         .find(|s| s.kind == kind)
         .ok_or_else(|| {
-            ErrorCode::StorageOther(format!("btree index footer missing section {:?}", kind))
+            ErrorCode::StorageOther(format!("ordered index footer missing section {:?}", kind))
         })
 }
 
-fn decode_footer(data: &[u8]) -> Result<BtreeIndexFooter> {
+fn decode_footer(data: &[u8]) -> Result<OrderedIndexFooter> {
     let min_len = MAGIC_SIZE + FOOTER_LEN_SIZE;
     if data.len() < min_len {
         return Err(ErrorCode::StorageOther(format!(
-            "invalid btree index file length {}, too small",
+            "invalid ordered index file length {}, too small",
             data.len()
         )));
     }
 
     let magic_start = data.len() - MAGIC_SIZE;
-    if &data[magic_start..] != BTREE_INDEX_MAGIC {
+    if !is_ordered_index_magic(&data[magic_start..]) {
         return Err(ErrorCode::StorageOther(
-            "invalid btree index magic".to_string(),
+            "invalid ordered index magic".to_string(),
         ));
     }
 
@@ -578,75 +583,79 @@ fn decode_footer(data: &[u8]) -> Result<BtreeIndexFooter> {
         u32::from_le_bytes(data[footer_len_start..magic_start].try_into().unwrap()) as usize;
     if footer_len > footer_len_start {
         return Err(ErrorCode::StorageOther(format!(
-            "invalid btree index footer length {}, file length {}",
+            "invalid ordered index footer length {}, file length {}",
             footer_len,
             data.len()
         )));
     }
 
     let footer_start = footer_len_start - footer_len;
-    let footer: BtreeIndexFooter =
-        decode_from_slice(&data[footer_start..footer_len_start], "btree footer")?;
-    if footer.version != BTREE_INDEX_FILE_VERSION {
+    let footer: OrderedIndexFooter =
+        decode_from_slice(&data[footer_start..footer_len_start], "ordered footer")?;
+    if footer.version != ORDERED_INDEX_FILE_VERSION {
         return Err(ErrorCode::StorageOther(format!(
-            "unsupported btree index file version {}",
+            "unsupported ordered index file version {}",
             footer.version
         )));
     }
     Ok(footer)
 }
 
-pub fn btree_footer_range(file_len: u64, tail: &[u8]) -> Result<Range<u64>> {
-    let min_len = BTREE_INDEX_FOOTER_TAIL_SIZE;
+pub fn ordered_footer_range(file_len: u64, tail: &[u8]) -> Result<Range<u64>> {
+    let min_len = ORDERED_INDEX_FOOTER_TAIL_SIZE;
     if tail.len() != min_len {
         return Err(ErrorCode::StorageOther(format!(
-            "invalid btree footer tail length {}, expected {}",
+            "invalid ordered footer tail length {}, expected {}",
             tail.len(),
             min_len
         )));
     }
     let magic_start = tail.len() - MAGIC_SIZE;
-    if &tail[magic_start..] != BTREE_INDEX_MAGIC {
+    if !is_ordered_index_magic(&tail[magic_start..]) {
         return Err(ErrorCode::StorageOther(
-            "invalid btree index magic".to_string(),
+            "invalid ordered index magic".to_string(),
         ));
     }
     let footer_len_start = magic_start - FOOTER_LEN_SIZE;
     let footer_len =
         u32::from_le_bytes(tail[footer_len_start..magic_start].try_into().unwrap()) as u64;
     let footer_len_start_in_file = file_len
-        .checked_sub(BTREE_INDEX_FOOTER_TAIL_SIZE as u64)
+        .checked_sub(ORDERED_INDEX_FOOTER_TAIL_SIZE as u64)
         .ok_or_else(|| {
-            ErrorCode::StorageOther(format!("invalid btree index file length {}", file_len))
+            ErrorCode::StorageOther(format!("invalid ordered index file length {}", file_len))
         })?;
     let footer_start = footer_len_start_in_file
         .checked_sub(footer_len)
         .ok_or_else(|| {
             ErrorCode::StorageOther(format!(
-                "invalid btree index footer length {}, file length {}",
+                "invalid ordered index footer length {}, file length {}",
                 footer_len, file_len
             ))
         })?;
     Ok(footer_start..footer_len_start_in_file)
 }
 
-pub fn decode_btree_footer_bytes(footer_bytes: &[u8]) -> Result<BtreeIndexFooter> {
-    let footer: BtreeIndexFooter = decode_from_slice(footer_bytes, "btree footer")?;
-    if footer.version != BTREE_INDEX_FILE_VERSION {
+pub fn decode_ordered_footer_bytes(footer_bytes: &[u8]) -> Result<OrderedIndexFooter> {
+    let footer: OrderedIndexFooter = decode_from_slice(footer_bytes, "ordered footer")?;
+    if footer.version != ORDERED_INDEX_FILE_VERSION {
         return Err(ErrorCode::StorageOther(format!(
-            "unsupported btree index file version {}",
+            "unsupported ordered index file version {}",
             footer.version
         )));
     }
     Ok(footer)
 }
 
-fn validate_checksum(data: &[u8], footer: &BtreeIndexFooter) -> Result<()> {
-    let footer_section = btree_index_section(footer, BtreeIndexSectionKind::Footer)?;
+fn is_ordered_index_magic(magic: &[u8]) -> bool {
+    magic == ORDERED_INDEX_MAGIC || magic == LEGACY_ORDERED_INDEX_MAGIC
+}
+
+fn validate_checksum(data: &[u8], footer: &OrderedIndexFooter) -> Result<()> {
+    let footer_section = ordered_index_section(footer, OrderedIndexSectionKind::Footer)?;
     let checksum_range_end = footer_section.offset as usize;
     if checksum_range_end > data.len() {
         return Err(ErrorCode::StorageOther(format!(
-            "invalid btree index footer offset {}, file length {}",
+            "invalid ordered index footer offset {}, file length {}",
             checksum_range_end,
             data.len()
         )));
@@ -656,14 +665,14 @@ fn validate_checksum(data: &[u8], footer: &BtreeIndexFooter) -> Result<()> {
     let checksum = hasher.finalize();
     if checksum != footer.checksum {
         return Err(ErrorCode::StorageOther(format!(
-            "btree index checksum mismatch, expected {}, got {}",
+            "ordered index checksum mismatch, expected {}, got {}",
             footer.checksum, checksum
         )));
     }
     Ok(())
 }
 
-fn decode_section<T>(data: &[u8], section: &BtreeIndexSection, label: &str) -> Result<T>
+fn decode_section<T>(data: &[u8], section: &OrderedIndexSection, label: &str) -> Result<T>
 where T: for<'de> Deserialize<'de> {
     let start = section.offset as usize;
     let end = start + section.length as usize;
@@ -681,7 +690,11 @@ where T: for<'de> Deserialize<'de> {
     decode_from_slice(bytes, label)
 }
 
-fn validate_section_checksum(section: &BtreeIndexSection, bytes: &[u8], label: &str) -> Result<()> {
+fn validate_section_checksum(
+    section: &OrderedIndexSection,
+    bytes: &[u8],
+    label: &str,
+) -> Result<()> {
     if section.checksum == 0 {
         return Ok(());
     }
@@ -695,15 +708,15 @@ fn validate_section_checksum(section: &BtreeIndexSection, bytes: &[u8], label: &
     Ok(())
 }
 
-fn decode_btree_data_block(
-    meta: &BtreeIndexDataBlockMeta,
+fn decode_ordered_data_block(
+    meta: &OrderedIndexDataBlockMeta,
     bytes: &[u8],
     compression: CommonCompression,
-) -> Result<BtreeIndexDataBlock> {
+) -> Result<OrderedIndexDataBlock> {
     let checksum = crc32fast::hash(bytes);
     if checksum != meta.checksum {
         return Err(ErrorCode::StorageOther(format!(
-            "btree index data block checksum mismatch, expected {}, got {}",
+            "ordered index data block checksum mismatch, expected {}, got {}",
             meta.checksum, checksum
         )));
     }
@@ -711,9 +724,9 @@ fn decode_btree_data_block(
     compression
         .decompress(bytes, &mut decompressed)
         .map_err(|e| {
-            ErrorCode::StorageOther(format!("failed to decompress btree data block: {e}"))
+            ErrorCode::StorageOther(format!("failed to decompress ordered data block: {e}"))
         })?;
-    decode_from_slice(&decompressed, "btree data block")
+    decode_from_slice(&decompressed, "ordered data block")
 }
 
 fn encode_to_vec<T: Serialize + ?Sized>(value: &T, label: &str) -> Result<Vec<u8>> {
@@ -731,72 +744,71 @@ where T: for<'de> Deserialize<'de> {
         .map_err(|e| ErrorCode::StorageOther(format!("failed to decode {label}: {e:?}")))
 }
 
-impl TryFrom<&BtreeIndexMeta> for Vec<u8> {
+impl TryFrom<&OrderedIndexMeta> for Vec<u8> {
     type Error = ErrorCode;
 
-    fn try_from(value: &BtreeIndexMeta) -> std::result::Result<Self, Self::Error> {
-        encode_to_vec(value, "btree index meta")
+    fn try_from(value: &OrderedIndexMeta) -> std::result::Result<Self, Self::Error> {
+        encode_to_vec(value, "ordered index meta")
     }
 }
 
-impl TryFrom<Bytes> for BtreeIndexMeta {
-    type Error = ErrorCode;
-
-    fn try_from(value: Bytes) -> std::result::Result<Self, Self::Error> {
-        decode_from_slice(value.as_ref(), "btree index meta")
-    }
-}
-
-impl TryFrom<&BtreeIndexFileMeta> for Vec<u8> {
-    type Error = ErrorCode;
-
-    fn try_from(value: &BtreeIndexFileMeta) -> std::result::Result<Self, Self::Error> {
-        encode_to_vec(value, "btree index file meta")
-    }
-}
-
-impl TryFrom<Bytes> for BtreeIndexFileMeta {
+impl TryFrom<Bytes> for OrderedIndexMeta {
     type Error = ErrorCode;
 
     fn try_from(value: Bytes) -> std::result::Result<Self, Self::Error> {
-        decode_from_slice(value.as_ref(), "btree index file meta")
+        decode_from_slice(value.as_ref(), "ordered index meta")
     }
 }
 
-pub fn encode_btree_payload(payload: &[Scalar]) -> Result<Vec<u8>> {
+impl TryFrom<&OrderedIndexFileMeta> for Vec<u8> {
+    type Error = ErrorCode;
+
+    fn try_from(value: &OrderedIndexFileMeta) -> std::result::Result<Self, Self::Error> {
+        encode_to_vec(value, "ordered index file meta")
+    }
+}
+
+impl TryFrom<Bytes> for OrderedIndexFileMeta {
+    type Error = ErrorCode;
+
+    fn try_from(value: Bytes) -> std::result::Result<Self, Self::Error> {
+        decode_from_slice(value.as_ref(), "ordered index file meta")
+    }
+}
+
+pub fn encode_ordered_payload(payload: &[Scalar]) -> Result<Vec<u8>> {
     let column_count = u32::try_from(payload.len()).map_err(|_| {
         ErrorCode::StorageOther(format!(
-            "btree row payload has too many columns: {}",
+            "ordered row payload has too many columns: {}",
             payload.len()
         ))
     })?;
     let mut encoded_columns = Vec::with_capacity(payload.len());
     let mut payload_size = 0usize;
     for scalar in payload {
-        let encoded = encode_to_vec(scalar, "btree row payload column")?;
-        payload_size = payload_size
-            .checked_add(encoded.len())
-            .ok_or_else(|| ErrorCode::StorageOther("btree row payload is too large".to_string()))?;
+        let encoded = encode_to_vec(scalar, "ordered row payload column")?;
+        payload_size = payload_size.checked_add(encoded.len()).ok_or_else(|| {
+            ErrorCode::StorageOther("ordered row payload is too large".to_string())
+        })?;
         encoded_columns.push(encoded);
     }
 
-    let header_size =
-        BTREE_ROW_PAYLOAD_HEADER_SIZE
-            .checked_add(payload.len().checked_mul(4).ok_or_else(|| {
-                ErrorCode::StorageOther("btree row payload is too large".to_string())
-            })?)
-            .ok_or_else(|| ErrorCode::StorageOther("btree row payload is too large".to_string()))?;
+    let header_size = ORDERED_ROW_PAYLOAD_HEADER_SIZE
+        .checked_add(payload.len().checked_mul(4).ok_or_else(|| {
+            ErrorCode::StorageOther("ordered row payload is too large".to_string())
+        })?)
+        .ok_or_else(|| ErrorCode::StorageOther("ordered row payload is too large".to_string()))?;
     let mut encoded_payload = Vec::with_capacity(header_size + payload_size);
-    encoded_payload.extend_from_slice(BTREE_ROW_PAYLOAD_MAGIC);
+    encoded_payload.extend_from_slice(ORDERED_ROW_PAYLOAD_MAGIC);
     encoded_payload.extend_from_slice(&column_count.to_le_bytes());
 
     let mut offset = 0usize;
     for column in &encoded_columns {
-        offset = offset
-            .checked_add(column.len())
-            .ok_or_else(|| ErrorCode::StorageOther("btree row payload is too large".to_string()))?;
+        offset = offset.checked_add(column.len()).ok_or_else(|| {
+            ErrorCode::StorageOther("ordered row payload is too large".to_string())
+        })?;
         let offset = u32::try_from(offset)
-            .map_err(|_| ErrorCode::StorageOther("btree row payload is too large".to_string()))?;
+            .map_err(|_| ErrorCode::StorageOther("ordered row payload is too large".to_string()))?;
         encoded_payload.extend_from_slice(&offset.to_le_bytes());
     }
     for column in encoded_columns {
@@ -805,29 +817,29 @@ pub fn encode_btree_payload(payload: &[Scalar]) -> Result<Vec<u8>> {
     Ok(encoded_payload)
 }
 
-pub fn decode_btree_payload(payload: &[u8]) -> Result<Vec<Scalar>> {
+pub fn decode_ordered_payload(payload: &[u8]) -> Result<Vec<Scalar>> {
     if !is_offset_encoded_payload(payload) {
-        return decode_from_slice(payload, "btree row payload");
+        return decode_from_slice(payload, "ordered row payload");
     }
 
-    let view = BtreePayloadView::parse(payload)?;
+    let view = OrderedPayloadView::parse(payload)?;
     (0..view.column_count())
         .map(|index| view.decode_column(index))
         .collect()
 }
 
-pub fn decode_btree_payload_projection(
+pub fn decode_ordered_payload_projection(
     payload: &[u8],
     column_indexes: &[usize],
 ) -> Result<Vec<Scalar>> {
     if !is_offset_encoded_payload(payload) {
-        let row = decode_from_slice::<Vec<Scalar>>(payload, "btree row payload")?;
+        let row = decode_from_slice::<Vec<Scalar>>(payload, "ordered row payload")?;
         return column_indexes
             .iter()
             .map(|index| {
                 row.get(*index).cloned().ok_or_else(|| {
                     ErrorCode::StorageOther(format!(
-                        "btree row payload missing column {}, width {}",
+                        "ordered row payload missing column {}, width {}",
                         index,
                         row.len()
                     ))
@@ -836,7 +848,7 @@ pub fn decode_btree_payload_projection(
             .collect();
     }
 
-    let view = BtreePayloadView::parse(payload)?;
+    let view = OrderedPayloadView::parse(payload)?;
     column_indexes
         .iter()
         .map(|index| view.decode_column(*index))
@@ -844,57 +856,57 @@ pub fn decode_btree_payload_projection(
 }
 
 fn is_offset_encoded_payload(payload: &[u8]) -> bool {
-    payload.starts_with(BTREE_ROW_PAYLOAD_MAGIC)
+    payload.starts_with(ORDERED_ROW_PAYLOAD_MAGIC)
 }
 
-struct BtreePayloadView<'a> {
+struct OrderedPayloadView<'a> {
     offsets: &'a [u8],
     data: &'a [u8],
     column_count: usize,
 }
 
-impl<'a> BtreePayloadView<'a> {
+impl<'a> OrderedPayloadView<'a> {
     fn parse(payload: &'a [u8]) -> Result<Self> {
-        if payload.len() < BTREE_ROW_PAYLOAD_HEADER_SIZE {
+        if payload.len() < ORDERED_ROW_PAYLOAD_HEADER_SIZE {
             return Err(ErrorCode::StorageOther(format!(
-                "invalid btree row payload length {}, too small",
+                "invalid ordered row payload length {}, too small",
                 payload.len()
             )));
         }
         if !is_offset_encoded_payload(payload) {
             return Err(ErrorCode::StorageOther(
-                "invalid btree row payload magic".to_string(),
+                "invalid ordered row payload magic".to_string(),
             ));
         }
         let column_count = u32::from_le_bytes(
-            payload[BTREE_ROW_PAYLOAD_MAGIC.len()..BTREE_ROW_PAYLOAD_HEADER_SIZE]
+            payload[ORDERED_ROW_PAYLOAD_MAGIC.len()..ORDERED_ROW_PAYLOAD_HEADER_SIZE]
                 .try_into()
                 .unwrap(),
         ) as usize;
         let offsets_len = column_count.checked_mul(4).ok_or_else(|| {
-            ErrorCode::StorageOther("invalid btree row payload column count".to_string())
+            ErrorCode::StorageOther("invalid ordered row payload column count".to_string())
         })?;
-        let data_start = BTREE_ROW_PAYLOAD_HEADER_SIZE
+        let data_start = ORDERED_ROW_PAYLOAD_HEADER_SIZE
             .checked_add(offsets_len)
             .ok_or_else(|| {
-                ErrorCode::StorageOther("invalid btree row payload header".to_string())
+                ErrorCode::StorageOther("invalid ordered row payload header".to_string())
             })?;
         if payload.len() < data_start {
             return Err(ErrorCode::StorageOther(format!(
-                "invalid btree row payload header length {}, payload length {}",
+                "invalid ordered row payload header length {}, payload length {}",
                 data_start,
                 payload.len()
             )));
         }
 
-        let offsets = &payload[BTREE_ROW_PAYLOAD_HEADER_SIZE..data_start];
+        let offsets = &payload[ORDERED_ROW_PAYLOAD_HEADER_SIZE..data_start];
         let data = &payload[data_start..];
         let mut previous = 0usize;
         for index in 0..column_count {
             let offset = read_payload_offset(offsets, index)?;
             if offset < previous || offset > data.len() {
                 return Err(ErrorCode::StorageOther(format!(
-                    "invalid btree row payload offset {} at column {}, previous {}, data length {}",
+                    "invalid ordered row payload offset {} at column {}, previous {}, data length {}",
                     offset,
                     index,
                     previous,
@@ -918,7 +930,7 @@ impl<'a> BtreePayloadView<'a> {
     fn decode_column(&self, index: usize) -> Result<Scalar> {
         if index >= self.column_count {
             return Err(ErrorCode::StorageOther(format!(
-                "btree row payload missing column {}, width {}",
+                "ordered row payload missing column {}, width {}",
                 index, self.column_count
             )));
         }
@@ -928,37 +940,37 @@ impl<'a> BtreePayloadView<'a> {
             read_payload_offset(self.offsets, index - 1)?
         };
         let end = read_payload_offset(self.offsets, index)?;
-        decode_from_slice(&self.data[start..end], "btree row payload column")
+        decode_from_slice(&self.data[start..end], "ordered row payload column")
     }
 }
 
 fn read_payload_offset(offsets: &[u8], index: usize) -> Result<usize> {
     let start = index.checked_mul(4).ok_or_else(|| {
-        ErrorCode::StorageOther("invalid btree row payload offset index".to_string())
+        ErrorCode::StorageOther("invalid ordered row payload offset index".to_string())
     })?;
     let end = start + 4;
     let Some(bytes) = offsets.get(start..end) else {
         return Err(ErrorCode::StorageOther(format!(
-            "invalid btree row payload offset index {}",
+            "invalid ordered row payload offset index {}",
             index
         )));
     };
     Ok(u32::from_le_bytes(bytes.try_into().unwrap()) as usize)
 }
 
-pub fn btree_equality_prefix(key: &[u8], component_count: usize) -> Result<Vec<u8>> {
+pub fn ordered_equality_prefix(key: &[u8], component_count: usize) -> Result<Vec<u8>> {
     let mut offset = 0;
     for _ in 0..component_count {
         let Some(len_bytes) = key.get(offset..offset + 4) else {
             return Err(ErrorCode::StorageOther(
-                "invalid btree key encoding, missing component length".to_string(),
+                "invalid ordered key encoding, missing component length".to_string(),
             ));
         };
         let len = u32::from_be_bytes(len_bytes.try_into().unwrap()) as usize;
         offset += 4 + len;
         if key.get(offset) != Some(&0xff) {
             return Err(ErrorCode::StorageOther(
-                "invalid btree key encoding, missing component separator".to_string(),
+                "invalid ordered key encoding, missing component separator".to_string(),
             ));
         }
         offset += 1;
@@ -966,10 +978,10 @@ pub fn btree_equality_prefix(key: &[u8], component_count: usize) -> Result<Vec<u
     Ok(key[..offset].to_vec())
 }
 
-pub fn encode_btree_key_component(
+pub fn encode_ordered_key_component(
     buf: &mut Vec<u8>,
     scalar: ScalarRef<'_>,
-    order: BtreeIndexKeyOrder,
+    order: OrderedIndexKeyOrder,
 ) -> Result<()> {
     let mut bytes = Vec::new();
     match scalar {
@@ -990,7 +1002,7 @@ pub fn encode_btree_key_component(
         | ScalarRef::Geometry(v) => encode_variable(&mut bytes, v),
         ScalarRef::Tuple(fields) => {
             for field in fields {
-                encode_btree_key_component(&mut bytes, field, BtreeIndexKeyOrder::Asc)?;
+                encode_ordered_key_component(&mut bytes, field, OrderedIndexKeyOrder::Asc)?;
             }
         }
         ScalarRef::Array(_)
@@ -998,11 +1010,11 @@ pub fn encode_btree_key_component(
         | ScalarRef::Geography(_)
         | ScalarRef::Vector(_)
         | ScalarRef::Opaque(_) => {
-            let payload = encode_btree_payload(&[scalar.to_owned()])?;
+            let payload = encode_ordered_payload(&[scalar.to_owned()])?;
             encode_variable(&mut bytes, &payload);
         }
     }
-    if matches!(order, BtreeIndexKeyOrder::Desc) {
+    if matches!(order, OrderedIndexKeyOrder::Desc) {
         for byte in &mut bytes {
             *byte = !*byte;
         }
@@ -1067,13 +1079,13 @@ mod tests {
     }
 
     #[test]
-    fn test_btree_index_sst_round_trip() -> Result<()> {
-        let meta = BtreeIndexMeta {
+    fn test_ordered_index_sst_round_trip() -> Result<()> {
+        let meta = OrderedIndexMeta {
             columns: vec![],
             metadata: BTreeMap::new(),
         };
-        let mut writer =
-            BtreeIndexWriter::new(meta, "schema", "a ASC,b DESC", "none").with_data_block_size(16);
+        let mut writer = OrderedIndexWriter::new(meta, "schema", "a ASC,b DESC", "none")
+            .with_data_block_size(16);
         writer.add_equality_prefix(Bytes::from_static(b"wallet-1"));
         let (key, value) = row("wallet-2|14|1", "payload-2");
         writer.add_row(key, value);
@@ -1081,9 +1093,9 @@ mod tests {
         writer.add_row(key, value);
 
         let data = writer.finish()?;
-        let view = BtreeIndexFileView::open(data)?;
+        let view = OrderedIndexFileView::open(data)?;
 
-        assert_eq!(view.footer().version, BTREE_INDEX_FILE_VERSION);
+        assert_eq!(view.footer().version, ORDERED_INDEX_FILE_VERSION);
         assert!(view.may_contain_equality_prefix(b"wallet-1"));
         assert!(!view.may_contain_equality_prefix(b"wallet-404"));
 
@@ -1094,12 +1106,12 @@ mod tests {
     }
 
     #[test]
-    fn test_btree_index_prefix_lookup_across_data_blocks() -> Result<()> {
-        let meta = BtreeIndexMeta {
+    fn test_ordered_index_prefix_lookup_across_data_blocks() -> Result<()> {
+        let meta = OrderedIndexMeta {
             columns: vec![],
             metadata: BTreeMap::new(),
         };
-        let mut writer = BtreeIndexWriter::new(meta, "schema", "wallet ASC,score DESC", "none")
+        let mut writer = OrderedIndexWriter::new(meta, "schema", "wallet ASC,score DESC", "none")
             .with_data_block_size(1);
         writer.add_equality_prefix(Bytes::from_static(b"wallet-1|"));
         for score in (0..10).rev() {
@@ -1110,7 +1122,7 @@ mod tests {
         }
 
         let data = writer.finish()?;
-        let view = BtreeIndexFileView::open(data)?;
+        let view = OrderedIndexFileView::open(data)?;
 
         assert!(view.index_block().data_blocks.len() > 1);
         assert!(view.may_contain_equality_prefix(b"wallet-1|"));
@@ -1122,20 +1134,20 @@ mod tests {
     }
 
     #[test]
-    fn test_btree_index_prefix_blocks_seek_to_matching_range() -> Result<()> {
-        let meta = BtreeIndexMeta {
+    fn test_ordered_index_prefix_blocks_seek_to_matching_range() -> Result<()> {
+        let meta = OrderedIndexMeta {
             columns: vec![],
             metadata: BTreeMap::new(),
         };
         let mut writer =
-            BtreeIndexWriter::new(meta, "schema", "wallet ASC", "none").with_data_block_size(1);
+            OrderedIndexWriter::new(meta, "schema", "wallet ASC", "none").with_data_block_size(1);
         for key in ["wallet-0|00", "wallet-1|00", "wallet-1|01", "wallet-2|00"] {
             let (key, value) = row(key, "payload");
             writer.add_row(key, value);
         }
 
         let data = writer.finish()?;
-        let view = BtreeIndexFileView::open(data)?;
+        let view = OrderedIndexFileView::open(data)?;
 
         let range = data_block_prefix_range(&view.index_block().data_blocks, b"wallet-1|");
         assert_eq!(range, 1..3);
@@ -1150,44 +1162,44 @@ mod tests {
     }
 
     #[test]
-    fn test_btree_index_footer_range_from_tail() -> Result<()> {
-        let meta = BtreeIndexMeta {
+    fn test_ordered_index_footer_range_from_tail() -> Result<()> {
+        let meta = OrderedIndexMeta {
             columns: vec![],
             metadata: BTreeMap::new(),
         };
-        let mut writer = BtreeIndexWriter::new(meta, "schema", "wallet ASC", "none");
+        let mut writer = OrderedIndexWriter::new(meta, "schema", "wallet ASC", "none");
         writer.add_equality_prefix(Bytes::from_static(b"wallet-1"));
         let (key, value) = row("wallet-1", "payload-1");
         writer.add_row(key, value);
 
         let data = writer.finish()?;
         let file_len = data.len() as u64;
-        let tail = &data[data.len() - BTREE_INDEX_FOOTER_TAIL_SIZE..];
-        let footer_range = btree_footer_range(file_len, tail)?;
-        let footer = decode_btree_footer_bytes(
+        let tail = &data[data.len() - ORDERED_INDEX_FOOTER_TAIL_SIZE..];
+        let footer_range = ordered_footer_range(file_len, tail)?;
+        let footer = decode_ordered_footer_bytes(
             &data[footer_range.start as usize..footer_range.end as usize],
         )?;
 
-        assert_eq!(footer.version, BTREE_INDEX_FILE_VERSION);
+        assert_eq!(footer.version, ORDERED_INDEX_FILE_VERSION);
         assert_eq!(footer.key_order, "wallet ASC");
         Ok(())
     }
 
     #[test]
-    fn test_btree_payload_projection_decode() -> Result<()> {
-        let payload = encode_btree_payload(&[
+    fn test_ordered_payload_projection_decode() -> Result<()> {
+        let payload = encode_ordered_payload(&[
             Scalar::String("wallet-a".to_string()),
             Scalar::Number(databend_common_expression::types::NumberScalar::UInt64(14)),
             Scalar::String("token-a".to_string()),
         ])?;
 
-        let projected = decode_btree_payload_projection(&payload, &[2, 0])?;
+        let projected = decode_ordered_payload_projection(&payload, &[2, 0])?;
         assert_eq!(projected, vec![
             Scalar::String("token-a".to_string()),
             Scalar::String("wallet-a".to_string())
         ]);
 
-        let decoded = decode_btree_payload(&payload)?;
+        let decoded = decode_ordered_payload(&payload)?;
         assert_eq!(decoded.len(), 3);
         assert_eq!(decoded[0], Scalar::String("wallet-a".to_string()));
         Ok(())

@@ -47,7 +47,7 @@ pub enum TableIndexType {
     Ngram,
     Vector,
     Spatial,
-    Btree,
+    Ordered,
 }
 
 impl Display for TableIndexType {
@@ -68,8 +68,8 @@ impl Display for TableIndexType {
             TableIndexType::Spatial => {
                 write!(f, "SPATIAL")
             }
-            TableIndexType::Btree => {
-                write!(f, "BTREE")
+            TableIndexType::Ordered => {
+                write!(f, "ORDERED")
             }
         }
     }

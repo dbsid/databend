@@ -21,12 +21,12 @@ use crate::optimizer::ir::SExpr;
 use crate::plans::RelOperator;
 use crate::plans::Sequence;
 
-/// Replace a subtree at the specified path in the SExpr tree.
+/// Replace a suordered at the specified path in the SExpr tree.
 ///
 /// # Arguments
 /// * `root` - The root SExpr to perform replacement on
 /// * `path` - A slice of child indices specifying the path to the replacement position
-/// * `replacement` - The new SExpr to replace the subtree at the specified position
+/// * `replacement` - The new SExpr to replace the suordered at the specified position
 ///
 /// # Returns
 /// A new SExpr with the replacement performed, or an error if the path is invalid
@@ -47,7 +47,7 @@ pub fn replace_at_path(root: &SExpr, path: &[usize], replacement: Arc<SExpr>) ->
         )));
     }
 
-    // Recursively replace in the subtree
+    // Recursively replace in the suordered
     let remaining_path = &path[1..];
     let old_child = &root.children[first_index];
     let new_child = Arc::new(replace_at_path(old_child, remaining_path, replacement)?);

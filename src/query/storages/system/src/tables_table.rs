@@ -267,7 +267,7 @@ where TablesTable<WITH_HISTORY, WITHOUT_VIEW>: HistoryAware
                     ))),
                 ),
                 TableField::new(
-                    "btree_index_size",
+                    "ordered_index_size",
                     TableDataType::Nullable(Box::new(TableDataType::Number(
                         NumberDataType::UInt64,
                     ))),
@@ -593,7 +593,7 @@ where TablesTable<WITH_HISTORY, WITHOUT_VIEW>: HistoryAware
                 | "bloom_index_size"
                 | "ngram_index_size"
                 | "inverted_index_size"
-                | "btree_index_size"
+                | "ordered_index_size"
                 | "vector_index_size"
                 | "virtual_column_size"
                 | "number_of_segments"
@@ -1020,7 +1020,7 @@ where TablesTable<WITH_HISTORY, WITHOUT_VIEW>: HistoryAware
         let mut bloom_index_sizes: Vec<Option<u64>> = Vec::new();
         let mut ngram_index_sizes: Vec<Option<u64>> = Vec::new();
         let mut inverted_index_sizes: Vec<Option<u64>> = Vec::new();
-        let mut btree_index_sizes: Vec<Option<u64>> = Vec::new();
+        let mut ordered_index_sizes: Vec<Option<u64>> = Vec::new();
         let mut vector_index_sizes: Vec<Option<u64>> = Vec::new();
         let mut virtual_column_sizes: Vec<Option<u64>> = Vec::new();
 
@@ -1055,7 +1055,7 @@ where TablesTable<WITH_HISTORY, WITHOUT_VIEW>: HistoryAware
                 bloom_index_sizes.push(stats.as_ref().and_then(|v| v.bloom_index_size));
                 ngram_index_sizes.push(stats.as_ref().and_then(|v| v.ngram_index_size));
                 inverted_index_sizes.push(stats.as_ref().and_then(|v| v.inverted_index_size));
-                btree_index_sizes.push(stats.as_ref().and_then(|v| v.btree_index_size));
+                ordered_index_sizes.push(stats.as_ref().and_then(|v| v.ordered_index_size));
                 vector_index_sizes.push(stats.as_ref().and_then(|v| v.vector_index_size));
                 virtual_column_sizes.push(stats.as_ref().and_then(|v| v.virtual_column_size));
             }
@@ -1209,7 +1209,7 @@ where TablesTable<WITH_HISTORY, WITHOUT_VIEW>: HistoryAware
                 bloom_index_sizes,
                 ngram_index_sizes,
                 inverted_index_sizes,
-                btree_index_sizes,
+                ordered_index_sizes,
                 vector_index_sizes,
                 virtual_column_sizes,
                 number_of_segments,
@@ -1263,7 +1263,7 @@ where TablesTable<WITH_HISTORY, WITHOUT_VIEW>: HistoryAware
         bloom_index_sizes: Vec<Option<u64>>,
         ngram_index_sizes: Vec<Option<u64>>,
         inverted_index_sizes: Vec<Option<u64>>,
-        btree_index_sizes: Vec<Option<u64>>,
+        ordered_index_sizes: Vec<Option<u64>>,
         vector_index_sizes: Vec<Option<u64>>,
         virtual_column_sizes: Vec<Option<u64>>,
         number_of_segments: Vec<Option<u64>>,
@@ -1297,7 +1297,7 @@ where TablesTable<WITH_HISTORY, WITHOUT_VIEW>: HistoryAware
             UInt64Type::from_opt_data(bloom_index_sizes),
             UInt64Type::from_opt_data(ngram_index_sizes),
             UInt64Type::from_opt_data(inverted_index_sizes),
-            UInt64Type::from_opt_data(btree_index_sizes),
+            UInt64Type::from_opt_data(ordered_index_sizes),
             UInt64Type::from_opt_data(vector_index_sizes),
             UInt64Type::from_opt_data(virtual_column_sizes),
             UInt64Type::from_opt_data(number_of_segments),

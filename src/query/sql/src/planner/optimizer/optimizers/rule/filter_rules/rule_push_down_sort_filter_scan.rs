@@ -99,7 +99,7 @@ impl Rule for RulePushDownSortFilterScan {
         let push_down_predicates = scan.push_down_predicates.clone().unwrap_or_default();
         let has_inverted_index = scan.inverted_index.is_some();
         let has_vector_index = scan.vector_index.is_some();
-        let has_btree_index = self
+        let has_ordered_index = self
             .metadata
             .read()
             .table(scan.table_index)
@@ -108,11 +108,11 @@ impl Rule for RulePushDownSortFilterScan {
             .meta
             .indexes
             .values()
-            .any(|index| matches!(index.index_type, TableIndexType::Btree));
-        if (!has_inverted_index && !has_vector_index && !has_btree_index)
+            .any(|index| matches!(index.index_type, TableIndexType::Ordered));
+        if (!has_inverted_index && !has_vector_index && !has_ordered_index)
             || push_down_predicates.len() != filter.predicates.len()
             || sort.limit.is_none()
-            || (!has_btree_index
+            || (!has_ordered_index
                 && !filter_contains_only_index_predicates(
                     &filter,
                     has_inverted_index,

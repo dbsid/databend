@@ -62,8 +62,8 @@ use opendal::Operator;
 
 use crate::FuseStorageFormat;
 use crate::io::BloomIndexState;
-use crate::io::BtreeIndexBuilder;
-use crate::io::BtreeIndexState;
+use crate::io::OrderedIndexBuilder;
+use crate::io::OrderedIndexState;
 use crate::io::TableMetaLocationGenerator;
 use crate::io::build_column_hlls;
 use crate::io::write::InvertedIndexBuilder;
@@ -167,7 +167,7 @@ pub struct BlockSerialization {
     pub block_raw_data: Vec<u8>,
     pub block_meta: BlockMeta,
     pub bloom_index_state: Option<BloomIndexState>,
-    pub btree_index_states: Vec<BtreeIndexState>,
+    pub ordered_index_states: Vec<OrderedIndexState>,
     pub inverted_index_states: Vec<InvertedIndexState>,
     pub virtual_column_state: Option<VirtualColumnState>,
     pub vector_index_state: Option<VectorIndexState>,
@@ -190,7 +190,7 @@ pub struct BlockBuilder {
     pub bloom_columns_map: BTreeMap<FieldIndex, TableField>,
     pub ndv_columns_map: BTreeMap<FieldIndex, TableField>,
     pub ngram_args: Vec<NgramArgs>,
-    pub btree_index_builders: Vec<BtreeIndexBuilder>,
+    pub ordered_index_builders: Vec<OrderedIndexBuilder>,
     pub inverted_index_builders: Vec<InvertedIndexBuilder>,
     pub virtual_column_builder: Option<VirtualColumnBuilder>,
     pub vector_index_builder: Option<VectorIndexBuilder>,
@@ -235,15 +235,15 @@ impl BlockBuilder {
         }
 
         let mut inverted_index_states = Vec::with_capacity(self.inverted_index_builders.len());
-        let mut btree_index_states = Vec::with_capacity(self.btree_index_builders.len());
-        for btree_index_builder in &self.btree_index_builders {
-            let btree_index_state = BtreeIndexState::from_data_block(
+        let mut ordered_index_states = Vec::with_capacity(self.ordered_index_builders.len());
+        for ordered_index_builder in &self.ordered_index_builders {
+            let ordered_index_state = OrderedIndexState::from_data_block(
                 &self.source_schema,
                 &data_block,
                 &block_location,
-                btree_index_builder,
+                ordered_index_builder,
             )?;
-            btree_index_states.push(btree_index_state);
+            ordered_index_states.push(ordered_index_state);
         }
         for inverted_index_builder in &self.inverted_index_builders {
             let inverted_index_state = InvertedIndexState::from_data_block(
@@ -310,8 +310,8 @@ impl BlockBuilder {
         } else {
             None
         };
-        let btree_index_size = if !btree_index_states.is_empty() {
-            let size = btree_index_states.iter().map(|v| v.size).sum();
+        let ordered_index_size = if !ordered_index_states.is_empty() {
+            let size = ordered_index_states.iter().map(|v| v.size).sum();
             Some(size)
         } else {
             None
@@ -340,7 +340,7 @@ impl BlockBuilder {
             spatial_stats,
             compression: self.write_settings.table_compression.into(),
             inverted_index_size,
-            btree_index_size,
+            ordered_index_size,
             virtual_block_meta: None,
             create_on: Some(Utc::now()),
         };
@@ -358,7 +358,7 @@ impl BlockBuilder {
             block_raw_data: buffer,
             block_meta,
             bloom_index_state,
-            btree_index_states,
+            ordered_index_states,
             inverted_index_states,
             virtual_column_state,
             vector_index_state,
@@ -401,7 +401,7 @@ impl BlockWriter {
         Self::write_down_bloom_index_state(dal, serialized.bloom_index_state).await?;
         Self::write_down_vector_index_state(dal, serialized.vector_index_state).await?;
         Self::write_down_spatial_index_state(dal, serialized.spatial_index_state).await?;
-        Self::write_down_btree_index_state(dal, serialized.btree_index_states).await?;
+        Self::write_down_ordered_index_state(dal, serialized.ordered_index_states).await?;
         Self::write_down_inverted_index_state(dal, serialized.inverted_index_states).await?;
         Self::write_down_virtual_column_state(dal, serialized.virtual_column_state).await?;
 
@@ -495,13 +495,13 @@ impl BlockWriter {
         Ok(())
     }
 
-    pub async fn write_down_btree_index_state(
+    pub async fn write_down_ordered_index_state(
         dal: &Operator,
-        btree_index_states: Vec<BtreeIndexState>,
+        ordered_index_states: Vec<OrderedIndexState>,
     ) -> Result<()> {
-        for btree_index_state in btree_index_states {
-            let location = &btree_index_state.location.0;
-            write_data(btree_index_state.data, dal, location).await?;
+        for ordered_index_state in ordered_index_states {
+            let location = &ordered_index_state.location.0;
+            write_data(ordered_index_state.data, dal, location).await?;
         }
         Ok(())
     }

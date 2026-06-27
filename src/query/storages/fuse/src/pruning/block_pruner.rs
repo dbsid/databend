@@ -528,7 +528,7 @@ impl BlockPruner {
         Ok(result)
     }
 
-    pub fn btree_cluster_pruning(
+    pub fn ordered_cluster_pruning(
         &self,
         segment_location: SegmentLocation,
         block_metas: Arc<Vec<Arc<BlockMeta>>>,
@@ -577,7 +577,7 @@ impl BlockPruner {
 
         let elapsed = start.elapsed().as_millis() as u64;
         metrics_inc_pruning_milliseconds(elapsed);
-        info!("[FUSE-PRUNER] btree cluster block prune elapsed: {elapsed}");
+        info!("[FUSE-PRUNER] ordered cluster block prune elapsed: {elapsed}");
 
         Ok(result)
     }
@@ -647,7 +647,7 @@ mod tests {
     use super::cluster_prefix_may_intersect;
 
     #[test]
-    fn test_btree_cluster_prefix_prunes_outside_cluster_range() {
+    fn test_ordered_cluster_prefix_prunes_outside_cluster_range() {
         let cluster_stats = Some(cluster_stats(
             vec![string("14"), string("wallet-a"), Scalar::Boolean(true)],
             vec![string("14"), string("wallet-z"), Scalar::Boolean(true)],
@@ -671,7 +671,7 @@ mod tests {
     }
 
     #[test]
-    fn test_btree_cluster_prefix_pruning_is_conservative_without_comparable_stats() {
+    fn test_ordered_cluster_prefix_pruning_is_conservative_without_comparable_stats() {
         assert!(cluster_prefix_may_intersect(&None, &[string("14")]));
         assert!(cluster_prefix_may_intersect(
             &Some(cluster_stats(vec![string("14")], vec![string("14")])),
@@ -686,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn test_btree_cluster_prefix_compares_different_number_widths() {
+    fn test_ordered_cluster_prefix_compares_different_number_widths() {
         let cluster_stats = Some(cluster_stats(
             vec![number(NumberScalar::Int32(14)), string("wallet-a")],
             vec![number(NumberScalar::Int32(14)), string("wallet-z")],
@@ -703,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    fn test_btree_cluster_prefix_keeps_truncated_string_stats() {
+    fn test_ordered_cluster_prefix_keeps_truncated_string_stats() {
         let cluster_stats = Some(cluster_stats(
             vec![number(NumberScalar::Int32(14)), string("0x97bbda")],
             vec![number(NumberScalar::Int32(14)), string("0x97bbda")],

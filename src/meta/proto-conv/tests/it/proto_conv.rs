@@ -265,7 +265,7 @@ fn new_table_statistics() -> databend_common_meta_app::schema::TableStatistics {
         bloom_index_size: None,
         ngram_index_size: None,
         inverted_index_size: None,
-        btree_index_size: None,
+        ordered_index_size: None,
         vector_index_size: None,
         virtual_column_size: None,
         number_of_segments: Some(1),

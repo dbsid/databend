@@ -23,7 +23,7 @@ use http::Method;
 use http::StatusCode;
 use http::Uri;
 use log::info;
-use maplit::btreeset;
+use maplit::orderedset;
 use poem::Endpoint;
 use poem::Request;
 use poem::Route;
@@ -202,7 +202,7 @@ async fn test_metrics() -> anyhow::Result<()> {
 
     let metric_keys = {
         let lines = txt.split('\n');
-        let mut metric_keys = btreeset! {};
+        let mut metric_keys = orderedset! {};
 
         for line in lines {
             if line.starts_with('#') {

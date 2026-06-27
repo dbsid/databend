@@ -30,7 +30,7 @@ pub const BLOOM_FILTER_INDEX_LOCATION: &str = "bloom_filter_index_location";
 pub const BLOOM_FILTER_INDEX_SIZE: &str = "bloom_filter_index_size";
 pub const NGRAM_FILTER_INDEX_SIZE: &str = "ngram_filter_index_size";
 pub const INVERTED_INDEX_SIZE: &str = "inverted_index_size";
-pub const BTREE_INDEX_SIZE: &str = "btree_index_size";
+pub const ORDERED_INDEX_SIZE: &str = "ordered_index_size";
 pub const COMPRESSION: &str = "compression";
 pub const CREATE_ON: &str = "create_on";
 pub const LOCATION_PATH: &str = "path";
@@ -46,7 +46,7 @@ pub fn block_level_field_names() -> HashSet<String> {
     set.insert(BLOOM_FILTER_INDEX_LOCATION.to_string());
     set.insert(BLOOM_FILTER_INDEX_SIZE.to_string());
     set.insert(INVERTED_INDEX_SIZE.to_string());
-    set.insert(BTREE_INDEX_SIZE.to_string());
+    set.insert(ORDERED_INDEX_SIZE.to_string());
     set.insert(COMPRESSION.to_string());
     set.insert(CREATE_ON.to_string());
     set
@@ -132,7 +132,7 @@ pub fn segment_schema(table_schema: &TableSchema) -> TableSchema {
         TableField::new(BLOOM_FILTER_INDEX_LOCATION, nullable_location_type()),
         TableField::new(BLOOM_FILTER_INDEX_SIZE, u64_t.clone()),
         TableField::new(INVERTED_INDEX_SIZE, nullable_u64_t.clone()),
-        TableField::new(BTREE_INDEX_SIZE, nullable_u64_t.clone()),
+        TableField::new(ORDERED_INDEX_SIZE, nullable_u64_t.clone()),
         TableField::new(COMPRESSION, u8_t.clone()),
         TableField::new(CREATE_ON, i64_t.clone()),
     ];

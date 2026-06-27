@@ -61,17 +61,17 @@ use crate::FuseStorageFormat;
 use crate::FuseTable;
 use crate::io::BlockSerialization;
 use crate::io::BloomIndexState;
-use crate::io::BtreeIndexBuilder;
-use crate::io::BtreeIndexState;
 use crate::io::InvertedIndexBuilder;
 use crate::io::InvertedIndexWriter;
+use crate::io::OrderedIndexBuilder;
+use crate::io::OrderedIndexState;
 use crate::io::SpatialIndexBuilder;
 use crate::io::TableMetaLocationGenerator;
 use crate::io::VectorIndexBuilder;
 use crate::io::VirtualColumnBuilder;
 use crate::io::WriteSettings;
-use crate::io::create_btree_index_builders;
 use crate::io::create_inverted_index_builders;
+use crate::io::create_ordered_index_builders;
 use crate::io::write::BlockStatsBuilder;
 use crate::io::write::InvertedIndexState;
 use crate::io::write::stream::ColumnStatisticsState;
@@ -264,7 +264,7 @@ pub struct StreamBlockBuilder {
     properties: Arc<StreamBlockProperties>,
     block_writer: BlockWriterImpl,
     inverted_index_writers: Vec<InvertedIndexWriter>,
-    btree_index_blocks: Vec<DataBlock>,
+    ordered_index_blocks: Vec<DataBlock>,
     bloom_index_builder: BloomIndexBuilder,
     virtual_column_builder: Option<VirtualColumnBuilder>,
     vector_index_builder: Option<VectorIndexBuilder>,
@@ -349,7 +349,7 @@ impl StreamBlockBuilder {
             properties,
             block_writer,
             inverted_index_writers,
-            btree_index_blocks: Vec::new(),
+            ordered_index_blocks: Vec::new(),
             bloom_index_builder,
             virtual_column_builder,
             vector_index_builder,
@@ -389,8 +389,8 @@ impl StreamBlockBuilder {
         for writer in self.inverted_index_writers.iter_mut() {
             writer.add_block(&self.properties.source_schema, &block)?;
         }
-        if !self.properties.btree_index_builders.is_empty() {
-            self.btree_index_blocks.push(block.clone());
+        if !self.properties.ordered_index_builders.is_empty() {
+            self.ordered_index_blocks.push(block.clone());
         }
         if let Some(ref mut virtual_column_builder) = self.virtual_column_builder {
             virtual_column_builder.add_block(&block)?;
@@ -452,21 +452,22 @@ impl StreamBlockBuilder {
         let col_stats = self.column_stats_state.finalize(column_distinct_count)?;
 
         let mut inverted_index_states = Vec::with_capacity(self.inverted_index_writers.len());
-        let btree_index_block = if !self.btree_index_blocks.is_empty() {
-            Some(DataBlock::concat(&self.btree_index_blocks)?)
+        let ordered_index_block = if !self.ordered_index_blocks.is_empty() {
+            Some(DataBlock::concat(&self.ordered_index_blocks)?)
         } else {
             None
         };
-        let mut btree_index_states = Vec::with_capacity(self.properties.btree_index_builders.len());
-        if let Some(btree_index_block) = &btree_index_block {
-            for btree_index_builder in &self.properties.btree_index_builders {
-                let btree_index_state = BtreeIndexState::from_data_block(
+        let mut ordered_index_states =
+            Vec::with_capacity(self.properties.ordered_index_builders.len());
+        if let Some(ordered_index_block) = &ordered_index_block {
+            for ordered_index_builder in &self.properties.ordered_index_builders {
+                let ordered_index_state = OrderedIndexState::from_data_block(
                     &self.properties.source_schema,
-                    btree_index_block,
+                    ordered_index_block,
                     &block_location,
-                    btree_index_builder,
+                    ordered_index_builder,
                 )?;
-                btree_index_states.push(btree_index_state);
+                ordered_index_states.push(ordered_index_state);
             }
         }
         for (i, inverted_index_writer) in std::mem::take(&mut self.inverted_index_writers)
@@ -522,7 +523,7 @@ impl StreamBlockBuilder {
             .iter()
             .map(|v| v.size)
             .reduce(|a, b| a + b);
-        let btree_index_size = btree_index_states
+        let ordered_index_size = ordered_index_states
             .iter()
             .map(|v| v.size)
             .reduce(|a, b| a + b);
@@ -547,7 +548,7 @@ impl StreamBlockBuilder {
                 .unwrap_or_default(),
             compression: self.properties.write_settings.table_compression.into(),
             inverted_index_size,
-            btree_index_size,
+            ordered_index_size,
             vector_index_size,
             vector_index_location,
             spatial_index_size,
@@ -564,7 +565,7 @@ impl StreamBlockBuilder {
             block_raw_data,
             block_meta,
             bloom_index_state,
-            btree_index_states,
+            ordered_index_states,
             inverted_index_states,
             virtual_column_state,
             vector_index_state,
@@ -589,7 +590,7 @@ pub struct StreamBlockProperties {
     bloom_columns_map: BTreeMap<FieldIndex, TableField>,
     ndv_columns_map: BTreeMap<FieldIndex, TableField>,
     ngram_args: Vec<NgramArgs>,
-    btree_index_builders: Vec<BtreeIndexBuilder>,
+    ordered_index_builders: Vec<OrderedIndexBuilder>,
     inverted_index_builders: Vec<InvertedIndexBuilder>,
     virtual_column_builder: Option<VirtualColumnBuilder>,
     table_meta_timestamps: TableMetaTimestamps,
@@ -640,7 +641,7 @@ impl StreamBlockProperties {
             .collect::<HashSet<_>>();
 
         let inverted_index_builders = create_inverted_index_builders(&table.table_info.meta);
-        let btree_index_builders = create_btree_index_builders(&table.table_info.meta);
+        let ordered_index_builders = create_ordered_index_builders(&table.table_info.meta);
 
         let virtual_column_builder = if table.enable_virtual_column() {
             VirtualColumnBuilder::try_create(ctx.clone(), source_schema.clone()).ok()
@@ -677,7 +678,7 @@ impl StreamBlockProperties {
             distinct_columns,
             bloom_columns_map,
             ngram_args,
-            btree_index_builders,
+            ordered_index_builders,
             inverted_index_builders,
             table_meta_timestamps,
             table_indexes,

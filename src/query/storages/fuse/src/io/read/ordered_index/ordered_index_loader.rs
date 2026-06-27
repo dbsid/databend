@@ -24,37 +24,37 @@ use databend_storages_common_cache::CacheAccessor;
 use databend_storages_common_cache::CacheManager;
 use databend_storages_common_cache::CacheValue;
 use databend_storages_common_cache::InMemoryLruCache;
-use databend_storages_common_index::BTREE_INDEX_FOOTER_TAIL_SIZE;
-use databend_storages_common_index::BtreeIndexFile;
-use databend_storages_common_index::BtreeIndexFileMeta;
-use databend_storages_common_index::BtreeIndexFileView;
-use databend_storages_common_index::BtreeIndexRow;
-use databend_storages_common_index::btree_footer_range;
-use databend_storages_common_index::decode_btree_footer_bytes;
+use databend_storages_common_index::ORDERED_INDEX_FOOTER_TAIL_SIZE;
+use databend_storages_common_index::OrderedIndexFile;
+use databend_storages_common_index::OrderedIndexFileMeta;
+use databend_storages_common_index::OrderedIndexFileView;
+use databend_storages_common_index::OrderedIndexRow;
+use databend_storages_common_index::decode_ordered_footer_bytes;
+use databend_storages_common_index::ordered_footer_range;
 use opendal::Operator;
 
-const BTREE_DECODED_DATA_BLOCK_CACHE_ITEMS: usize = 8192;
+const ORDERED_DECODED_DATA_BLOCK_CACHE_ITEMS: usize = 8192;
 
-static BTREE_DECODED_DATA_BLOCK_CACHE: LazyLock<InMemoryLruCache<BtreeIndexDecodedDataBlock>> =
+static ORDERED_DECODED_DATA_BLOCK_CACHE: LazyLock<InMemoryLruCache<OrderedIndexDecodedDataBlock>> =
     LazyLock::new(|| {
         InMemoryLruCache::with_items_capacity(
-            "btree_index_decoded_data_block".to_string(),
-            BTREE_DECODED_DATA_BLOCK_CACHE_ITEMS,
+            "ordered_index_decoded_data_block".to_string(),
+            ORDERED_DECODED_DATA_BLOCK_CACHE_ITEMS,
         )
     });
 
 #[derive(Clone)]
-struct BtreeIndexDecodedDataBlock {
-    rows: Arc<Vec<BtreeIndexRow>>,
+struct OrderedIndexDecodedDataBlock {
+    rows: Arc<Vec<OrderedIndexRow>>,
 }
 
-impl From<BtreeIndexDecodedDataBlock> for CacheValue<BtreeIndexDecodedDataBlock> {
-    fn from(value: BtreeIndexDecodedDataBlock) -> Self {
+impl From<OrderedIndexDecodedDataBlock> for CacheValue<OrderedIndexDecodedDataBlock> {
+    fn from(value: OrderedIndexDecodedDataBlock) -> Self {
         let mem_bytes = value
             .rows
             .iter()
             .map(|row| {
-                std::mem::size_of::<BtreeIndexRow>()
+                std::mem::size_of::<OrderedIndexRow>()
                     + row.encoded_key.len()
                     + row.encoded_row_payload.len()
             })
@@ -64,18 +64,18 @@ impl From<BtreeIndexDecodedDataBlock> for CacheValue<BtreeIndexDecodedDataBlock>
 }
 
 #[fastrace::trace]
-pub async fn load_btree_index_file(
+pub async fn load_ordered_index_file(
     operator: Operator,
     location: &str,
     len_hint: Option<u64>,
-) -> Result<Arc<BtreeIndexFileView>> {
+) -> Result<Arc<OrderedIndexFileView>> {
     let start = Instant::now();
-    let cache = CacheManager::instance().get_btree_index_file_cache();
+    let cache = CacheManager::instance().get_ordered_index_file_cache();
     if let Some(file) = match len_hint {
         Some(len) => cache.get_sized(location, len),
         None => cache.get(location),
     } {
-        return open_btree_index_view(file);
+        return open_ordered_index_view(file);
     }
 
     let data = if let Some(len) = len_hint {
@@ -85,7 +85,7 @@ pub async fn load_btree_index_file(
             .await
             .map_err(|err| {
                 ErrorCode::StorageOther(format!(
-                    "read btree index file failed, {}, {:?}",
+                    "read ordered index file failed, {}, {:?}",
                     location, err
                 ))
             })?
@@ -96,57 +96,57 @@ pub async fn load_btree_index_file(
             .await
             .map_err(|err| {
                 ErrorCode::StorageOther(format!(
-                    "read btree index file failed, {}, {:?}",
+                    "read ordered index file failed, {}, {:?}",
                     location, err
                 ))
             })?
             .to_bytes()
     };
-    let file = BtreeIndexFile::create(location.to_string(), data);
+    let file = OrderedIndexFile::create(location.to_string(), data);
     let file = cache.insert(location.to_string(), file);
-    let view = open_btree_index_view(file)?;
+    let view = open_ordered_index_view(file)?;
     log::debug!(
-        "loaded btree index file {}, elapsed {} ms",
+        "loaded ordered index file {}, elapsed {} ms",
         location,
         start.elapsed().as_millis()
     );
     Ok(view)
 }
 
-fn open_btree_index_view(file: Arc<BtreeIndexFile>) -> Result<Arc<BtreeIndexFileView>> {
-    BtreeIndexFileView::open(file.data.clone()).map(Arc::new)
+fn open_ordered_index_view(file: Arc<OrderedIndexFile>) -> Result<Arc<OrderedIndexFileView>> {
+    OrderedIndexFileView::open(file.data.clone()).map(Arc::new)
 }
 
 #[fastrace::trace]
-pub async fn load_btree_index_meta(
+pub async fn load_ordered_index_meta(
     operator: Operator,
     location: &str,
     len_hint: Option<u64>,
-) -> Result<Arc<BtreeIndexFileMeta>> {
+) -> Result<Arc<OrderedIndexFileMeta>> {
     let start = Instant::now();
-    let meta_cache = CacheManager::instance().get_btree_index_meta_cache();
+    let meta_cache = CacheManager::instance().get_ordered_index_meta_cache();
     if let Some(meta) = match len_hint {
         Some(len) => meta_cache.get_sized(location, len),
         None => meta_cache.get(location),
     } {
-        record_elapsed(ProfileStatisticsName::BtreeIndexMetaLoadTime, start);
+        record_elapsed(ProfileStatisticsName::OrderedIndexMetaLoadTime, start);
         return Ok(meta);
     }
 
-    if let Some(file_cache) = CacheManager::instance().get_btree_index_file_cache()
+    if let Some(file_cache) = CacheManager::instance().get_ordered_index_file_cache()
         && let Some(file) = match len_hint {
             Some(len) => file_cache.get_sized(location, len),
             None => file_cache.get(location),
         }
     {
-        let view = BtreeIndexFileView::open(file.data.clone())?;
-        let meta = BtreeIndexFileMeta {
+        let view = OrderedIndexFileView::open(file.data.clone())?;
+        let meta = OrderedIndexFileMeta {
             footer: view.footer().clone(),
             index_block: view.index_block().clone(),
             filter_block: view.filter_block().clone(),
         };
         let meta = meta_cache.insert(location.to_string(), meta);
-        record_elapsed(ProfileStatisticsName::BtreeIndexMetaLoadTime, start);
+        record_elapsed(ProfileStatisticsName::OrderedIndexMetaLoadTime, start);
         return Ok(meta);
     }
 
@@ -158,84 +158,87 @@ pub async fn load_btree_index_meta(
             .await
             .map_err(|err| {
                 ErrorCode::StorageOther(format!(
-                    "stat btree index file failed, {}, {:?}",
+                    "stat ordered index file failed, {}, {:?}",
                     location, err
                 ))
             })?
             .content_length()
     };
-    if file_len < BTREE_INDEX_FOOTER_TAIL_SIZE as u64 {
+    if file_len < ORDERED_INDEX_FOOTER_TAIL_SIZE as u64 {
         return Err(ErrorCode::StorageOther(format!(
-            "invalid btree index file length {}, too small",
+            "invalid ordered index file length {}, too small",
             file_len
         )));
     }
 
-    let tail_start = file_len - BTREE_INDEX_FOOTER_TAIL_SIZE as u64;
+    let tail_start = file_len - ORDERED_INDEX_FOOTER_TAIL_SIZE as u64;
     let tail = read_range(
         operator.clone(),
         location,
         tail_start..file_len,
-        "btree index footer tail",
+        "ordered index footer tail",
     )
     .await?;
-    let footer_range = btree_footer_range(file_len, &tail)?;
+    let footer_range = ordered_footer_range(file_len, &tail)?;
     let footer_bytes = read_range(
         operator.clone(),
         location,
         footer_range,
-        "btree index footer",
+        "ordered index footer",
     )
     .await?;
-    let footer = decode_btree_footer_bytes(&footer_bytes)?;
+    let footer = decode_ordered_footer_bytes(&footer_bytes)?;
 
-    let index_section = databend_storages_common_index::btree_index_section(
+    let index_section = databend_storages_common_index::ordered_index_section(
         &footer,
-        databend_storages_common_index::BtreeIndexSectionKind::Index,
+        databend_storages_common_index::OrderedIndexSectionKind::Index,
     )?;
-    let filter_section = databend_storages_common_index::btree_index_section(
+    let filter_section = databend_storages_common_index::ordered_index_section(
         &footer,
-        databend_storages_common_index::BtreeIndexSectionKind::Filter,
+        databend_storages_common_index::OrderedIndexSectionKind::Filter,
     )?;
     let index_block = read_range(
         operator.clone(),
         location,
         index_section.offset..index_section.offset + index_section.length,
-        "btree index block",
+        "ordered index block",
     )
     .await?;
     let filter_block = read_range(
         operator,
         location,
         filter_section.offset..filter_section.offset + filter_section.length,
-        "btree filter block",
+        "ordered filter block",
     )
     .await?;
-    let meta = BtreeIndexFileMeta::from_sections(footer, index_block, filter_block)?;
+    let meta = OrderedIndexFileMeta::from_sections(footer, index_block, filter_block)?;
     let meta = meta_cache.insert(location.to_string(), meta);
-    record_elapsed(ProfileStatisticsName::BtreeIndexMetaLoadTime, start);
+    record_elapsed(ProfileStatisticsName::OrderedIndexMetaLoadTime, start);
     Ok(meta)
 }
 
-pub async fn load_btree_index_data_block(
+pub async fn load_ordered_index_data_block(
     operator: Operator,
     location: &str,
-    meta: &BtreeIndexFileMeta,
-    block_meta: &databend_storages_common_index::BtreeIndexDataBlockMeta,
-) -> Result<Arc<Vec<BtreeIndexRow>>> {
+    meta: &OrderedIndexFileMeta,
+    block_meta: &databend_storages_common_index::OrderedIndexDataBlockMeta,
+) -> Result<Arc<Vec<OrderedIndexRow>>> {
     let cache_key = format!("{}#{}+{}", location, block_meta.offset, block_meta.length);
     let decoded_cache_key = format!("decoded#{cache_key}");
-    if let Some(block) = BTREE_DECODED_DATA_BLOCK_CACHE.get(&decoded_cache_key) {
+    if let Some(block) = ORDERED_DECODED_DATA_BLOCK_CACHE.get(&decoded_cache_key) {
         return Ok(block.rows.clone());
     }
 
-    let cache = CacheManager::instance().get_btree_index_file_cache();
+    let cache = CacheManager::instance().get_ordered_index_file_cache();
     if let Some(block) = cache.get_sized(&cache_key, block_meta.length) {
         let start = Instant::now();
         let rows = meta.decode_data_block(block_meta, block.data.as_ref())?;
-        record_elapsed(ProfileStatisticsName::BtreeIndexDataBlockDecodeTime, start);
+        record_elapsed(
+            ProfileStatisticsName::OrderedIndexDataBlockDecodeTime,
+            start,
+        );
         let rows = Arc::new(rows);
-        BTREE_DECODED_DATA_BLOCK_CACHE.insert(decoded_cache_key, BtreeIndexDecodedDataBlock {
+        ORDERED_DECODED_DATA_BLOCK_CACHE.insert(decoded_cache_key, OrderedIndexDecodedDataBlock {
             rows: rows.clone(),
         });
         return Ok(rows);
@@ -246,23 +249,23 @@ pub async fn load_btree_index_data_block(
         operator,
         location,
         block_meta.offset..block_meta.offset + block_meta.length,
-        "btree data block",
+        "ordered data block",
     )
     .await?;
     record_elapsed(
-        ProfileStatisticsName::BtreeIndexDataBlockReadTime,
+        ProfileStatisticsName::OrderedIndexDataBlockReadTime,
         read_start,
     );
-    let block = BtreeIndexFile::create(cache_key.clone(), bytes);
+    let block = OrderedIndexFile::create(cache_key.clone(), bytes);
     let block = cache.insert(cache_key, block);
     let decode_start = Instant::now();
     let rows = meta.decode_data_block(block_meta, block.data.as_ref())?;
     record_elapsed(
-        ProfileStatisticsName::BtreeIndexDataBlockDecodeTime,
+        ProfileStatisticsName::OrderedIndexDataBlockDecodeTime,
         decode_start,
     );
     let rows = Arc::new(rows);
-    BTREE_DECODED_DATA_BLOCK_CACHE.insert(decoded_cache_key, BtreeIndexDecodedDataBlock {
+    ORDERED_DECODED_DATA_BLOCK_CACHE.insert(decoded_cache_key, OrderedIndexDecodedDataBlock {
         rows: rows.clone(),
     });
     Ok(rows)
@@ -293,8 +296,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use bytes::Bytes;
-    use databend_storages_common_index::BtreeIndexMeta;
-    use databend_storages_common_index::BtreeIndexWriter;
+    use databend_storages_common_index::OrderedIndexMeta;
+    use databend_storages_common_index::OrderedIndexWriter;
 
     use super::*;
 
@@ -306,17 +309,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_load_btree_index_ranges_from_opendal() -> Result<()> {
+    async fn test_load_ordered_index_ranges_from_opendal() -> Result<()> {
         crate::test_utils::init_test_globals()?;
         let operator = Operator::new(opendal::services::Memory::default())
             .unwrap()
             .finish();
-        let location = "btree-index.sst";
-        let meta = BtreeIndexMeta {
+        let location = "ordered-index.sst";
+        let meta = OrderedIndexMeta {
             columns: vec![],
             metadata: BTreeMap::new(),
         };
-        let mut writer = BtreeIndexWriter::new(meta, "schema", "wallet ASC,score DESC", "none")
+        let mut writer = OrderedIndexWriter::new(meta, "schema", "wallet ASC,score DESC", "none")
             .with_data_block_size(1);
         writer.add_equality_prefix(Bytes::from_static(b"wallet-1|"));
         for score in 0..4 {
@@ -330,10 +333,10 @@ mod tests {
             .write(location, data.to_vec())
             .await
             .map_err(|err| {
-                ErrorCode::StorageOther(format!("write btree index test file failed: {err:?}"))
+                ErrorCode::StorageOther(format!("write ordered index test file failed: {err:?}"))
             })?;
 
-        let meta = load_btree_index_meta(operator.clone(), location, None).await?;
+        let meta = load_ordered_index_meta(operator.clone(), location, None).await?;
         assert!(meta.may_contain_equality_prefix(b"wallet-1|"));
         let block_metas = meta.blocks_for_prefix(b"wallet-1|");
         assert!(block_metas.len() > 1);
@@ -341,7 +344,8 @@ mod tests {
         let mut rows = Vec::new();
         for block_meta in &block_metas {
             let block_rows =
-                load_btree_index_data_block(operator.clone(), location, &meta, block_meta).await?;
+                load_ordered_index_data_block(operator.clone(), location, &meta, block_meta)
+                    .await?;
             rows.extend(block_rows.iter().cloned());
         }
         rows.retain(|row| row.encoded_key.starts_with(b"wallet-1|"));

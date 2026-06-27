@@ -345,9 +345,9 @@ where
             }
 
             // Most table index types map one index implementation to one set of
-            // columns. BTREE indexes are different: alternate key orderings over
+            // columns. ORDERED indexes are different: alternate key orderings over
             // overlapping columns are valid access paths.
-            if !matches!(req.index_type, TableIndexType::Btree) {
+            if !matches!(req.index_type, TableIndexType::Ordered) {
                 for (name, index) in indexes.iter() {
                     if *name == req.name || index.index_type != req.index_type {
                         continue;

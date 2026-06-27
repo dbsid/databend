@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use databend_common_base::runtime::Runtime;
-use databend_common_catalog::plan::BtreeIndexInfo;
+use databend_common_catalog::plan::OrderedIndexInfo;
 use databend_common_catalog::plan::PushDownInfo;
 use databend_common_catalog::plan::ReadPartitionsPruningMode;
 use databend_common_catalog::query_kind::QueryKind;
@@ -266,7 +266,7 @@ pub struct FusePruner {
     pub inverse_range_index: Option<RangeIndex>,
     pub deleted_segments: Vec<DeletedSegmentInfo>,
     pub block_meta_cache: Option<SegmentBlockMetasCache>,
-    pub btree_cluster_prefix: Option<Vec<Scalar>>,
+    pub ordered_cluster_prefix: Option<Vec<Scalar>>,
 }
 
 impl FusePruner {
@@ -335,10 +335,10 @@ impl FusePruner {
         spatial_index_columns: HashSet<ColumnId>,
         bloom_index_builder: Option<BloomIndexRebuilder>,
     ) -> Result<Self> {
-        let btree_cluster_prefix = push_down
+        let ordered_cluster_prefix = push_down
             .as_ref()
-            .and_then(|push_down| push_down.btree_index.as_ref())
-            .and_then(|btree_index| btree_cluster_prefix(btree_index, &cluster_keys));
+            .and_then(|push_down| push_down.ordered_index.as_ref())
+            .and_then(|ordered_index| ordered_cluster_prefix(ordered_index, &cluster_keys));
         let max_concurrency = {
             let max_io_requests = ctx.get_settings().get_max_storage_io_requests()? as usize;
             // Prevent us from miss-configured max_storage_io_requests setting, e.g. 0
@@ -379,7 +379,7 @@ impl FusePruner {
             inverse_range_index: None,
             deleted_segments: vec![],
             block_meta_cache: CacheManager::instance().get_segment_block_metas_cache(),
-            btree_cluster_prefix,
+            ordered_cluster_prefix,
         })
     }
 
@@ -426,7 +426,7 @@ impl FusePruner {
 
             let mut batch = segment_locs.drain(0..batch_size).collect::<Vec<_>>();
             let inverse_range_index = self.get_inverse_range_index();
-            let btree_cluster_prefix = self.btree_cluster_prefix.clone();
+            let ordered_cluster_prefix = self.ordered_cluster_prefix.clone();
             works.push(self.pruning_ctx.pruning_runtime.spawn({
                 let block_pruner = block_pruner.clone();
                 let segment_pruner = segment_pruner.clone();
@@ -519,10 +519,10 @@ impl FusePruner {
                                     block_metas = Arc::new(sample_block_metas);
                                 }
                             }
-                            if let Some(cluster_prefix) = &btree_cluster_prefix {
+                            if let Some(cluster_prefix) = &ordered_cluster_prefix {
                                 let block_meta_indexes =
                                     block_pruner.internal_column_pruning(&block_metas);
-                                res.extend(block_pruner.btree_cluster_pruning(
+                                res.extend(block_pruner.ordered_cluster_pruning(
                                     location.clone(),
                                     block_metas,
                                     block_meta_indexes,
@@ -818,17 +818,17 @@ pub fn table_sample(push_down_info: &Option<PushDownInfo>) -> Result<Option<f64>
     Ok(sample_probability)
 }
 
-fn btree_cluster_prefix(
-    btree_index: &BtreeIndexInfo,
+fn ordered_cluster_prefix(
+    ordered_index: &OrderedIndexInfo,
     cluster_keys: &[RemoteExpr<String>],
 ) -> Option<Vec<Scalar>> {
-    let mut prefix = Vec::with_capacity(btree_index.equality_prefix.len());
+    let mut prefix = Vec::with_capacity(ordered_index.equality_prefix.len());
     for cluster_key in cluster_keys {
-        if prefix.len() == btree_index.equality_prefix.len() {
+        if prefix.len() == ordered_index.equality_prefix.len() {
             break;
         }
 
-        let Some(value) = btree_cluster_prefix_value(btree_index, cluster_key) else {
+        let Some(value) = ordered_cluster_prefix_value(ordered_index, cluster_key) else {
             break;
         };
         prefix.push(value);
@@ -837,19 +837,19 @@ fn btree_cluster_prefix(
     (!prefix.is_empty()).then_some(prefix)
 }
 
-fn btree_cluster_prefix_value(
-    btree_index: &BtreeIndexInfo,
+fn ordered_cluster_prefix_value(
+    ordered_index: &OrderedIndexInfo,
     cluster_key: &RemoteExpr<String>,
 ) -> Option<Scalar> {
     match cluster_key {
-        RemoteExpr::ColumnRef { id, .. } => btree_equality_value(btree_index, id).cloned(),
+        RemoteExpr::ColumnRef { id, .. } => ordered_equality_value(ordered_index, id).cloned(),
         RemoteExpr::FunctionCall { id, args, .. }
             if id.name().as_ref() == "is_null" && args.len() == 1 =>
         {
             let RemoteExpr::ColumnRef { id, .. } = &args[0] else {
                 return None;
             };
-            btree_equality_value(btree_index, id)
+            ordered_equality_value(ordered_index, id)
                 .map(|value| Scalar::Boolean(matches!(value, Scalar::Null)))
         }
         RemoteExpr::FunctionCall { id, args, .. }
@@ -864,7 +864,7 @@ fn btree_cluster_prefix_value(
             let RemoteExpr::ColumnRef { id, .. } = &args[0] else {
                 return None;
             };
-            btree_equality_value(btree_index, id)
+            ordered_equality_value(ordered_index, id)
                 .map(|value| Scalar::Boolean(matches!(value, Scalar::Null)))
         }
         RemoteExpr::FunctionCall { id, args, .. }
@@ -882,7 +882,7 @@ fn btree_cluster_prefix_value(
             if start != 1 {
                 return None;
             }
-            let Some(Scalar::String(value)) = btree_equality_value(btree_index, id) else {
+            let Some(Scalar::String(value)) = ordered_equality_value(ordered_index, id) else {
                 return None;
             };
             Some(Scalar::String(
@@ -893,11 +893,14 @@ fn btree_cluster_prefix_value(
     }
 }
 
-fn btree_equality_value<'a>(btree_index: &'a BtreeIndexInfo, column: &str) -> Option<&'a Scalar> {
-    btree_index
+fn ordered_equality_value<'a>(
+    ordered_index: &'a OrderedIndexInfo,
+    column: &str,
+) -> Option<&'a Scalar> {
+    ordered_index
         .key_columns
         .iter()
-        .zip(btree_index.equality_prefix.iter())
+        .zip(ordered_index.equality_prefix.iter())
         .find_map(|(key_column, value)| (key_column.field.name() == column).then_some(value))
 }
 
@@ -914,8 +917,8 @@ fn remote_expr_positive_integer(expr: &RemoteExpr<String>) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use databend_common_catalog::plan::BtreeIndexColumnOrder;
-    use databend_common_catalog::plan::BtreeIndexKeyColumn;
+    use databend_common_catalog::plan::OrderedIndexColumnOrder;
+    use databend_common_catalog::plan::OrderedIndexKeyColumn;
     use databend_common_expression::FunctionID;
     use databend_common_expression::TableDataType;
     use databend_common_expression::TableField;
@@ -926,8 +929,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_btree_cluster_prefix_supports_is_null_cluster_key() {
-        let btree_index = BtreeIndexInfo {
+    fn test_ordered_cluster_prefix_supports_is_null_cluster_key() {
+        let ordered_index = OrderedIndexInfo {
             index_name: "idx".to_string(),
             index_version: "v1".to_string(),
             key_columns: vec![
@@ -944,7 +947,7 @@ mod tests {
             ],
             limit: Some(100),
             filters: None,
-            use_block_btree_index_size_hint: false,
+            use_block_ordered_index_size_hint: false,
         };
         let cluster_keys = vec![
             column_ref("platform_id"),
@@ -962,7 +965,7 @@ mod tests {
             },
         ];
 
-        let prefix = btree_cluster_prefix(&btree_index, &cluster_keys).unwrap();
+        let prefix = ordered_cluster_prefix(&ordered_index, &cluster_keys).unwrap();
         assert_eq!(prefix, vec![
             Scalar::Number(NumberScalar::UInt64(14)),
             Scalar::String("0xwallet".to_string()),
@@ -971,8 +974,8 @@ mod tests {
     }
 
     #[test]
-    fn test_btree_cluster_prefix_supports_truncated_string_cluster_key() {
-        let btree_index = BtreeIndexInfo {
+    fn test_ordered_cluster_prefix_supports_truncated_string_cluster_key() {
+        let ordered_index = OrderedIndexInfo {
             index_name: "idx".to_string(),
             index_version: "v1".to_string(),
             key_columns: vec![key_column("platform_id"), key_column("wallet_address")],
@@ -983,7 +986,7 @@ mod tests {
             ],
             limit: Some(100),
             filters: None,
-            use_block_btree_index_size_hint: false,
+            use_block_ordered_index_size_hint: false,
         };
         let cluster_keys = vec![column_ref("platform_id"), RemoteExpr::FunctionCall {
             span: None,
@@ -1000,7 +1003,7 @@ mod tests {
             return_type: DataType::String,
         }];
 
-        let prefix = btree_cluster_prefix(&btree_index, &cluster_keys).unwrap();
+        let prefix = ordered_cluster_prefix(&ordered_index, &cluster_keys).unwrap();
         assert_eq!(prefix, vec![
             Scalar::Number(NumberScalar::Int32(14)),
             Scalar::String("0x97bbda".to_string()),
@@ -1008,8 +1011,8 @@ mod tests {
     }
 
     #[test]
-    fn test_btree_cluster_prefix_supports_normalized_is_null_cluster_key() {
-        let btree_index = BtreeIndexInfo {
+    fn test_ordered_cluster_prefix_supports_normalized_is_null_cluster_key() {
+        let ordered_index = OrderedIndexInfo {
             index_name: "idx".to_string(),
             index_version: "v1".to_string(),
             key_columns: vec![key_column("tag_black_hole")],
@@ -1017,7 +1020,7 @@ mod tests {
             equality_prefix: vec![Scalar::Null],
             limit: Some(100),
             filters: None,
-            use_block_btree_index_size_hint: false,
+            use_block_ordered_index_size_hint: false,
         };
         let cluster_keys = vec![RemoteExpr::FunctionCall {
             span: None,
@@ -1039,14 +1042,14 @@ mod tests {
             return_type: DataType::Boolean,
         }];
 
-        let prefix = btree_cluster_prefix(&btree_index, &cluster_keys).unwrap();
+        let prefix = ordered_cluster_prefix(&ordered_index, &cluster_keys).unwrap();
         assert_eq!(prefix, vec![Scalar::Boolean(true)]);
     }
 
-    fn key_column(name: &str) -> BtreeIndexKeyColumn {
-        BtreeIndexKeyColumn {
+    fn key_column(name: &str) -> OrderedIndexKeyColumn {
+        OrderedIndexKeyColumn {
             field: TableField::new(name, TableDataType::String),
-            order: BtreeIndexColumnOrder::Asc,
+            order: OrderedIndexColumnOrder::Asc,
         }
     }
 

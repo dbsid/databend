@@ -46,7 +46,7 @@ pub enum Matcher {
 /// Build [`Matcher`] trees with a compact DSL.
 ///
 /// * Use `->` to describe a unary chain: `match_op!(EvalScalar -> Aggregate -> *)`.
-/// * Use `*` for [`Matcher::Leaf`], meaning "any subtree".
+/// * Use `*` for [`Matcher::Leaf`], meaning "any suordered".
 /// * Use brackets for explicit child lists: `match_op!(Join[*, *])` or
 ///   `match_op!(Join[(EvalScalar -> *), (Aggregate -> *)])`.
 /// * Because the macro returns a single [`Matcher`], wrap multiple patterns in

@@ -223,7 +223,7 @@ impl FuseTable {
             bloom_index_size: stats.bloom_index_size,
             ngram_index_size: stats.ngram_index_size,
             inverted_index_size: stats.inverted_index_size,
-            btree_index_size: stats.btree_index_size,
+            ordered_index_size: stats.ordered_index_size,
             vector_index_size: stats.vector_index_size,
             virtual_column_size: stats.virtual_column_size,
             number_of_segments: Some(new_snapshot.segments.len() as u64),

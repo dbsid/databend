@@ -357,7 +357,7 @@ impl CreateTableInterpreter {
                     bloom_index_size: snapshot.summary.bloom_index_size,
                     ngram_index_size: snapshot.summary.ngram_index_size,
                     inverted_index_size: snapshot.summary.inverted_index_size,
-                    btree_index_size: snapshot.summary.btree_index_size,
+                    ordered_index_size: snapshot.summary.ordered_index_size,
                     vector_index_size: snapshot.summary.vector_index_size,
                     virtual_column_size: snapshot.summary.virtual_column_size,
                     number_of_segments: Some(snapshot.segments.len() as u64),

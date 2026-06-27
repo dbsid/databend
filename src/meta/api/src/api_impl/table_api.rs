@@ -177,7 +177,7 @@ fn validate_index_columns(meta: &TableMeta) -> Result<(), KVAppError> {
                     IndexColumnIdNotFound::new(column_id, &index.name),
                 )));
             }
-            if !matches!(index.index_type, TableIndexType::Btree)
+            if !matches!(index.index_type, TableIndexType::Ordered)
                 && !seen.insert((column_id, index.index_type.clone()))
             {
                 return Err(KVAppError::AppError(AppError::DuplicatedIndexColumnId(

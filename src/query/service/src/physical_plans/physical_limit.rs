@@ -158,10 +158,10 @@ impl PhysicalPlanBuilder {
         let mut input_plan = self.build(s_expr.child(0)?, required).await?;
         if !lazy_columns.is_empty()
             && support_lazy_materialize
-            && (plan_contains_btree_index(&input_plan)
-                || btree_index_covers_lazy_columns(&input_plan, &lazy_columns, &metadata))
+            && (plan_contains_ordered_index(&input_plan)
+                || ordered_index_covers_lazy_columns(&input_plan, &lazy_columns, &metadata))
         {
-            // A covered BTREE scan returns rows from the SST payload directly and
+            // A covered ORDERED scan returns rows from the SST payload directly and
             // does not provide `_row_id`, so it cannot be combined with RowFetch.
             lazy_columns.clear();
             input_plan = self.build(s_expr.child(0)?, original_required).await?;
@@ -321,28 +321,28 @@ impl PhysicalPlanBuilder {
     }
 }
 
-fn plan_contains_btree_index(plan: &PhysicalPlan) -> bool {
+fn plan_contains_ordered_index(plan: &PhysicalPlan) -> bool {
     if let Some(scan) = crate::physical_plans::TableScan::from_physical_plan(plan)
         && scan
             .source
             .push_downs
             .as_ref()
-            .and_then(|push_downs| push_downs.btree_index.as_ref())
+            .and_then(|push_downs| push_downs.ordered_index.as_ref())
             .is_some()
     {
         return true;
     }
-    plan.children().any(plan_contains_btree_index)
+    plan.children().any(plan_contains_ordered_index)
 }
 
-fn btree_index_covers_lazy_columns(
+fn ordered_index_covers_lazy_columns(
     plan: &PhysicalPlan,
     lazy_columns: &ColumnSet,
     metadata: &databend_common_sql::Metadata,
 ) -> bool {
-    let mut btree_payloads_by_table = HashMap::new();
-    collect_btree_index_payloads(plan, &mut btree_payloads_by_table);
-    if btree_payloads_by_table.is_empty() {
+    let mut ordered_payloads_by_table = HashMap::new();
+    collect_ordered_index_payloads(plan, &mut ordered_payloads_by_table);
+    if ordered_payloads_by_table.is_empty() {
         return false;
     }
 
@@ -353,33 +353,33 @@ fn btree_index_covers_lazy_columns(
         if column.path_indices.is_some() {
             return false;
         }
-        btree_payloads_by_table
+        ordered_payloads_by_table
             .get(&column.table_index)
             .is_some_and(|payloads| payloads.contains(column.column_name.as_str()))
     })
 }
 
-fn collect_btree_index_payloads(
+fn collect_ordered_index_payloads(
     plan: &PhysicalPlan,
     payloads_by_table: &mut HashMap<IndexType, HashSet<String>>,
 ) {
     if let Some(scan) = crate::physical_plans::TableScan::from_physical_plan(plan)
         && let Some(table_index) = scan.table_index
-        && let Some(btree_index) = scan
+        && let Some(ordered_index) = scan
             .source
             .push_downs
             .as_ref()
-            .and_then(|push_downs| push_downs.btree_index.as_ref())
+            .and_then(|push_downs| push_downs.ordered_index.as_ref())
     {
         let payloads = payloads_by_table.entry(table_index).or_default();
         payloads.extend(
-            btree_index
+            ordered_index
                 .payload_fields
                 .iter()
                 .map(|field| field.name().to_string()),
         );
     }
     for child in plan.children() {
-        collect_btree_index_payloads(child, payloads_by_table);
+        collect_ordered_index_payloads(child, payloads_by_table);
     }
 }

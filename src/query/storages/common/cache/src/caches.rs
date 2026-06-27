@@ -51,8 +51,8 @@ pub type BloomIndexFilterCache = HybridCache<FilterImpl>;
 /// In memory object cache of parquet FileMetaData of bloom index data
 pub type BloomIndexMetaCache = HybridCache<BloomIndexMeta>;
 
-pub type BtreeIndexMetaCache = HybridCache<BtreeIndexFileMeta>;
-pub type BtreeIndexFileCache = HybridCache<BtreeIndexFile>;
+pub type OrderedIndexMetaCache = HybridCache<OrderedIndexFileMeta>;
+pub type OrderedIndexFileCache = HybridCache<OrderedIndexFile>;
 
 pub type InvertedIndexMetaCache = HybridCache<InvertedIndexMeta>;
 pub type InvertedIndexFileCache = HybridCache<InvertedIndexFile>;
@@ -171,17 +171,17 @@ impl CachedObject<InvertedIndexMeta> for InvertedIndexMeta {
     }
 }
 
-impl CachedObject<BtreeIndexFile> for BtreeIndexFile {
-    type Cache = BtreeIndexFileCache;
+impl CachedObject<OrderedIndexFile> for OrderedIndexFile {
+    type Cache = OrderedIndexFileCache;
     fn cache() -> Option<Self::Cache> {
-        CacheManager::instance().get_btree_index_file_cache()
+        CacheManager::instance().get_ordered_index_file_cache()
     }
 }
 
-impl CachedObject<BtreeIndexFileMeta> for BtreeIndexFileMeta {
-    type Cache = BtreeIndexMetaCache;
+impl CachedObject<OrderedIndexFileMeta> for OrderedIndexFileMeta {
+    type Cache = OrderedIndexMetaCache;
     fn cache() -> Option<Self::Cache> {
-        CacheManager::instance().get_btree_index_meta_cache()
+        CacheManager::instance().get_ordered_index_meta_cache()
     }
 }
 
@@ -322,8 +322,8 @@ impl From<InvertedIndexMeta> for CacheValue<InvertedIndexMeta> {
     }
 }
 
-impl From<BtreeIndexFileMeta> for CacheValue<BtreeIndexFileMeta> {
-    fn from(value: BtreeIndexFileMeta) -> Self {
+impl From<OrderedIndexFileMeta> for CacheValue<OrderedIndexFileMeta> {
+    fn from(value: OrderedIndexFileMeta) -> Self {
         CacheValue {
             inner: Arc::new(value),
             mem_bytes: 0,

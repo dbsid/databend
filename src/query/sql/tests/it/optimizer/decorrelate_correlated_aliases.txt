@@ -1,5 +1,5 @@
 === nested_filter_alias_reaches_limit_rewrite ===
-description: Filter-derived correlated aliases must remain visible while rewriting a deeper correlated LIMIT subtree.
+description: Filter-derived correlated aliases must remain visible while rewriting a deeper correlated LIMIT suordered.
 sql: 
         SELECT *
         FROM (VALUES (1, 1)) AS t1(a, b)

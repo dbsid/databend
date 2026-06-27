@@ -31,8 +31,8 @@ use crate::SegmentLocation;
 use crate::io::AggIndexReader;
 use crate::io::BlockReader;
 use crate::io::VirtualColumnReader;
-use crate::operations::read::build_btree_index_source_pipeline;
 use crate::operations::read::build_fuse_source_pipeline;
+use crate::operations::read::build_ordered_index_source_pipeline;
 
 impl FuseTable {
     pub fn create_block_reader(
@@ -153,18 +153,18 @@ impl FuseTable {
             self.pruned_result_receiver.lock().take()
         };
 
-        if let Some(btree_index) = plan
+        if let Some(ordered_index) = plan
             .push_downs
             .as_ref()
-            .and_then(|push_downs| push_downs.btree_index.clone())
+            .and_then(|push_downs| push_downs.ordered_index.clone())
         {
             let max_threads = ctx.get_settings().get_max_threads()? as usize;
-            return build_btree_index_source_pipeline(
+            return build_ordered_index_source_pipeline(
                 ctx.clone(),
                 self.operator.clone(),
                 pipeline,
                 plan,
-                btree_index,
+                ordered_index,
                 max_threads,
                 rx,
             );

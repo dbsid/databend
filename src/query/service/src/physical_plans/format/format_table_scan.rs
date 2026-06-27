@@ -126,16 +126,16 @@ impl<'a> PhysicalFormat for TableScanFormatter<'a> {
         };
         children.push(FormatTreeNode::new(push_downs));
 
-        if let Some(btree_index) = self
+        if let Some(ordered_index) = self
             .inner
             .source
             .push_downs
             .as_ref()
-            .and_then(|p| p.btree_index.as_ref())
+            .and_then(|p| p.ordered_index.as_ref())
         {
             children.push(FormatTreeNode::new(format!(
-                "btree index: [{}@{}]",
-                btree_index.index_name, btree_index.index_version
+                "ordered index: [{}@{}]",
+                ordered_index.index_name, ordered_index.index_version
             )));
         }
 

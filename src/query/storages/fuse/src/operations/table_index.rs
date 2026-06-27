@@ -70,9 +70,9 @@ use crate::index::filters::Filter;
 use crate::io::BlockReader;
 use crate::io::BlockWriter;
 use crate::io::BloomIndexState;
-use crate::io::BtreeIndexBuilder;
-use crate::io::BtreeIndexState;
 use crate::io::MetaReaders;
+use crate::io::OrderedIndexBuilder;
+use crate::io::OrderedIndexState;
 use crate::io::SpatialIndexBuilder;
 use crate::io::TableMetaLocationGenerator;
 use crate::io::VectorIndexBuilder;
@@ -102,7 +102,7 @@ pub async fn do_refresh_table_index(
         TableIndexType::Ngram
             | TableIndexType::Vector
             | TableIndexType::Spatial
-            | TableIndexType::Btree
+            | TableIndexType::Ordered
     ) {
         return Err(ErrorCode::RefreshIndexError(format!(
             "Refresh index type {} not support",
@@ -259,12 +259,12 @@ pub async fn do_refresh_table_index(
                 )
             });
         }
-        RefreshIndexArg::Btree(btree_index_arg) => {
+        RefreshIndexArg::Ordered(ordered_index_arg) => {
             pipeline.add_async_transformer(|| {
-                BtreeIndexTransform::new(
+                OrderedIndexTransform::new(
                     operator.clone(),
                     index_schema.clone(),
-                    btree_index_arg.clone(),
+                    ordered_index_arg.clone(),
                 )
             });
         }
@@ -376,7 +376,7 @@ fn build_refresh_index_arg(
             };
             Ok(RefreshIndexArg::Spatial(spatial_arg))
         }
-        TableIndexType::Btree => {
+        TableIndexType::Ordered => {
             let index = table_meta.indexes.get(index_name).unwrap();
             let key_columns = if index.key_columns.is_empty() {
                 index
@@ -401,7 +401,7 @@ fn build_refresh_index_arg(
                         .map(|field| (field.clone(), column.order.clone()))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let payload_fields = if is_btree_covered_all_columns(&index.options)
+            let payload_fields = if is_ordered_covered_all_columns(&index.options)
                 || index.include_column_ids.is_empty()
             {
                 table_meta
@@ -416,7 +416,7 @@ fn build_refresh_index_arg(
                     .map(|column_id| table_meta.schema.field_of_column_id(*column_id).cloned())
                     .collect::<Result<Vec<_>>>()?
             };
-            Ok(RefreshIndexArg::Btree(RefreshBtreeIndexArg {
+            Ok(RefreshIndexArg::Ordered(RefreshOrderedIndexArg {
                 index_name: index_name.clone(),
                 index_version: index.version.clone(),
                 key_fields,
@@ -471,32 +471,32 @@ async fn check_index_generated(
             )
             .await
         }
-        RefreshIndexArg::Btree(btree_index_arg) => {
-            check_btree_index_generated(
+        RefreshIndexArg::Ordered(ordered_index_arg) => {
+            check_ordered_index_generated(
                 operator.clone(),
                 segment_idx,
                 block_idx,
                 block_meta,
                 stats,
-                btree_index_arg,
+                ordered_index_arg,
             )
             .await
         }
     }
 }
 
-async fn check_btree_index_generated(
+async fn check_ordered_index_generated(
     operator: Operator,
     segment_idx: usize,
     block_idx: usize,
     block_meta: Arc<BlockMeta>,
     stats: Option<Arc<SegmentStatistics>>,
-    btree_index_arg: &RefreshBtreeIndexArg,
+    ordered_index_arg: &RefreshOrderedIndexArg,
 ) -> Result<Option<RefreshIndexMeta>> {
-    let index_location = TableMetaLocationGenerator::gen_btree_index_location_from_block_location(
+    let index_location = TableMetaLocationGenerator::gen_ordered_index_location_from_block_location(
         &block_meta.location.0,
-        &btree_index_arg.index_name,
-        &btree_index_arg.index_version,
+        &ordered_index_arg.index_name,
+        &ordered_index_arg.index_version,
     );
     if operator.stat(&index_location).await.is_ok() {
         return Ok(None);
@@ -1029,29 +1029,29 @@ pub struct SpatialIndexTransform {
     existing_names_prefix: Vec<String>,
 }
 
-pub struct BtreeIndexTransform {
+pub struct OrderedIndexTransform {
     operator: Operator,
     source_schema: TableSchemaRef,
-    btree_index_arg: RefreshBtreeIndexArg,
+    ordered_index_arg: RefreshOrderedIndexArg,
 }
 
-impl BtreeIndexTransform {
+impl OrderedIndexTransform {
     fn new(
         operator: Operator,
         source_schema: TableSchemaRef,
-        btree_index_arg: RefreshBtreeIndexArg,
+        ordered_index_arg: RefreshOrderedIndexArg,
     ) -> Self {
         Self {
             operator,
             source_schema,
-            btree_index_arg,
+            ordered_index_arg,
         }
     }
 }
 
 #[async_trait::async_trait]
-impl AsyncTransform for BtreeIndexTransform {
-    const NAME: &'static str = "BtreeIndexTransform";
+impl AsyncTransform for OrderedIndexTransform {
+    const NAME: &'static str = "OrderedIndexTransform";
 
     #[async_backtrace::framed]
     async fn transform(&mut self, data_block: DataBlock) -> Result<DataBlock> {
@@ -1066,14 +1066,14 @@ impl AsyncTransform for BtreeIndexTransform {
             .and_then(RefreshIndexMeta::downcast_ref_from)
             .unwrap();
 
-        let builder = BtreeIndexBuilder {
-            name: self.btree_index_arg.index_name.clone(),
-            version: self.btree_index_arg.index_version.clone(),
-            key_fields: self.btree_index_arg.key_fields.clone(),
-            payload_fields: self.btree_index_arg.payload_fields.clone(),
-            options: self.btree_index_arg.options.clone(),
+        let builder = OrderedIndexBuilder {
+            name: self.ordered_index_arg.index_name.clone(),
+            version: self.ordered_index_arg.index_version.clone(),
+            key_fields: self.ordered_index_arg.key_fields.clone(),
+            payload_fields: self.ordered_index_arg.payload_fields.clone(),
+            options: self.ordered_index_arg.options.clone(),
         };
-        let state = BtreeIndexState::from_data_block(
+        let state = OrderedIndexState::from_data_block(
             &self.source_schema,
             &data_block,
             &block_meta.location,
@@ -1081,9 +1081,9 @@ impl AsyncTransform for BtreeIndexTransform {
         )?;
 
         let mut new_block_meta = Arc::unwrap_or_clone(block_meta.clone());
-        let old_size = new_block_meta.btree_index_size.unwrap_or_default();
-        new_block_meta.btree_index_size = Some(old_size + state.size);
-        BlockWriter::write_down_btree_index_state(&self.operator, vec![state]).await?;
+        let old_size = new_block_meta.ordered_index_size.unwrap_or_default();
+        new_block_meta.ordered_index_size = Some(old_size + state.size);
+        BlockWriter::write_down_ordered_index_state(&self.operator, vec![state]).await?;
 
         let extended_block_meta = ExtendedBlockMeta {
             block_meta: new_block_meta,
@@ -1231,7 +1231,7 @@ enum RefreshIndexArg {
     Ngram(RefreshNgramIndexArg),
     Vector(RefreshVectorIndexArg),
     Spatial(RefreshSpatialIndexArg),
-    Btree(RefreshBtreeIndexArg),
+    Ordered(RefreshOrderedIndexArg),
 }
 
 struct RefreshNgramIndexArg {
@@ -1254,7 +1254,7 @@ struct RefreshSpatialIndexArg {
 }
 
 #[derive(Clone)]
-struct RefreshBtreeIndexArg {
+struct RefreshOrderedIndexArg {
     index_name: String,
     index_version: String,
     key_fields: Vec<(TableField, TableIndexColumnOrder)>,
@@ -1262,7 +1262,7 @@ struct RefreshBtreeIndexArg {
     options: BTreeMap<String, String>,
 }
 
-fn is_btree_covered_all_columns(options: &BTreeMap<String, String>) -> bool {
+fn is_ordered_covered_all_columns(options: &BTreeMap<String, String>) -> bool {
     options
         .get("index_covered_type")
         .is_some_and(|value| value.eq_ignore_ascii_case("covered_all_columns_in_schema"))

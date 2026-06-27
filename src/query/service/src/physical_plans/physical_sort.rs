@@ -18,9 +18,9 @@ use std::cmp;
 use std::cmp::Ordering;
 use std::fmt::Display;
 
-use databend_common_catalog::plan::BtreeIndexColumnOrder;
 use databend_common_catalog::plan::DataSourcePlan;
 use databend_common_catalog::plan::Filters;
+use databend_common_catalog::plan::OrderedIndexColumnOrder;
 use databend_common_catalog::plan::PartInfoPtr;
 use databend_common_catalog::plan::PartitionsShuffleKind;
 use databend_common_catalog::table::Table;
@@ -461,7 +461,7 @@ impl PhysicalPlanBuilder {
         let Some(after_exchange) = sort.after_exchange else {
             let mut input_plan = self.build(s_expr.unary_child(), required).await?;
             if sort.limit.is_some()
-                && (self.prove_btree_index_ordering(&mut input_plan, &order_by)
+                && (self.prove_ordered_index_ordering(&mut input_plan, &order_by)
                     || self.prove_cluster_key_ordering(&mut input_plan, &order_by))
             {
                 return Ok(PhysicalPlan::new(Sort {
@@ -582,7 +582,7 @@ impl PhysicalPlanBuilder {
         }
 
         let order_by = sort.order_by.clone();
-        if self.prove_btree_index_ordering(&mut sort.input, &order_by)
+        if self.prove_ordered_index_ordering(&mut sort.input, &order_by)
             || self.prove_cluster_key_ordering(&mut sort.input, &order_by)
         {
             sort.limit = Some(sort.limit.map_or(limit, |v| cmp::max(v, limit)));
@@ -590,7 +590,7 @@ impl PhysicalPlanBuilder {
         }
     }
 
-    fn prove_btree_index_ordering(
+    fn prove_ordered_index_ordering(
         &self,
         input_plan: &mut PhysicalPlan,
         order_by: &[SortDesc],
@@ -606,15 +606,15 @@ impl PhysicalPlanBuilder {
         let Some(scan) = ordered_table_scan_mut(input_plan) else {
             return false;
         };
-        let Some(btree_index) = scan
+        let Some(ordered_index) = scan
             .source
             .push_downs
             .as_ref()
-            .and_then(|push_downs| push_downs.btree_index.as_ref())
+            .and_then(|push_downs| push_downs.ordered_index.as_ref())
         else {
             return false;
         };
-        if !btree_index_covers_ordering(btree_index, &sort_exprs) {
+        if !ordered_index_covers_ordering(ordered_index, &sort_exprs) {
             return false;
         }
 
@@ -699,12 +699,12 @@ impl PhysicalPlanBuilder {
     }
 }
 
-fn btree_index_covers_ordering(
-    btree_index: &databend_common_catalog::plan::BtreeIndexInfo,
+fn ordered_index_covers_ordering(
+    ordered_index: &databend_common_catalog::plan::OrderedIndexInfo,
     sort_exprs: &[(RemoteExpr<String>, bool, bool)],
 ) -> bool {
-    let prefix_len = btree_index.equality_prefix.len();
-    if prefix_len + sort_exprs.len() > btree_index.key_columns.len() {
+    let prefix_len = ordered_index.equality_prefix.len();
+    if prefix_len + sort_exprs.len() > ordered_index.key_columns.len() {
         return false;
     }
 
@@ -713,14 +713,14 @@ fn btree_index_covers_ordering(
             return false;
         }
 
-        let key_column = &btree_index.key_columns[prefix_len + offset];
+        let key_column = &ordered_index.key_columns[prefix_len + offset];
         let RemoteExpr::ColumnRef { id, .. } = sort_expr else {
             return false;
         };
         if key_column.field.name() != id {
             return false;
         }
-        if matches!(key_column.order, BtreeIndexColumnOrder::Asc) != *asc {
+        if matches!(key_column.order, OrderedIndexColumnOrder::Asc) != *asc {
             return false;
         }
     }

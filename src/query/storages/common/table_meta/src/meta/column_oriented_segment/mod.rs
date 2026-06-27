@@ -31,6 +31,7 @@ pub use schema::LOCATION;
 pub use schema::LOCATION_FORMAT_VERSION;
 pub use schema::LOCATION_PATH;
 pub use schema::NGRAM_FILTER_INDEX_SIZE;
+pub use schema::ORDERED_INDEX_SIZE;
 pub use schema::ROW_COUNT;
 pub use schema::block_level_field_names;
 pub use schema::col_meta_type;

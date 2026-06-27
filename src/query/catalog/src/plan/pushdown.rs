@@ -154,25 +154,25 @@ pub struct VectorIndexInfo {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BtreeIndexColumnOrder {
+pub enum OrderedIndexColumnOrder {
     Asc,
     Desc,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct BtreeIndexKeyColumn {
+pub struct OrderedIndexKeyColumn {
     pub field: TableField,
-    pub order: BtreeIndexColumnOrder,
+    pub order: OrderedIndexColumnOrder,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct BtreeIndexInfo {
+pub struct OrderedIndexInfo {
     /// The index name.
     pub index_name: String,
     /// The index version.
     pub index_version: String,
     /// The ordered key columns.
-    pub key_columns: Vec<BtreeIndexKeyColumn>,
+    pub key_columns: Vec<OrderedIndexKeyColumn>,
     /// Payload fields stored in the row payload of the SST file.
     pub payload_fields: Vec<TableField>,
     /// Equality values for the leading key prefix.
@@ -181,10 +181,10 @@ pub struct BtreeIndexInfo {
     pub limit: Option<usize>,
     /// Extra filters to apply on the covered payload before global limit.
     pub filters: Option<Filters>,
-    /// Whether block-level `btree_index_size` can be used as the selected
-    /// index file length. It is only exact when the table has a single BTREE
-    /// index, because block meta currently stores the total BTREE index size.
-    pub use_block_btree_index_size_hint: bool,
+    /// Whether block-level `ordered_index_size` can be used as the selected
+    /// index file length. It is only exact when the table has a single ORDERED
+    /// index, because block meta currently stores the total ORDERED index size.
+    pub use_block_ordered_index_size_hint: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -226,8 +226,8 @@ pub struct PushDownInfo {
     pub inverted_index: Option<InvertedIndexInfo>,
     /// Optional vector index
     pub vector_index: Option<VectorIndexInfo>,
-    /// Optional btree index
-    pub btree_index: Option<BtreeIndexInfo>,
+    /// Optional ordered index
+    pub ordered_index: Option<OrderedIndexInfo>,
     /// Used by table sample
     pub sample: Option<SampleConfig>,
     /// Controls how much pruning work a storage should do while collecting partitions.

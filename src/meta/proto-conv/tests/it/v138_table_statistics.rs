@@ -41,7 +41,7 @@ fn test_decode_v138_table_statistics() -> anyhow::Result<()> {
         bloom_index_size: Some(256),
         ngram_index_size: Some(128),
         inverted_index_size: Some(128),
-        btree_index_size: None,
+        ordered_index_size: None,
         vector_index_size: Some(512),
         virtual_column_size: None,
         number_of_segments: Some(1),

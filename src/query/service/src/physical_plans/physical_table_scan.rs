@@ -20,13 +20,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use databend_common_catalog::catalog::CatalogManager;
-use databend_common_catalog::plan::BtreeIndexColumnOrder;
-use databend_common_catalog::plan::BtreeIndexInfo;
-use databend_common_catalog::plan::BtreeIndexKeyColumn;
 use databend_common_catalog::plan::DataSourceInfo;
 use databend_common_catalog::plan::DataSourcePlan;
 use databend_common_catalog::plan::Filters;
 use databend_common_catalog::plan::InternalColumn;
+use databend_common_catalog::plan::OrderedIndexColumnOrder;
+use databend_common_catalog::plan::OrderedIndexInfo;
+use databend_common_catalog::plan::OrderedIndexKeyColumn;
 use databend_common_catalog::plan::PartStatistics;
 use databend_common_catalog::plan::PartitionsShuffleKind;
 use databend_common_catalog::plan::PrewhereInfo;
@@ -95,8 +95,8 @@ use crate::sessions::TableContextPartitionStats;
 use crate::sessions::TableContextSettings;
 use crate::sessions::TableContextTableFactory;
 
-const BTREE_INDEX_OPTION_COVERED_TYPE: &str = "index_covered_type";
-const BTREE_INDEX_COVERED_ALL_COLUMNS: &str = "covered_all_columns_in_schema";
+const ORDERED_INDEX_OPTION_COVERED_TYPE: &str = "index_covered_type";
+const ORDERED_INDEX_COVERED_ALL_COLUMNS: &str = "covered_all_columns_in_schema";
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TableScan {
@@ -180,15 +180,15 @@ impl IPhysicalPlan for TableScan {
                 self.source.statistics.partitions_total.to_string(),
             ]),
         ]);
-        if let Some(btree_index) = self
+        if let Some(ordered_index) = self
             .source
             .push_downs
             .as_ref()
-            .and_then(|push_downs| push_downs.btree_index.as_ref())
+            .and_then(|push_downs| push_downs.ordered_index.as_ref())
         {
-            labels.insert(String::from("Btree index"), vec![format!(
+            labels.insert(String::from("Ordered index"), vec![format!(
                 "{}@{}",
-                btree_index.index_name, btree_index.index_version
+                ordered_index.index_name, ordered_index.index_version
             )]);
         }
         Ok(labels)
@@ -363,7 +363,7 @@ impl PhysicalPlanBuilder {
             };
 
             if scan.is_lazy_table && supported_lazy_materialize {
-                let btree_user_filters = if let Some(predicates) = scan
+                let ordered_user_filters = if let Some(predicates) = scan
                     .push_down_predicates
                     .as_ref()
                     .filter(|preds| !preds.is_empty())
@@ -376,7 +376,7 @@ impl PhysicalPlanBuilder {
                     None
                 };
                 let lazy_columns = if self
-                    .try_build_btree_index_info(
+                    .try_build_ordered_index_info(
                         scan,
                         &self
                             .metadata
@@ -384,7 +384,7 @@ impl PhysicalPlanBuilder {
                             .table(scan.table_index)
                             .table()
                             .schema_with_stream(),
-                        btree_user_filters,
+                        ordered_user_filters,
                     )?
                     .is_some()
                 {
@@ -903,20 +903,20 @@ impl PhysicalPlanBuilder {
 
         let virtual_column = self.build_virtual_column(virtual_columns)?;
 
-        let btree_index =
-            self.try_build_btree_index_info(scan, table_schema, user_filters.clone())?;
-        if btree_index
+        let ordered_index =
+            self.try_build_ordered_index_info(scan, table_schema, user_filters.clone())?;
+        if ordered_index
             .as_ref()
-            .is_some_and(|btree_index| btree_index.limit.is_none())
+            .is_some_and(|ordered_index| ordered_index.limit.is_none())
         {
-            // A filter-only BTREE access path does not preserve the query ORDER BY,
+            // A filter-only ORDERED access path does not preserve the query ORDER BY,
             // so neither the source nor FUSE block pruning may consume the LIMIT.
             limit = None;
         }
-        let prewhere = if btree_index.is_some() {
-            // The BTREE source scans row payloads from the covered SST and applies the
+        let prewhere = if ordered_index.is_some() {
+            // The ORDERED source scans row payloads from the covered SST and applies the
             // complete pushed filter there, so the normal block-read prewhere path is
-            // redundant and should not be mixed into the BTREE read path.
+            // redundant and should not be mixed into the ORDERED read path.
             None
         } else {
             prewhere_info
@@ -936,19 +936,19 @@ impl PhysicalPlanBuilder {
             change_type: scan.change_type.clone(),
             inverted_index: scan.inverted_index.clone(),
             vector_index: scan.vector_index.clone(),
-            btree_index,
+            ordered_index,
             sample: scan.sample.clone(),
             read_partitions_pruning_mode: Default::default(),
             secure_filters,
         })
     }
 
-    fn try_build_btree_index_info(
+    fn try_build_ordered_index_info(
         &self,
         scan: &databend_common_sql::plans::Scan,
         table_schema: &TableSchema,
         filters: Option<Filters>,
-    ) -> Result<Option<BtreeIndexInfo>> {
+    ) -> Result<Option<OrderedIndexInfo>> {
         if scan
             .secure_predicates
             .as_ref()
@@ -964,20 +964,20 @@ impl PhysicalPlanBuilder {
         let table_entry = metadata.table(scan.table_index);
         let table_info = table_entry.table().get_table_info().clone();
         let table_meta = &table_info.meta;
-        let btree_index_count = table_meta
+        let ordered_index_count = table_meta
             .indexes
             .values()
-            .filter(|index| matches!(index.index_type, TableIndexType::Btree))
+            .filter(|index| matches!(index.index_type, TableIndexType::Ordered))
             .count();
         let mut prefix_constants_by_column = HashMap::new();
         for predicate in scan.push_down_predicates.as_deref().unwrap_or_default() {
-            collect_btree_prefix_column_constants(predicate, &mut prefix_constants_by_column);
+            collect_ordered_prefix_column_constants(predicate, &mut prefix_constants_by_column);
         }
-        let filter_column_names = btree_filter_column_names(filters.as_ref());
-        let mut best_candidate: Option<(BtreeIndexCandidateScore, BtreeIndexInfo)> = None;
+        let filter_column_names = ordered_filter_column_names(filters.as_ref());
+        let mut best_candidate: Option<(OrderedIndexCandidateScore, OrderedIndexInfo)> = None;
 
         for index in table_meta.indexes.values() {
-            if !matches!(index.index_type, TableIndexType::Btree) {
+            if !matches!(index.index_type, TableIndexType::Ordered) {
                 continue;
             }
 
@@ -997,11 +997,11 @@ impl PhysicalPlanBuilder {
                 continue;
             }
 
-            let Some(payload_fields) = btree_payload_fields(
+            let Some(payload_fields) = ordered_payload_fields(
                 table_meta,
                 &key_columns,
                 index.include_column_ids.as_slice(),
-                is_btree_covered_all_columns(&index.options),
+                is_ordered_covered_all_columns(&index.options),
             ) else {
                 continue;
             };
@@ -1031,7 +1031,7 @@ impl PhysicalPlanBuilder {
             }
 
             let order_by = scan.order_by.as_ref().unwrap();
-            let preserves_order = btree_index_matches_scan_order(
+            let preserves_order = ordered_index_matches_scan_order(
                 table_meta,
                 &metadata,
                 scan.table_index,
@@ -1039,7 +1039,7 @@ impl PhysicalPlanBuilder {
                 prefix_len,
                 order_by,
             );
-            let extra_filter_key_columns = btree_extra_filter_key_column_count(
+            let extra_filter_key_columns = ordered_extra_filter_key_column_count(
                 table_meta,
                 &key_columns,
                 if preserves_order {
@@ -1070,20 +1070,20 @@ impl PhysicalPlanBuilder {
             {
                 continue;
             }
-            if !btree_filters_are_covered(filters.as_ref(), &payload_fields) {
+            if !ordered_filters_are_covered(filters.as_ref(), &payload_fields) {
                 continue;
             }
 
-            let mut btree_key_columns = Vec::with_capacity(key_columns.len());
+            let mut ordered_key_columns = Vec::with_capacity(key_columns.len());
             let mut valid_key_fields = true;
             for key_column in &key_columns {
                 let Ok(field) = table_meta.schema.field_of_column_id(key_column.column_id) else {
                     valid_key_fields = false;
                     break;
                 };
-                btree_key_columns.push(BtreeIndexKeyColumn {
+                ordered_key_columns.push(OrderedIndexKeyColumn {
                     field: field.clone(),
-                    order: to_btree_pushdown_order(&key_column.order),
+                    order: to_ordered_pushdown_order(&key_column.order),
                 });
             }
             if !valid_key_fields {
@@ -1091,35 +1091,35 @@ impl PhysicalPlanBuilder {
             }
 
             let _ = table_schema;
-            let btree_index_info = BtreeIndexInfo {
+            let ordered_index_info = OrderedIndexInfo {
                 index_name: index.name.clone(),
                 index_version: index.version.clone(),
-                key_columns: btree_key_columns,
+                key_columns: ordered_key_columns,
                 payload_fields,
                 equality_prefix: prefix_values,
                 limit: preserves_order.then_some(scan.limit).flatten(),
                 filters: filters.clone(),
-                use_block_btree_index_size_hint: btree_index_count == 1,
+                use_block_ordered_index_size_hint: ordered_index_count == 1,
             };
-            let score = BtreeIndexCandidateScore {
+            let score = OrderedIndexCandidateScore {
                 prefix_len,
                 extra_filter_key_columns,
                 preserves_order,
-                payload_width: btree_index_info.payload_fields.len(),
-                key_width: btree_index_info.key_columns.len(),
+                payload_width: ordered_index_info.payload_fields.len(),
+                key_width: ordered_index_info.key_columns.len(),
             };
             if best_candidate
                 .as_ref()
                 .is_none_or(|(best_score, best_index)| {
-                    btree_candidate_score_is_better(
+                    ordered_candidate_score_is_better(
                         &score,
-                        &btree_index_info.index_name,
+                        &ordered_index_info.index_name,
                         best_score,
                         &best_index.index_name,
                     )
                 })
             {
-                best_candidate = Some((score, btree_index_info));
+                best_candidate = Some((score, ordered_index_info));
             }
         }
 
@@ -1368,13 +1368,13 @@ impl PhysicalPlanBuilder {
     }
 }
 
-fn is_btree_covered_all_columns(options: &BTreeMap<String, String>) -> bool {
+fn is_ordered_covered_all_columns(options: &BTreeMap<String, String>) -> bool {
     options
-        .get(BTREE_INDEX_OPTION_COVERED_TYPE)
-        .is_some_and(|value| value.eq_ignore_ascii_case(BTREE_INDEX_COVERED_ALL_COLUMNS))
+        .get(ORDERED_INDEX_OPTION_COVERED_TYPE)
+        .is_some_and(|value| value.eq_ignore_ascii_case(ORDERED_INDEX_COVERED_ALL_COLUMNS))
 }
 
-fn btree_payload_fields(
+fn ordered_payload_fields(
     table_meta: &databend_common_meta_app::schema::TableMeta,
     key_columns: &[TableIndexColumn],
     include_column_ids: &[u32],
@@ -1413,7 +1413,7 @@ fn btree_payload_fields(
     Some(fields)
 }
 
-fn btree_filters_are_covered(
+fn ordered_filters_are_covered(
     filters: Option<&Filters>,
     payload_fields: &[databend_common_expression::TableField],
 ) -> bool {
@@ -1433,7 +1433,7 @@ fn btree_filters_are_covered(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct BtreeIndexCandidateScore {
+struct OrderedIndexCandidateScore {
     prefix_len: usize,
     extra_filter_key_columns: usize,
     preserves_order: bool,
@@ -1441,7 +1441,7 @@ struct BtreeIndexCandidateScore {
     key_width: usize,
 }
 
-fn btree_filter_column_names(filters: Option<&Filters>) -> HashSet<String> {
+fn ordered_filter_column_names(filters: Option<&Filters>) -> HashSet<String> {
     filters
         .map(|filters| {
             filters
@@ -1455,7 +1455,7 @@ fn btree_filter_column_names(filters: Option<&Filters>) -> HashSet<String> {
         .unwrap_or_default()
 }
 
-fn btree_extra_filter_key_column_count(
+fn ordered_extra_filter_key_column_count(
     table_meta: &databend_common_meta_app::schema::TableMeta,
     key_columns: &[TableIndexColumn],
     first_extra_key_index: usize,
@@ -1478,7 +1478,7 @@ fn btree_extra_filter_key_column_count(
         .count()
 }
 
-fn btree_index_matches_scan_order(
+fn ordered_index_matches_scan_order(
     table_meta: &databend_common_meta_app::schema::TableMeta,
     metadata: &Metadata,
     table_index: IndexType,
@@ -1509,10 +1509,10 @@ fn btree_index_matches_scan_order(
     true
 }
 
-fn btree_candidate_score_is_better(
-    candidate: &BtreeIndexCandidateScore,
+fn ordered_candidate_score_is_better(
+    candidate: &OrderedIndexCandidateScore,
     candidate_name: &str,
-    best: &BtreeIndexCandidateScore,
+    best: &OrderedIndexCandidateScore,
     best_name: &str,
 ) -> bool {
     if candidate.prefix_len != best.prefix_len {
@@ -1537,10 +1537,10 @@ fn key_order_is_asc(order: &TableIndexColumnOrder) -> bool {
     matches!(order, TableIndexColumnOrder::Asc)
 }
 
-fn to_btree_pushdown_order(order: &TableIndexColumnOrder) -> BtreeIndexColumnOrder {
+fn to_ordered_pushdown_order(order: &TableIndexColumnOrder) -> OrderedIndexColumnOrder {
     match order {
-        TableIndexColumnOrder::Asc => BtreeIndexColumnOrder::Asc,
-        TableIndexColumnOrder::Desc => BtreeIndexColumnOrder::Desc,
+        TableIndexColumnOrder::Asc => OrderedIndexColumnOrder::Asc,
+        TableIndexColumnOrder::Desc => OrderedIndexColumnOrder::Desc,
     }
 }
 
@@ -1566,7 +1566,7 @@ fn table_symbol_for_field(
     })
 }
 
-fn collect_btree_prefix_column_constants(
+fn collect_ordered_prefix_column_constants(
     expr: &ScalarExpr,
     constants_by_column: &mut HashMap<Symbol, Scalar>,
 ) {
@@ -1574,17 +1574,17 @@ fn collect_btree_prefix_column_constants(
         && matches!(func.func_name.as_str(), "and" | "and_filters")
     {
         for argument in &func.arguments {
-            collect_btree_prefix_column_constants(argument, constants_by_column);
+            collect_ordered_prefix_column_constants(argument, constants_by_column);
         }
         return;
     }
 
-    if let Some((column, value)) = extract_btree_prefix_column_constant(expr) {
+    if let Some((column, value)) = extract_ordered_prefix_column_constant(expr) {
         constants_by_column.insert(column, value);
     }
 }
 
-fn extract_btree_prefix_column_constant(expr: &ScalarExpr) -> Option<(Symbol, Scalar)> {
+fn extract_ordered_prefix_column_constant(expr: &ScalarExpr) -> Option<(Symbol, Scalar)> {
     if let Some(column) = extract_is_null_column(expr) {
         return Some((column, Scalar::Null));
     }
@@ -1642,7 +1642,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_btree_prefix_constants_collect_eq_and_is_null() {
+    fn test_ordered_prefix_constants_collect_eq_and_is_null() {
         let platform = Symbol::new(0);
         let tag = Symbol::new(1);
         let expr = and(
@@ -1658,7 +1658,7 @@ mod tests {
         );
 
         let mut constants_by_column = HashMap::new();
-        collect_btree_prefix_column_constants(&expr, &mut constants_by_column);
+        collect_ordered_prefix_column_constants(&expr, &mut constants_by_column);
 
         assert_eq!(
             constants_by_column.get(&platform),
@@ -1668,7 +1668,7 @@ mod tests {
     }
 
     #[test]
-    fn test_btree_prefix_constant_extracts_reversed_eq() {
+    fn test_ordered_prefix_constant_extracts_reversed_eq() {
         let wallet = Symbol::new(0);
         let expr = eq(
             ConstantExpr {
@@ -1680,30 +1680,30 @@ mod tests {
         );
 
         assert_eq!(
-            extract_btree_prefix_column_constant(&expr),
+            extract_ordered_prefix_column_constant(&expr),
             Some((wallet, Scalar::String("wallet-a".to_string())))
         );
     }
 
     #[test]
-    fn test_btree_prefix_constant_ignores_is_not_null() {
+    fn test_ordered_prefix_constant_ignores_is_not_null() {
         let tag = Symbol::new(0);
         assert_eq!(
-            extract_btree_prefix_column_constant(&is_not_null(test_column("tag_sniper", tag))),
+            extract_ordered_prefix_column_constant(&is_not_null(test_column("tag_sniper", tag))),
             None
         );
     }
 
     #[test]
-    fn test_btree_candidate_score_prefers_longer_prefix() {
-        let shorter_payload = BtreeIndexCandidateScore {
+    fn test_ordered_candidate_score_prefers_longer_prefix() {
+        let shorter_payload = OrderedIndexCandidateScore {
             prefix_len: 2,
             extra_filter_key_columns: 0,
             preserves_order: true,
             payload_width: 3,
             key_width: 3,
         };
-        let longer_prefix = BtreeIndexCandidateScore {
+        let longer_prefix = OrderedIndexCandidateScore {
             prefix_len: 3,
             extra_filter_key_columns: 0,
             preserves_order: false,
@@ -1711,7 +1711,7 @@ mod tests {
             key_width: 4,
         };
 
-        assert!(btree_candidate_score_is_better(
+        assert!(ordered_candidate_score_is_better(
             &longer_prefix,
             "idx_longer_prefix",
             &shorter_payload,
@@ -1720,15 +1720,15 @@ mod tests {
     }
 
     #[test]
-    fn test_btree_candidate_score_prefers_order_preserving_before_extra_filter_keys() {
-        let no_extra_filter_keys = BtreeIndexCandidateScore {
+    fn test_ordered_candidate_score_prefers_order_preserving_before_extra_filter_keys() {
+        let no_extra_filter_keys = OrderedIndexCandidateScore {
             prefix_len: 2,
             extra_filter_key_columns: 0,
             preserves_order: true,
             payload_width: 3,
             key_width: 3,
         };
-        let with_extra_filter_keys = BtreeIndexCandidateScore {
+        let with_extra_filter_keys = OrderedIndexCandidateScore {
             prefix_len: 2,
             extra_filter_key_columns: 2,
             preserves_order: false,
@@ -1736,7 +1736,7 @@ mod tests {
             key_width: 5,
         };
 
-        assert!(btree_candidate_score_is_better(
+        assert!(ordered_candidate_score_is_better(
             &no_extra_filter_keys,
             "idx_plain",
             &with_extra_filter_keys,
@@ -1745,15 +1745,15 @@ mod tests {
     }
 
     #[test]
-    fn test_btree_candidate_score_prefers_extra_filter_key_columns_on_order_tie() {
-        let no_extra_filter_keys = BtreeIndexCandidateScore {
+    fn test_ordered_candidate_score_prefers_extra_filter_key_columns_on_order_tie() {
+        let no_extra_filter_keys = OrderedIndexCandidateScore {
             prefix_len: 2,
             extra_filter_key_columns: 0,
             preserves_order: true,
             payload_width: 3,
             key_width: 3,
         };
-        let with_extra_filter_keys = BtreeIndexCandidateScore {
+        let with_extra_filter_keys = OrderedIndexCandidateScore {
             prefix_len: 2,
             extra_filter_key_columns: 2,
             preserves_order: true,
@@ -1761,7 +1761,7 @@ mod tests {
             key_width: 5,
         };
 
-        assert!(btree_candidate_score_is_better(
+        assert!(ordered_candidate_score_is_better(
             &with_extra_filter_keys,
             "idx_with_tags",
             &no_extra_filter_keys,
@@ -1770,15 +1770,15 @@ mod tests {
     }
 
     #[test]
-    fn test_btree_candidate_score_prefers_order_preserving_on_tie() {
-        let filter_only = BtreeIndexCandidateScore {
+    fn test_ordered_candidate_score_prefers_order_preserving_on_tie() {
+        let filter_only = OrderedIndexCandidateScore {
             prefix_len: 2,
             extra_filter_key_columns: 1,
             preserves_order: false,
             payload_width: 3,
             key_width: 4,
         };
-        let ordered = BtreeIndexCandidateScore {
+        let ordered = OrderedIndexCandidateScore {
             prefix_len: 2,
             extra_filter_key_columns: 1,
             preserves_order: true,
@@ -1786,7 +1786,7 @@ mod tests {
             key_width: 5,
         };
 
-        assert!(btree_candidate_score_is_better(
+        assert!(ordered_candidate_score_is_better(
             &ordered,
             "idx_ordered",
             &filter_only,
@@ -1795,15 +1795,15 @@ mod tests {
     }
 
     #[test]
-    fn test_btree_candidate_score_prefers_narrower_payload_on_tie() {
-        let wide_payload = BtreeIndexCandidateScore {
+    fn test_ordered_candidate_score_prefers_narrower_payload_on_tie() {
+        let wide_payload = OrderedIndexCandidateScore {
             prefix_len: 2,
             extra_filter_key_columns: 1,
             preserves_order: true,
             payload_width: 20,
             key_width: 5,
         };
-        let narrow_payload = BtreeIndexCandidateScore {
+        let narrow_payload = OrderedIndexCandidateScore {
             prefix_len: 2,
             extra_filter_key_columns: 1,
             preserves_order: true,
@@ -1811,7 +1811,7 @@ mod tests {
             key_width: 5,
         };
 
-        assert!(btree_candidate_score_is_better(
+        assert!(ordered_candidate_score_is_better(
             &narrow_payload,
             "idx_narrow",
             &wide_payload,

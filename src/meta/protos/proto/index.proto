@@ -62,7 +62,7 @@ message MarkedDeletedIndexMeta {
     NGRAM = 2;
     VECTOR = 3;
     SPATIAL = 4;
-    BTREE = 5;
+    ORDERED = 5;
   }
 
   uint64 ver = 100;

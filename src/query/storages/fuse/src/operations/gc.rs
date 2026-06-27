@@ -51,8 +51,8 @@ use log::warn;
 
 use crate::FUSE_TBL_SNAPSHOT_PREFIX;
 use crate::FuseTable;
-use crate::index::BtreeIndexFile;
 use crate::index::InvertedIndexFile;
+use crate::index::OrderedIndexFile;
 use crate::io::InvertedIndexReader;
 use crate::io::SegmentsIO;
 use crate::io::SnapshotLiteExtended;
@@ -370,9 +370,9 @@ impl FuseTable {
                                 ),
                             );
                         }
-                        TableIndexType::Btree => {
+                        TableIndexType::Ordered => {
                             purge_files.push(
-                                TableMetaLocationGenerator::gen_btree_index_location_from_block_location(
+                                TableMetaLocationGenerator::gen_ordered_index_location_from_block_location(
                                     loc,
                                     idx.name.as_str(),
                                     idx.version.as_str(),
@@ -424,7 +424,7 @@ impl FuseTable {
 
             let mut blocks_to_be_purged = HashSet::new();
             let mut agg_indexes_to_be_purged = HashSet::new();
-            let mut btree_indexes_to_be_purged = HashSet::new();
+            let mut ordered_indexes_to_be_purged = HashSet::new();
             let mut inverted_indexes_to_be_purged = HashSet::new();
             for loc in &locations.block_location {
                 if locations_referenced_by_root.block_location.contains(loc) {
@@ -450,9 +450,9 @@ impl FuseTable {
                                 ),
                             );
                         }
-                        TableIndexType::Btree => {
-                            btree_indexes_to_be_purged.insert(
-                                TableMetaLocationGenerator::gen_btree_index_location_from_block_location(
+                        TableIndexType::Ordered => {
+                            ordered_indexes_to_be_purged.insert(
+                                TableMetaLocationGenerator::gen_ordered_index_location_from_block_location(
                                     loc,
                                     idx.name.as_str(),
                                     idx.version.as_str(),
@@ -504,7 +504,7 @@ impl FuseTable {
                 counter,
                 blocks_to_be_purged,
                 agg_indexes_to_be_purged,
-                btree_indexes_to_be_purged,
+                ordered_indexes_to_be_purged,
                 inverted_indexes_to_be_purged,
                 blooms_to_be_purged,
                 stats_to_be_purged,
@@ -523,7 +523,7 @@ impl FuseTable {
         counter: &mut PurgeCounter,
         blocks_to_be_purged: HashSet<String>,
         agg_indexes_to_be_purged: HashSet<String>,
-        btree_indexes_to_be_purged: HashSet<String>,
+        ordered_indexes_to_be_purged: HashSet<String>,
         inverted_indexes_to_be_purged: HashSet<String>,
         blooms_to_be_purged: HashSet<String>,
         stats_to_be_purged: HashSet<String>,
@@ -544,12 +544,12 @@ impl FuseTable {
                 .await?;
         }
 
-        let btree_index_count = btree_indexes_to_be_purged.len();
-        if btree_index_count > 0 {
-            counter.btree_indexes += btree_index_count;
-            self.try_purge_location_files_and_cache::<BtreeIndexFile, _>(
+        let ordered_index_count = ordered_indexes_to_be_purged.len();
+        if ordered_index_count > 0 {
+            counter.ordered_indexes += ordered_index_count;
+            self.try_purge_location_files_and_cache::<OrderedIndexFile, _>(
                 ctx.clone(),
-                btree_indexes_to_be_purged,
+                ordered_indexes_to_be_purged,
             )
             .await?;
         }
@@ -915,7 +915,7 @@ struct PurgeCounter {
     start: Instant,
     blocks: usize,
     agg_indexes: usize,
-    btree_indexes: usize,
+    ordered_indexes: usize,
     inverted_indexes: usize,
     blooms: usize,
     hlls: usize,
@@ -930,7 +930,7 @@ impl PurgeCounter {
             start: Instant::now(),
             blocks: 0,
             agg_indexes: 0,
-            btree_indexes: 0,
+            ordered_indexes: 0,
             inverted_indexes: 0,
             blooms: 0,
             hlls: 0,

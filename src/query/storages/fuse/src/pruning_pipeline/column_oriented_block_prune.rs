@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use async_channel::Sender;
 use chrono::DateTime;
+use databend_common_catalog::plan::OrderedIndexInfo;
 use databend_common_catalog::plan::PartInfoPtr;
 use databend_common_catalog::plan::block_id_in_segment;
 use databend_common_exception::ErrorCode;
@@ -50,6 +51,7 @@ pub struct ColumnOrientedBlockPruneSink {
     column_ids: Vec<ColumnId>,
     sender: Option<Sender<Result<PartInfoPtr>>>,
     runtime_filter_prune_context: Option<RuntimeFilterPruneContext>,
+    ordered_index: Option<OrderedIndexInfo>,
 }
 
 impl ColumnOrientedBlockPruneSink {
@@ -59,6 +61,7 @@ impl ColumnOrientedBlockPruneSink {
         sender: Sender<Result<PartInfoPtr>>,
         column_ids: Vec<ColumnId>,
         runtime_filter_prune_context: Option<RuntimeFilterPruneContext>,
+        ordered_index: Option<OrderedIndexInfo>,
     ) -> Result<ProcessorPtr> {
         Ok(ProcessorPtr::create(AsyncSinker::create(
             input,
@@ -67,6 +70,7 @@ impl ColumnOrientedBlockPruneSink {
                 column_ids,
                 sender: Some(sender),
                 runtime_filter_prune_context,
+                ordered_index,
             },
         )))
     }
@@ -106,6 +110,115 @@ impl AsyncSink for ColumnOrientedBlockPruneSink {
         let bloom_index_size_col = segment.bloom_filter_index_size_col();
         let block_size_col = segment.block_size_col();
         let row_count_col = segment.row_count_col();
+
+        if self.ordered_index.is_some() {
+            let ordered_index_size_col = segment.col_by_name(&[ORDERED_INDEX_SIZE]).unwrap();
+            for block_idx in 0..block_num {
+                let location_path = location_path_col.index(block_idx).unwrap().to_string();
+
+                if self
+                    .block_pruner
+                    .pruning_ctx
+                    .internal_column_pruner
+                    .as_ref()
+                    .is_some_and(|pruner| !pruner.should_keep(BLOCK_NAME_COL_NAME, &location_path))
+                {
+                    continue;
+                }
+
+                let mut columns_stat = HashMap::with_capacity(self.column_ids.len());
+                for column_id in &self.column_ids {
+                    if let Some(stat) = segment.stat_col(*column_id) {
+                        let stat = stat.index(block_idx).unwrap();
+                        let stat = stat.as_tuple().unwrap();
+                        let min = stat[0].to_owned();
+                        let max = stat[1].to_owned();
+                        let null_count = stat[2].as_number().unwrap().as_u_int64().unwrap();
+                        let in_memory_size = stat[3].as_number().unwrap().as_u_int64().unwrap();
+                        let distinct_of_values = match stat[4] {
+                            ScalarRef::Number(number_scalar) => {
+                                Some(*number_scalar.as_u_int64().unwrap())
+                            }
+                            ScalarRef::Null => None,
+                            _ => unreachable!(),
+                        };
+                        columns_stat.insert(
+                            *column_id,
+                            ColumnStatistics::new(
+                                min,
+                                max,
+                                *null_count,
+                                *in_memory_size,
+                                distinct_of_values,
+                            ),
+                        );
+                    }
+                }
+
+                let row_count = row_count_col[block_idx];
+                let range_input = RangeIndexInput::from_columns(&columns_stat);
+                if !range_pruner.should_keep(&range_input, None) {
+                    continue;
+                }
+
+                if runtime_stats_pruner.as_ref().is_some_and(|pruner| {
+                    pruner.should_prune(Some(&columns_stat), row_count as usize)
+                }) {
+                    continue;
+                }
+
+                let compression = Compression::from_u8(compression_col[block_idx]);
+                let create_on = create_on_col.index(block_idx).unwrap();
+                let create_on = match create_on {
+                    ScalarRef::Null => None,
+                    ScalarRef::Number(number_scalar) => Some(
+                        DateTime::from_timestamp(*number_scalar.as_int64().unwrap(), 0).unwrap(),
+                    ),
+                    _ => unreachable!(),
+                };
+                let ordered_index_size = match ordered_index_size_col.index(block_idx).unwrap() {
+                    ScalarRef::Null => None,
+                    ScalarRef::Number(number_scalar) => Some(*number_scalar.as_u_int64().unwrap()),
+                    _ => unreachable!(),
+                };
+
+                let block_meta_index = BlockMetaIndex {
+                    segment_idx: segment_location.segment_idx,
+                    block_idx,
+                    range: None,
+                    page_size: row_count as usize,
+                    block_id: block_id_in_segment(block_num, block_idx),
+                    block_location: location_path.clone(),
+                    segment_location: segment_location.location.0.clone(),
+                    snapshot_location: segment_location.snapshot_loc.clone(),
+                    matched_rows: None,
+                    matched_scores: None,
+                    vector_scores: None,
+                    virtual_block_meta: None,
+                };
+
+                let part_info = FuseBlockPartInfo::create(
+                    location_path,
+                    None,
+                    0,
+                    None,
+                    0,
+                    ordered_index_size,
+                    row_count,
+                    HashMap::new(),
+                    Some(columns_stat),
+                    None,
+                    compression,
+                    None,
+                    None,
+                    Some(block_meta_index),
+                    create_on,
+                );
+
+                let _ = self.sender.as_ref().unwrap().send(Ok(part_info)).await;
+            }
+            return Ok(false);
+        }
 
         let pruning_runtime = &self.block_pruner.pruning_ctx.pruning_runtime;
         let pruning_semaphore = &self.block_pruner.pruning_ctx.pruning_semaphore;

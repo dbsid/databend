@@ -73,6 +73,7 @@ use databend_storages_common_table_meta::meta::column_oriented_segment::FILE_SIZ
 use databend_storages_common_table_meta::meta::column_oriented_segment::INVERTED_INDEX_SIZE;
 use databend_storages_common_table_meta::meta::column_oriented_segment::LOCATION;
 use databend_storages_common_table_meta::meta::column_oriented_segment::NGRAM_FILTER_INDEX_SIZE;
+use databend_storages_common_table_meta::meta::column_oriented_segment::ORDERED_INDEX_SIZE;
 use databend_storages_common_table_meta::meta::column_oriented_segment::ROW_COUNT;
 use databend_storages_common_table_meta::meta::column_oriented_segment::meta_name;
 use databend_storages_common_table_meta::meta::column_oriented_segment::stat_name;
@@ -361,29 +362,39 @@ impl FuseTable {
             if let Some((stat, part)) = Self::check_prune_cache(&derterministic_cache_key) {
                 ctx.set_pruned_partitions_stats(plan_id, stat);
                 let sender = part_info_tx.clone();
+                let cached_partitions = part.partitions;
                 info!("Retrieved pruning result from cache");
                 source_pipeline.set_on_init(move || {
-                    // We cannot use the runtime associated with the query to avoid increasing its lifetime.
-                    GlobalIORuntime::instance().spawn(async move {
-                        // avoid block global io runtime
-                        let runtime =
-                            Runtime::with_worker_threads(2, Some("send-parts".to_string()))?;
-
-                        let join_handler = runtime.spawn(async move {
-                            for part in part.partitions {
-                                // the sql may be killed or early stop, ignore the error
-                                if let Err(_e) = sender.send(Ok(part)).await {
-                                    break;
-                                }
+                    if cached_partitions.len() <= max_io_requests {
+                        for part in &cached_partitions {
+                            // The query may be killed before the source pipeline starts; ignore that race.
+                            if sender.try_send(Ok(part.clone())).is_err() {
+                                break;
                             }
-                        });
-
-                        if let Err(cause) = join_handler.await {
-                            log::warn!("Join error in prune pipeline: {:?}", cause);
                         }
+                    } else {
+                        // We cannot use the runtime associated with the query to avoid increasing its lifetime.
+                        GlobalIORuntime::instance().spawn(async move {
+                            // avoid block global io runtime
+                            let runtime =
+                                Runtime::with_worker_threads(2, Some("send-parts".to_string()))?;
 
-                        Result::Ok(())
-                    });
+                            let join_handler = runtime.spawn(async move {
+                                for part in cached_partitions {
+                                    // the sql may be killed or early stop, ignore the error
+                                    if let Err(_e) = sender.send(Ok(part)).await {
+                                        break;
+                                    }
+                                }
+                            });
+
+                            if let Err(cause) = join_handler.await {
+                                log::warn!("Join error in prune pipeline: {:?}", cause);
+                            }
+
+                            Result::Ok(())
+                        });
+                    }
 
                     Ok(())
                 });
@@ -425,25 +436,35 @@ impl FuseTable {
             }
         }
         prune_pipeline.set_on_init(move || {
-            // We cannot use the runtime associated with the query to avoid increasing its lifetime.
-            GlobalIORuntime::instance().spawn(async move {
-                // avoid block global io runtime
-                let runtime = Runtime::with_worker_threads(2, Some("prune-pipeline".to_string()))?;
-                let join_handler = runtime.spawn(async move {
-                    for segment in lazy_init_segments {
-                        // the sql may be killed or early stop, ignore the error
-                        if let Err(_e) = segment_tx.send(segment).await {
-                            break;
+            if lazy_init_segments.len() <= max_io_requests {
+                for segment in &lazy_init_segments {
+                    // The query may be killed before the prune pipeline starts; ignore that race.
+                    if segment_tx.try_send(segment.clone()).is_err() {
+                        break;
+                    }
+                }
+            } else {
+                // We cannot use the runtime associated with the query to avoid increasing its lifetime.
+                GlobalIORuntime::instance().spawn(async move {
+                    // avoid block global io runtime
+                    let runtime =
+                        Runtime::with_worker_threads(2, Some("prune-pipeline".to_string()))?;
+                    let join_handler = runtime.spawn(async move {
+                        for segment in lazy_init_segments {
+                            // the sql may be killed or early stop, ignore the error
+                            if let Err(_e) = segment_tx.send(segment).await {
+                                break;
+                            }
                         }
+                        Ok::<_, ErrorCode>(())
+                    });
+
+                    if let Err(cause) = join_handler.await {
+                        log::warn!("Join error in prune pipeline: {:?}", cause);
                     }
                     Ok::<_, ErrorCode>(())
                 });
-
-                if let Err(cause) = join_handler.await {
-                    log::warn!("Join error in prune pipeline: {:?}", cause);
-                }
-                Ok::<_, ErrorCode>(())
-            });
+            }
             Ok(())
         });
 
@@ -641,14 +662,14 @@ impl FuseTable {
             pruner.table_schema.clone(),
         )?;
         let runtime_filter_prune_context_for_block = runtime_filter_prune_context.clone();
-        if let Some(btree_cluster_prefix) = &pruner.btree_cluster_prefix {
-            let btree_cluster_prefix = btree_cluster_prefix.clone();
+        if let Some(ordered_cluster_prefix) = &pruner.ordered_cluster_prefix {
+            let ordered_cluster_prefix = ordered_cluster_prefix.clone();
             prune_pipeline.add_transform(|input, output| {
-                SyncBlockPruneTransform::create_for_btree(
+                SyncBlockPruneTransform::create_for_ordered(
                     input,
                     output,
                     block_pruner.clone(),
-                    btree_cluster_prefix.clone(),
+                    ordered_cluster_prefix.clone(),
                 )
             })?;
         } else if pruner.pruning_ctx.bloom_pruner.is_some()
@@ -786,29 +807,37 @@ impl FuseTable {
     ) -> Result<()> {
         let max_threads = ctx.get_settings().get_max_threads()? as usize;
         let push_down = &pruner.push_down;
+        let ordered_index = push_down
+            .as_ref()
+            .and_then(|push_down| push_down.ordered_index.clone());
         let block_pruner = Arc::new(BlockPruner::create(pruner.pruning_ctx.clone())?);
         let runtime_filter_prune_context =
             RuntimeFilterPruneContext::try_create(ctx.clone(), scan_id, table_schema.clone())?;
 
         // Only the columns that are used in the push down will be read, cached and passed to the next pipeline.
         let projection_column_ids = {
-            let arrow_schema = self.schema().as_ref().into();
-            let column_nodes = ColumnNodes::new_from_schema(&arrow_schema, Some(&self.schema()));
-            let column_nodes = match push_down.as_ref().and_then(|p| p.projection.as_ref()) {
-                Some(projection) => {
-                    match push_down.as_ref().and_then(|p| p.output_columns.as_ref()) {
-                        Some(output_columns) => {
-                            output_columns.project_column_nodes(&column_nodes)?
+            if ordered_index.is_some() {
+                Vec::new()
+            } else {
+                let arrow_schema = self.schema().as_ref().into();
+                let column_nodes =
+                    ColumnNodes::new_from_schema(&arrow_schema, Some(&self.schema()));
+                let column_nodes = match push_down.as_ref().and_then(|p| p.projection.as_ref()) {
+                    Some(projection) => {
+                        match push_down.as_ref().and_then(|p| p.output_columns.as_ref()) {
+                            Some(output_columns) => {
+                                output_columns.project_column_nodes(&column_nodes)?
+                            }
+                            None => projection.project_column_nodes(&column_nodes)?,
                         }
-                        None => projection.project_column_nodes(&column_nodes)?,
                     }
-                }
-                None => column_nodes.column_nodes.iter().collect(),
-            };
-            column_nodes
-                .iter()
-                .flat_map(|c| c.leaf_column_ids.clone())
-                .collect::<Vec<_>>()
+                    None => column_nodes.column_nodes.iter().collect(),
+                };
+                column_nodes
+                    .iter()
+                    .flat_map(|c| c.leaf_column_ids.clone())
+                    .collect::<Vec<_>>()
+            }
         };
         let filter_column_ids = match push_down
             .as_ref()
@@ -858,6 +887,7 @@ impl FuseTable {
         segment_column_projection.insert(BLOOM_FILTER_INDEX_SIZE.to_string());
         segment_column_projection.insert(NGRAM_FILTER_INDEX_SIZE.to_string());
         segment_column_projection.insert(INVERTED_INDEX_SIZE.to_string());
+        segment_column_projection.insert(ORDERED_INDEX_SIZE.to_string());
         segment_column_projection.insert(COMPRESSION.to_string());
         segment_column_projection.insert(CREATE_ON.to_string());
         let segment_pruner = SegmentPruner::create(
@@ -886,6 +916,7 @@ impl FuseTable {
                 part_info_tx.clone(),
                 block_prune_column_ids.clone(),
                 runtime_filter_prune_context.clone(),
+                ordered_index.clone(),
             )
         })?;
         // TODO(Sky): populate prune cache , deal with topn prune
@@ -1455,7 +1486,7 @@ impl FuseTable {
             meta.bloom_filter_index_size,
             meta.spatial_index_location.clone(),
             meta.spatial_index_size.unwrap_or(0),
-            meta.btree_index_size,
+            meta.ordered_index_size,
             rows_count,
             columns_meta,
             Some(columns_stats),
@@ -1522,7 +1553,7 @@ impl FuseTable {
             meta.bloom_filter_index_size,
             meta.spatial_index_location.clone(),
             meta.spatial_index_size.unwrap_or(0),
-            meta.btree_index_size,
+            meta.ordered_index_size,
             rows_count,
             columns_meta,
             Some(columns_stat),

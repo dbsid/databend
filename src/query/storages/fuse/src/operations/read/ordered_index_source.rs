@@ -20,10 +20,10 @@ use std::time::Instant;
 use async_channel::Receiver;
 use databend_common_base::runtime::profile::Profile;
 use databend_common_base::runtime::profile::ProfileStatisticsName;
-use databend_common_catalog::plan::BtreeIndexColumnOrder;
-use databend_common_catalog::plan::BtreeIndexInfo;
 use databend_common_catalog::plan::DataSourcePlan;
 use databend_common_catalog::plan::Filters;
+use databend_common_catalog::plan::OrderedIndexColumnOrder;
+use databend_common_catalog::plan::OrderedIndexInfo;
 use databend_common_catalog::plan::PartInfoPtr;
 use databend_common_catalog::plan::StealablePartitions;
 use databend_common_catalog::table_context::TableContext;
@@ -55,93 +55,94 @@ use databend_common_pipeline::sources::AsyncSourcer;
 use databend_storages_common_cache::CacheAccessor;
 use databend_storages_common_cache::CacheValue;
 use databend_storages_common_cache::InMemoryLruCache;
-use databend_storages_common_index::BtreeIndexDataBlockMeta;
-use databend_storages_common_index::BtreeIndexFileMeta;
-use databend_storages_common_index::BtreeIndexKeyOrder;
-use databend_storages_common_index::BtreeIndexRow;
-use databend_storages_common_index::btree_equality_prefix;
-use databend_storages_common_index::decode_btree_payload;
-use databend_storages_common_index::decode_btree_payload_projection;
-use databend_storages_common_index::encode_btree_key_component;
+use databend_storages_common_index::OrderedIndexDataBlockMeta;
+use databend_storages_common_index::OrderedIndexFileMeta;
+use databend_storages_common_index::OrderedIndexKeyOrder;
+use databend_storages_common_index::OrderedIndexRow;
+use databend_storages_common_index::decode_ordered_payload;
+use databend_storages_common_index::decode_ordered_payload_projection;
+use databend_storages_common_index::encode_ordered_key_component;
 use databend_storages_common_index::filters::BloomFilter;
 use databend_storages_common_index::filters::Filter as _;
+use databend_storages_common_index::ordered_equality_prefix;
 use futures::future;
 use opendal::Operator;
 use sha2::Digest;
 
 use crate::fuse_part::FuseBlockPartInfo;
 use crate::io::TableMetaLocationGenerator;
-use crate::io::load_btree_index_data_block;
-use crate::io::load_btree_index_meta;
+use crate::io::load_ordered_index_data_block;
+use crate::io::load_ordered_index_meta;
 
-const BTREE_INDEX_DATA_BLOCK_READ_BATCH_SIZE: usize = 32;
-const BTREE_DECODED_PAYLOAD_ROW_CACHE_ITEMS: usize = 65536;
-const BTREE_DECODED_EQUALITY_PREFIX_BLOOM_CACHE_ITEMS: usize = 8192;
+const ORDERED_INDEX_DATA_BLOCK_READ_BATCH_SIZE: usize = 32;
+const ORDERED_DECODED_PAYLOAD_ROW_CACHE_ITEMS: usize = 65536;
+const ORDERED_DECODED_EQUALITY_PREFIX_BLOOM_CACHE_ITEMS: usize = 8192;
 
-static BTREE_DECODED_PAYLOAD_ROW_CACHE: LazyLock<InMemoryLruCache<BtreeIndexDecodedPayloadRow>> =
-    LazyLock::new(|| {
-        InMemoryLruCache::with_items_capacity(
-            "btree_index_decoded_payload_row".to_string(),
-            BTREE_DECODED_PAYLOAD_ROW_CACHE_ITEMS,
-        )
-    });
-
-static BTREE_DECODED_EQUALITY_PREFIX_BLOOM_CACHE: LazyLock<
-    InMemoryLruCache<BtreeIndexDecodedEqualityPrefixBloom>,
+static ORDERED_DECODED_PAYLOAD_ROW_CACHE: LazyLock<
+    InMemoryLruCache<OrderedIndexDecodedPayloadRow>,
 > = LazyLock::new(|| {
     InMemoryLruCache::with_items_capacity(
-        "btree_index_decoded_equality_prefix_bloom".to_string(),
-        BTREE_DECODED_EQUALITY_PREFIX_BLOOM_CACHE_ITEMS,
+        "ordered_index_decoded_payload_row".to_string(),
+        ORDERED_DECODED_PAYLOAD_ROW_CACHE_ITEMS,
+    )
+});
+
+static ORDERED_DECODED_EQUALITY_PREFIX_BLOOM_CACHE: LazyLock<
+    InMemoryLruCache<OrderedIndexDecodedEqualityPrefixBloom>,
+> = LazyLock::new(|| {
+    InMemoryLruCache::with_items_capacity(
+        "ordered_index_decoded_equality_prefix_bloom".to_string(),
+        ORDERED_DECODED_EQUALITY_PREFIX_BLOOM_CACHE_ITEMS,
     )
 });
 
 #[derive(Clone)]
-struct BtreeIndexDecodedPayloadRow {
+struct OrderedIndexDecodedPayloadRow {
     row: Vec<Scalar>,
 }
 
-impl From<BtreeIndexDecodedPayloadRow> for CacheValue<BtreeIndexDecodedPayloadRow> {
-    fn from(value: BtreeIndexDecodedPayloadRow) -> Self {
-        let mem_bytes =
-            std::mem::size_of::<BtreeIndexDecodedPayloadRow>() + scalar_rows_mem_bytes(&value.row);
+impl From<OrderedIndexDecodedPayloadRow> for CacheValue<OrderedIndexDecodedPayloadRow> {
+    fn from(value: OrderedIndexDecodedPayloadRow) -> Self {
+        let mem_bytes = std::mem::size_of::<OrderedIndexDecodedPayloadRow>()
+            + scalar_rows_mem_bytes(&value.row);
         CacheValue::new(value, mem_bytes)
     }
 }
 
 #[derive(Clone)]
-struct BtreeIndexDecodedEqualityPrefixBloom {
+struct OrderedIndexDecodedEqualityPrefixBloom {
     filter: Option<Arc<BloomFilter>>,
     mem_bytes: usize,
 }
 
-impl From<BtreeIndexDecodedEqualityPrefixBloom>
-    for CacheValue<BtreeIndexDecodedEqualityPrefixBloom>
+impl From<OrderedIndexDecodedEqualityPrefixBloom>
+    for CacheValue<OrderedIndexDecodedEqualityPrefixBloom>
 {
-    fn from(value: BtreeIndexDecodedEqualityPrefixBloom) -> Self {
+    fn from(value: OrderedIndexDecodedEqualityPrefixBloom) -> Self {
         let mem_bytes =
-            value.mem_bytes + std::mem::size_of::<BtreeIndexDecodedEqualityPrefixBloom>();
+            value.mem_bytes + std::mem::size_of::<OrderedIndexDecodedEqualityPrefixBloom>();
         CacheValue::new(value, mem_bytes)
     }
 }
 
-pub fn build_btree_index_source_pipeline(
+pub fn build_ordered_index_source_pipeline(
     ctx: Arc<dyn TableContext>,
     operator: Operator,
     pipeline: &mut Pipeline,
     plan: &DataSourcePlan,
-    btree_index: BtreeIndexInfo,
+    ordered_index: OrderedIndexInfo,
     max_threads: usize,
     receiver: Option<Receiver<Result<PartInfoPtr>>>,
 ) -> Result<()> {
     let _ = max_threads;
-    // BTREE scans merge candidates globally to preserve ordered limit semantics.
+    // ORDERED scans merge candidates globally to preserve ordered limit semantics.
     let max_threads = 1;
     let partitions =
         crate::operations::read::fuse_source::dispatch_partitions(ctx.clone(), plan, max_threads);
     let partitions = StealablePartitions::new(partitions, ctx.clone());
     let output_schema: DataSchema = plan.schema().as_ref().into();
     let payload_schema: DataSchema = DataSchema::new(
-        btree_index
+        ordered_index
             .payload_fields
             .iter()
             .map(|field| {
@@ -159,7 +160,7 @@ pub fn build_btree_index_source_pipeline(
         let output = OutputPort::create();
         source_builder.add_source(
             output.clone(),
-            BtreeIndexSource::create(
+            OrderedIndexSource::create(
                 ctx.clone(),
                 output,
                 operator.clone(),
@@ -168,7 +169,7 @@ pub fn build_btree_index_source_pipeline(
                 func_ctx.clone(),
                 Some(partitions.clone()),
                 receiver.clone(),
-                btree_index.clone(),
+                ordered_index.clone(),
                 worker_id,
             )?,
         );
@@ -177,19 +178,19 @@ pub fn build_btree_index_source_pipeline(
     Ok(())
 }
 
-struct BtreeIndexSource {
+struct OrderedIndexSource {
     operator: Operator,
     output_schema: DataSchema,
     payload_schema: DataSchema,
     func_ctx: FunctionContext,
     partitions: Option<StealablePartitions>,
     receiver: Option<Receiver<Result<PartInfoPtr>>>,
-    btree_index: BtreeIndexInfo,
+    ordered_index: OrderedIndexInfo,
     worker_id: usize,
     is_finished: bool,
 }
 
-impl BtreeIndexSource {
+impl OrderedIndexSource {
     #[allow(clippy::too_many_arguments)]
     fn create(
         ctx: Arc<dyn TableContext>,
@@ -200,7 +201,7 @@ impl BtreeIndexSource {
         func_ctx: FunctionContext,
         partitions: Option<StealablePartitions>,
         receiver: Option<Receiver<Result<PartInfoPtr>>>,
-        btree_index: BtreeIndexInfo,
+        ordered_index: OrderedIndexInfo,
         worker_id: usize,
     ) -> Result<databend_common_pipeline::core::ProcessorPtr> {
         AsyncSourcer::create(ctx.get_scan_progress(), output, Self {
@@ -210,7 +211,7 @@ impl BtreeIndexSource {
             func_ctx,
             partitions,
             receiver,
-            btree_index,
+            ordered_index,
             worker_id,
             is_finished: false,
         })
@@ -218,8 +219,8 @@ impl BtreeIndexSource {
 }
 
 #[async_trait::async_trait]
-impl AsyncSource for BtreeIndexSource {
-    const NAME: &'static str = "BtreeIndexSource";
+impl AsyncSource for OrderedIndexSource {
+    const NAME: &'static str = "OrderedIndexSource";
 
     #[async_backtrace::framed]
     async fn generate(&mut self) -> Result<Option<DataBlock>> {
@@ -228,8 +229,8 @@ impl AsyncSource for BtreeIndexSource {
         }
         self.is_finished = true;
 
-        let prefix = encode_prefix(&self.btree_index)?;
-        let filter = self.build_filter_expr(self.btree_index.filters.as_ref())?;
+        let prefix = encode_prefix(&self.ordered_index)?;
+        let filter = self.build_filter_expr(self.ordered_index.filters.as_ref())?;
         let candidate_read_start = Instant::now();
         let mut candidates = Vec::new();
         while let Some(parts) = self.fetch_parts().await? {
@@ -244,7 +245,7 @@ impl AsyncSource for BtreeIndexSource {
                     .await?,
             );
             record_elapsed(
-                ProfileStatisticsName::BtreeIndexCandidateCollectTime,
+                ProfileStatisticsName::OrderedIndexCandidateCollectTime,
                 candidate_collect_start,
             );
         }
@@ -253,7 +254,7 @@ impl AsyncSource for BtreeIndexSource {
             .read_candidate_rows(candidates, &prefix, filter.as_ref())
             .await?;
         record_elapsed(
-            ProfileStatisticsName::BtreeIndexCandidateReadTime,
+            ProfileStatisticsName::OrderedIndexCandidateReadTime,
             candidate_read_start,
         );
         if rows.is_empty() {
@@ -262,47 +263,47 @@ impl AsyncSource for BtreeIndexSource {
         let decode_start = Instant::now();
         let mut decoded_rows = Vec::with_capacity(rows.len());
         for row in rows {
-            decoded_rows.push(decode_btree_payload_cached(&row.encoded_row_payload)?);
+            decoded_rows.push(decode_ordered_payload_cached(&row.encoded_row_payload)?);
         }
         record_elapsed(
-            ProfileStatisticsName::BtreeIndexPayloadDecodeTime,
+            ProfileStatisticsName::OrderedIndexPayloadDecodeTime,
             decode_start,
         );
 
         let output_build_start = Instant::now();
-        let mut block = payload_rows_to_block(&self.btree_index.payload_fields, decoded_rows)?;
+        let mut block = payload_rows_to_block(&self.ordered_index.payload_fields, decoded_rows)?;
         block = block.resort(&self.payload_schema, &self.output_schema)?;
         record_elapsed(
-            ProfileStatisticsName::BtreeIndexOutputBuildTime,
+            ProfileStatisticsName::OrderedIndexOutputBuildTime,
             output_build_start,
         );
         Ok(Some(block))
     }
 }
 
-struct BtreeIndexCandidateBlock {
+struct OrderedIndexCandidateBlock {
     index_location: String,
-    meta: Arc<BtreeIndexFileMeta>,
-    block_meta: BtreeIndexDataBlockMeta,
+    meta: Arc<OrderedIndexFileMeta>,
+    block_meta: OrderedIndexDataBlockMeta,
 }
 
-struct BtreeIndexFilter {
+struct OrderedIndexFilter {
     expr: Option<Expr<usize>>,
     payload_field_indexes: Vec<usize>,
     payload_fields: Vec<TableField>,
-    key_predicates: Vec<BtreeIndexKeyPredicate>,
-    fast_predicates: Option<Vec<BtreeIndexFastPredicate>>,
+    key_predicates: Vec<OrderedIndexKeyPredicate>,
+    fast_predicates: Option<Vec<OrderedIndexFastPredicate>>,
 }
 
 #[derive(Clone, Debug)]
-struct BtreeIndexKeyPredicate {
+struct OrderedIndexKeyPredicate {
     component_index: usize,
-    order: BtreeIndexKeyOrder,
-    kind: BtreeIndexKeyPredicateKind,
+    order: OrderedIndexKeyOrder,
+    kind: OrderedIndexKeyPredicateKind,
 }
 
 #[derive(Clone, Debug)]
-enum BtreeIndexKeyPredicateKind {
+enum OrderedIndexKeyPredicateKind {
     IsNull {
         null_component: Vec<u8>,
     },
@@ -310,21 +311,21 @@ enum BtreeIndexKeyPredicateKind {
         null_component: Vec<u8>,
     },
     Compare {
-        op: BtreeIndexFastCompareOp,
+        op: OrderedIndexFastCompareOp,
         constant_component: Vec<u8>,
         null_component: Vec<u8>,
     },
 }
 
 #[derive(Clone, Debug)]
-struct BtreeIndexKeyField {
+struct OrderedIndexKeyField {
     component_index: usize,
-    order: BtreeIndexKeyOrder,
+    order: OrderedIndexKeyOrder,
     data_type: TableDataType,
 }
 
 #[derive(Clone, Debug)]
-enum BtreeIndexFastPredicate {
+enum OrderedIndexFastPredicate {
     IsNull {
         column: usize,
     },
@@ -333,13 +334,13 @@ enum BtreeIndexFastPredicate {
     },
     Compare {
         column: usize,
-        op: BtreeIndexFastCompareOp,
+        op: OrderedIndexFastCompareOp,
         constant: Scalar,
     },
 }
 
 #[derive(Clone, Copy, Debug)]
-enum BtreeIndexFastCompareOp {
+enum OrderedIndexFastCompareOp {
     Eq,
     NotEq,
     Gt,
@@ -348,7 +349,7 @@ enum BtreeIndexFastCompareOp {
     Lte,
 }
 
-impl BtreeIndexSource {
+impl OrderedIndexSource {
     async fn fetch_parts(&self) -> Result<Option<Vec<PartInfoPtr>>> {
         if let Some(receiver) = &self.receiver {
             return match receiver.recv().await {
@@ -363,7 +364,7 @@ impl BtreeIndexSource {
             .and_then(|partitions| partitions.steal(self.worker_id, 8)))
     }
 
-    fn build_filter_expr(&self, filters: Option<&Filters>) -> Result<Option<BtreeIndexFilter>> {
+    fn build_filter_expr(&self, filters: Option<&Filters>) -> Result<Option<OrderedIndexFilter>> {
         let Some(filters) = filters else {
             return Ok(None);
         };
@@ -371,11 +372,11 @@ impl BtreeIndexSource {
             .filter
             .as_expr(&BUILTIN_FUNCTIONS)
             .project_column_ref(|name| self.payload_schema.index_of(name))?;
-        let prefix_equalities = self.btree_prefix_payload_equalities()?;
-        let fast_predicates = compile_btree_fast_predicates(&expr, &prefix_equalities);
-        let key_fields = self.btree_key_fields_by_payload_index()?;
+        let prefix_equalities = self.ordered_prefix_payload_equalities()?;
+        let fast_predicates = compile_ordered_fast_predicates(&expr, &prefix_equalities);
+        let key_fields = self.ordered_key_fields_by_payload_index()?;
         let (mut key_predicates, fast_predicates) = if let Some(predicates) = fast_predicates {
-            split_btree_fast_predicates(predicates, &key_fields)?
+            split_ordered_fast_predicates(predicates, &key_fields)?
         } else {
             (Vec::new(), None)
         };
@@ -393,15 +394,15 @@ impl BtreeIndexSource {
         let payload_fields = payload_field_indexes
             .iter()
             .map(|index| {
-                self.btree_index
+                self.ordered_index
                     .payload_fields
                     .get(*index)
                     .cloned()
                     .ok_or_else(|| {
                         ErrorCode::StorageOther(format!(
-                            "btree filter references missing payload column {}, width {}",
+                            "ordered filter references missing payload column {}, width {}",
                             index,
-                            self.btree_index.payload_fields.len()
+                            self.ordered_index.payload_fields.len()
                         ))
                     })
             })
@@ -424,7 +425,7 @@ impl BtreeIndexSource {
         } else {
             None
         };
-        Ok(Some(BtreeIndexFilter {
+        Ok(Some(OrderedIndexFilter {
             expr,
             payload_field_indexes,
             payload_fields,
@@ -433,13 +434,13 @@ impl BtreeIndexSource {
         }))
     }
 
-    fn btree_prefix_payload_equalities(&self) -> Result<Vec<(usize, Scalar)>> {
-        let mut equalities = Vec::with_capacity(self.btree_index.equality_prefix.len());
+    fn ordered_prefix_payload_equalities(&self) -> Result<Vec<(usize, Scalar)>> {
+        let mut equalities = Vec::with_capacity(self.ordered_index.equality_prefix.len());
         for (key_column, scalar) in self
-            .btree_index
+            .ordered_index
             .key_columns
             .iter()
-            .zip(self.btree_index.equality_prefix.iter())
+            .zip(self.ordered_index.equality_prefix.iter())
         {
             let payload_index = self.payload_schema.index_of(key_column.field.name())?;
             equalities.push((payload_index, scalar.clone()));
@@ -447,15 +448,15 @@ impl BtreeIndexSource {
         Ok(equalities)
     }
 
-    fn btree_key_fields_by_payload_index(&self) -> Result<Vec<Option<BtreeIndexKeyField>>> {
-        let mut key_fields = vec![None; self.btree_index.payload_fields.len()];
-        for (component_index, key_column) in self.btree_index.key_columns.iter().enumerate() {
+    fn ordered_key_fields_by_payload_index(&self) -> Result<Vec<Option<OrderedIndexKeyField>>> {
+        let mut key_fields = vec![None; self.ordered_index.payload_fields.len()];
+        for (component_index, key_column) in self.ordered_index.key_columns.iter().enumerate() {
             let payload_index = self.payload_schema.index_of(key_column.field.name())?;
             let order = match key_column.order {
-                BtreeIndexColumnOrder::Asc => BtreeIndexKeyOrder::Asc,
-                BtreeIndexColumnOrder::Desc => BtreeIndexKeyOrder::Desc,
+                OrderedIndexColumnOrder::Asc => OrderedIndexKeyOrder::Asc,
+                OrderedIndexColumnOrder::Desc => OrderedIndexKeyOrder::Desc,
             };
-            key_fields[payload_index] = Some(BtreeIndexKeyField {
+            key_fields[payload_index] = Some(OrderedIndexKeyField {
                 component_index,
                 order,
                 data_type: key_column.field.data_type().clone(),
@@ -466,12 +467,12 @@ impl BtreeIndexSource {
 
     fn filter_index_row_refs(
         &self,
-        rows: &[&BtreeIndexRow],
-        filter: &BtreeIndexFilter,
+        rows: &[&OrderedIndexRow],
+        filter: &OrderedIndexFilter,
         limit: Option<usize>,
         key_predicate_start_component: usize,
         key_predicate_start_offset: usize,
-    ) -> Result<Vec<BtreeIndexRow>> {
+    ) -> Result<Vec<OrderedIndexRow>> {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -480,7 +481,7 @@ impl BtreeIndexSource {
         if let Some(predicates) = &filter.fast_predicates {
             let filtered_rows = if predicates.is_empty() {
                 clone_matching_row_refs(rows, limit, |row| {
-                    evaluate_btree_key_predicates_from(
+                    evaluate_ordered_key_predicates_from(
                         &filter.key_predicates,
                         &row.encoded_key,
                         key_predicate_start_component,
@@ -490,7 +491,7 @@ impl BtreeIndexSource {
             } else {
                 let mut filtered_rows = Vec::new();
                 for row in rows {
-                    if !evaluate_btree_key_predicates_from(
+                    if !evaluate_ordered_key_predicates_from(
                         &filter.key_predicates,
                         &row.encoded_key,
                         key_predicate_start_component,
@@ -498,11 +499,11 @@ impl BtreeIndexSource {
                     ) {
                         continue;
                     }
-                    let payload_row = decode_btree_payload_projection(
+                    let payload_row = decode_ordered_payload_projection(
                         &row.encoded_row_payload,
                         &filter.payload_field_indexes,
                     )?;
-                    if evaluate_btree_fast_predicates(predicates, &payload_row) {
+                    if evaluate_ordered_fast_predicates(predicates, &payload_row) {
                         filtered_rows.push((*row).clone());
                         if limit.is_some_and(|limit| filtered_rows.len() >= limit) {
                             break;
@@ -511,14 +512,14 @@ impl BtreeIndexSource {
                 }
                 filtered_rows
             };
-            record_elapsed(ProfileStatisticsName::BtreeIndexFilterTime, start);
+            record_elapsed(ProfileStatisticsName::OrderedIndexFilterTime, start);
             return Ok(filtered_rows);
         }
 
         let payload_rows = rows
             .iter()
             .map(|row| {
-                decode_btree_payload_projection(
+                decode_ordered_payload_projection(
                     &row.encoded_row_payload,
                     &filter.payload_field_indexes,
                 )
@@ -528,7 +529,7 @@ impl BtreeIndexSource {
         let evaluator = Evaluator::new(&block, &self.func_ctx, &BUILTIN_FUNCTIONS);
         let filter = evaluator
             .run(filter.expr.as_ref().ok_or_else(|| {
-                ErrorCode::StorageOther("missing btree fallback filter expression".to_string())
+                ErrorCode::StorageOther("missing ordered fallback filter expression".to_string())
             })?)?
             .try_downcast::<BooleanType>()
             .unwrap();
@@ -549,7 +550,7 @@ impl BtreeIndexSource {
                 filtered_rows
             }
         };
-        record_elapsed(ProfileStatisticsName::BtreeIndexFilterTime, start);
+        record_elapsed(ProfileStatisticsName::OrderedIndexFilterTime, start);
         Ok(filtered_rows)
     }
 
@@ -557,20 +558,20 @@ impl BtreeIndexSource {
         &self,
         parts: Vec<PartInfoPtr>,
         prefix: &[u8],
-        filter: Option<&BtreeIndexFilter>,
-    ) -> Result<Vec<BtreeIndexCandidateBlock>> {
-        Profile::record_usize_profile(ProfileStatisticsName::BtreeIndexPartsScanned, parts.len());
+        filter: Option<&OrderedIndexFilter>,
+    ) -> Result<Vec<OrderedIndexCandidateBlock>> {
+        Profile::record_usize_profile(ProfileStatisticsName::OrderedIndexPartsScanned, parts.len());
         let key_predicates = filter
             .map(|filter| filter.key_predicates.clone())
             .unwrap_or_default();
-        let prefix_component_count = self.btree_index.equality_prefix.len();
+        let prefix_component_count = self.ordered_index.equality_prefix.len();
         let futures = parts.into_iter().map(|part| {
             Self::load_candidate_blocks_for_part(
                 self.operator.clone(),
                 part,
-                self.btree_index.index_name.clone(),
-                self.btree_index.index_version.clone(),
-                self.btree_index.use_block_btree_index_size_hint,
+                self.ordered_index.index_name.clone(),
+                self.ordered_index.index_version.clone(),
+                self.ordered_index.use_block_ordered_index_size_hint,
                 prefix.to_vec(),
                 prefix_component_count,
                 key_predicates.clone(),
@@ -579,7 +580,7 @@ impl BtreeIndexSource {
         let candidate_batches = future::try_join_all(futures).await?;
         let candidates = candidate_batches.into_iter().flatten().collect::<Vec<_>>();
         Profile::record_usize_profile(
-            ProfileStatisticsName::BtreeIndexCandidateBlocks,
+            ProfileStatisticsName::OrderedIndexCandidateBlocks,
             candidates.len(),
         );
         Ok(candidates)
@@ -590,22 +591,22 @@ impl BtreeIndexSource {
         part: PartInfoPtr,
         index_name: String,
         index_version: String,
-        use_block_btree_index_size_hint: bool,
+        use_block_ordered_index_size_hint: bool,
         prefix: Vec<u8>,
         prefix_component_count: usize,
-        key_predicates: Vec<BtreeIndexKeyPredicate>,
-    ) -> Result<Vec<BtreeIndexCandidateBlock>> {
+        key_predicates: Vec<OrderedIndexKeyPredicate>,
+    ) -> Result<Vec<OrderedIndexCandidateBlock>> {
         let fuse_part = FuseBlockPartInfo::from_part(&part)?;
         let index_location =
-            TableMetaLocationGenerator::gen_btree_index_location_from_block_location(
+            TableMetaLocationGenerator::gen_ordered_index_location_from_block_location(
                 &fuse_part.location,
                 &index_name,
                 &index_version,
             );
-        let len_hint = use_block_btree_index_size_hint
-            .then_some(fuse_part.btree_index_size)
+        let len_hint = use_block_ordered_index_size_hint
+            .then_some(fuse_part.ordered_index_size)
             .flatten();
-        let meta = load_btree_index_meta(operator, &index_location, len_hint).await?;
+        let meta = load_ordered_index_meta(operator, &index_location, len_hint).await?;
         if !may_contain_equality_prefix_cached(&index_location, &meta, &prefix) {
             return Ok(Vec::new());
         }
@@ -620,7 +621,7 @@ impl BtreeIndexSource {
                     &key_predicates,
                 )
             })
-            .map(|block_meta| BtreeIndexCandidateBlock {
+            .map(|block_meta| OrderedIndexCandidateBlock {
                 index_location: index_location.clone(),
                 meta: meta.clone(),
                 block_meta,
@@ -630,10 +631,10 @@ impl BtreeIndexSource {
 
     async fn read_candidate_rows(
         &self,
-        mut candidates: Vec<BtreeIndexCandidateBlock>,
+        mut candidates: Vec<OrderedIndexCandidateBlock>,
         prefix: &[u8],
-        filter: Option<&BtreeIndexFilter>,
-    ) -> Result<Vec<BtreeIndexRow>> {
+        filter: Option<&OrderedIndexFilter>,
+    ) -> Result<Vec<OrderedIndexRow>> {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
@@ -648,7 +649,7 @@ impl BtreeIndexSource {
                 .then_with(|| left.block_meta.offset.cmp(&right.block_meta.offset))
         });
         record_elapsed(
-            ProfileStatisticsName::BtreeIndexCandidateSortTime,
+            ProfileStatisticsName::OrderedIndexCandidateSortTime,
             sort_start,
         );
 
@@ -663,14 +664,14 @@ impl BtreeIndexSource {
 
     async fn read_candidate_rows_in_order(
         &self,
-        candidates: Vec<BtreeIndexCandidateBlock>,
+        candidates: Vec<OrderedIndexCandidateBlock>,
         prefix: &[u8],
-        filter: Option<&BtreeIndexFilter>,
-    ) -> Result<Vec<BtreeIndexRow>> {
-        let mut rows: Vec<BtreeIndexRow> = Vec::new();
+        filter: Option<&OrderedIndexFilter>,
+    ) -> Result<Vec<OrderedIndexRow>> {
+        let mut rows: Vec<OrderedIndexRow> = Vec::new();
         for candidate in candidates {
             let remaining = self
-                .btree_index
+                .ordered_index
                 .limit
                 .map(|limit| limit.saturating_sub(rows.len()));
             if remaining == Some(0) {
@@ -681,11 +682,11 @@ impl BtreeIndexSource {
                 .await?;
             rows.append(&mut block_rows);
             if self
-                .btree_index
+                .ordered_index
                 .limit
                 .is_some_and(|limit| rows.len() >= limit)
             {
-                rows.truncate(self.btree_index.limit.unwrap());
+                rows.truncate(self.ordered_index.limit.unwrap());
                 return Ok(rows);
             }
         }
@@ -694,13 +695,13 @@ impl BtreeIndexSource {
 
     async fn read_candidate_rows_with_sort(
         &self,
-        candidates: Vec<BtreeIndexCandidateBlock>,
+        candidates: Vec<OrderedIndexCandidateBlock>,
         prefix: &[u8],
-        filter: Option<&BtreeIndexFilter>,
-    ) -> Result<Vec<BtreeIndexRow>> {
-        let Some(limit) = self.btree_index.limit else {
+        filter: Option<&OrderedIndexFilter>,
+    ) -> Result<Vec<OrderedIndexRow>> {
+        let Some(limit) = self.ordered_index.limit else {
             let mut rows = Vec::new();
-            for batch in candidates.chunks(BTREE_INDEX_DATA_BLOCK_READ_BATCH_SIZE) {
+            for batch in candidates.chunks(ORDERED_INDEX_DATA_BLOCK_READ_BATCH_SIZE) {
                 for mut block_rows in self
                     .read_candidate_blocks_batch(batch, prefix, filter, None, None)
                     .await?
@@ -712,7 +713,7 @@ impl BtreeIndexSource {
             return Ok(rows);
         };
 
-        let mut rows: Vec<BtreeIndexRow> = Vec::new();
+        let mut rows: Vec<OrderedIndexRow> = Vec::new();
         let mut candidate_offset = 0;
         while candidate_offset < candidates.len() {
             let batch_end = candidate_offset + 1;
@@ -751,12 +752,12 @@ impl BtreeIndexSource {
 
     async fn read_candidate_blocks_batch(
         &self,
-        candidates: &[BtreeIndexCandidateBlock],
+        candidates: &[OrderedIndexCandidateBlock],
         prefix: &[u8],
-        filter: Option<&BtreeIndexFilter>,
+        filter: Option<&OrderedIndexFilter>,
         limit: Option<usize>,
         upper_bound_key: Option<&[u8]>,
-    ) -> Result<Vec<Vec<BtreeIndexRow>>> {
+    ) -> Result<Vec<Vec<OrderedIndexRow>>> {
         let futures = candidates.iter().map(|candidate| {
             self.read_candidate_block(candidate, prefix, filter, limit, upper_bound_key)
         });
@@ -765,14 +766,14 @@ impl BtreeIndexSource {
 
     async fn read_candidate_block(
         &self,
-        candidate: &BtreeIndexCandidateBlock,
+        candidate: &OrderedIndexCandidateBlock,
         prefix: &[u8],
-        filter: Option<&BtreeIndexFilter>,
+        filter: Option<&OrderedIndexFilter>,
         limit: Option<usize>,
         upper_bound_key: Option<&[u8]>,
-    ) -> Result<Vec<BtreeIndexRow>> {
+    ) -> Result<Vec<OrderedIndexRow>> {
         let load_start = Instant::now();
-        let rows = load_btree_index_data_block(
+        let rows = load_ordered_index_data_block(
             self.operator.clone(),
             &candidate.index_location,
             &candidate.meta,
@@ -780,19 +781,19 @@ impl BtreeIndexSource {
         )
         .await?;
         record_elapsed(
-            ProfileStatisticsName::BtreeIndexDataBlockLoadTime,
+            ProfileStatisticsName::OrderedIndexDataBlockLoadTime,
             load_start,
         );
-        Profile::record_usize_profile(ProfileStatisticsName::BtreeIndexRowsDecoded, rows.len());
+        Profile::record_usize_profile(ProfileStatisticsName::OrderedIndexRowsDecoded, rows.len());
         let row_select_start = Instant::now();
-        let mut rows = btree_prefix_row_refs(&rows, prefix);
+        let mut rows = ordered_prefix_row_refs(&rows, prefix);
         truncate_row_refs_before_key(&mut rows, upper_bound_key);
         let rows = if let Some(filter) = filter {
             let (key_predicate_start_component, key_predicate_start_offset) =
-                btree_key_predicate_scan_start(
+                ordered_key_predicate_scan_start(
                     filter,
                     prefix,
-                    self.btree_index.equality_prefix.len(),
+                    self.ordered_index.equality_prefix.len(),
                 );
             self.filter_index_row_refs(
                 &rows,
@@ -805,20 +806,20 @@ impl BtreeIndexSource {
             clone_row_refs(&rows, limit)
         };
         record_elapsed(
-            ProfileStatisticsName::BtreeIndexRowSelectTime,
+            ProfileStatisticsName::OrderedIndexRowSelectTime,
             row_select_start,
         );
-        Profile::record_usize_profile(ProfileStatisticsName::BtreeIndexRowsMatched, rows.len());
+        Profile::record_usize_profile(ProfileStatisticsName::OrderedIndexRowsMatched, rows.len());
         Ok(rows)
     }
 }
 
-impl BtreeIndexFastPredicate {
+impl OrderedIndexFastPredicate {
     fn column(&self) -> usize {
         match self {
-            BtreeIndexFastPredicate::IsNull { column }
-            | BtreeIndexFastPredicate::IsNotNull { column }
-            | BtreeIndexFastPredicate::Compare { column, .. } => *column,
+            OrderedIndexFastPredicate::IsNull { column }
+            | OrderedIndexFastPredicate::IsNotNull { column }
+            | OrderedIndexFastPredicate::Compare { column, .. } => *column,
         }
     }
 
@@ -829,23 +830,25 @@ impl BtreeIndexFastPredicate {
                 .position(|payload_index| *payload_index == column)
                 .ok_or_else(|| {
                     ErrorCode::StorageOther(format!(
-                        "btree fast filter references missing payload column {}",
+                        "ordered fast filter references missing payload column {}",
                         column
                     ))
                 })
         };
         Ok(match self {
-            BtreeIndexFastPredicate::IsNull { column } => BtreeIndexFastPredicate::IsNull {
+            OrderedIndexFastPredicate::IsNull { column } => OrderedIndexFastPredicate::IsNull {
                 column: remap_column(column)?,
             },
-            BtreeIndexFastPredicate::IsNotNull { column } => BtreeIndexFastPredicate::IsNotNull {
-                column: remap_column(column)?,
-            },
-            BtreeIndexFastPredicate::Compare {
+            OrderedIndexFastPredicate::IsNotNull { column } => {
+                OrderedIndexFastPredicate::IsNotNull {
+                    column: remap_column(column)?,
+                }
+            }
+            OrderedIndexFastPredicate::Compare {
                 column,
                 op,
                 constant,
-            } => BtreeIndexFastPredicate::Compare {
+            } => OrderedIndexFastPredicate::Compare {
                 column: remap_column(column)?,
                 op,
                 constant,
@@ -854,12 +857,12 @@ impl BtreeIndexFastPredicate {
     }
 }
 
-fn split_btree_fast_predicates(
-    predicates: Vec<BtreeIndexFastPredicate>,
-    key_fields: &[Option<BtreeIndexKeyField>],
+fn split_ordered_fast_predicates(
+    predicates: Vec<OrderedIndexFastPredicate>,
+    key_fields: &[Option<OrderedIndexKeyField>],
 ) -> Result<(
-    Vec<BtreeIndexKeyPredicate>,
-    Option<Vec<BtreeIndexFastPredicate>>,
+    Vec<OrderedIndexKeyPredicate>,
+    Option<Vec<OrderedIndexFastPredicate>>,
 )> {
     let mut key_predicates = Vec::new();
     let mut payload_predicates = Vec::new();
@@ -877,33 +880,33 @@ fn split_btree_fast_predicates(
     Ok((key_predicates, Some(payload_predicates)))
 }
 
-impl BtreeIndexFastPredicate {
+impl OrderedIndexFastPredicate {
     fn try_into_key_predicate(
         self,
-        key_field: &BtreeIndexKeyField,
-    ) -> Result<Option<BtreeIndexKeyPredicate>> {
+        key_field: &OrderedIndexKeyField,
+    ) -> Result<Option<OrderedIndexKeyPredicate>> {
         let null_component = encode_key_component_value(&Scalar::Null, key_field.order)?;
         let kind = match self {
-            BtreeIndexFastPredicate::IsNull { .. } => {
-                BtreeIndexKeyPredicateKind::IsNull { null_component }
+            OrderedIndexFastPredicate::IsNull { .. } => {
+                OrderedIndexKeyPredicateKind::IsNull { null_component }
             }
-            BtreeIndexFastPredicate::IsNotNull { .. } => {
-                BtreeIndexKeyPredicateKind::IsNotNull { null_component }
+            OrderedIndexFastPredicate::IsNotNull { .. } => {
+                OrderedIndexKeyPredicateKind::IsNotNull { null_component }
             }
-            BtreeIndexFastPredicate::Compare { op, constant, .. } => {
+            OrderedIndexFastPredicate::Compare { op, constant, .. } => {
                 let Some(constant) = normalize_key_filter_constant(&constant, &key_field.data_type)
                 else {
                     return Ok(None);
                 };
                 let constant_component = encode_key_component_value(&constant, key_field.order)?;
-                BtreeIndexKeyPredicateKind::Compare {
+                OrderedIndexKeyPredicateKind::Compare {
                     op,
                     constant_component,
                     null_component,
                 }
             }
         };
-        Ok(Some(BtreeIndexKeyPredicate {
+        Ok(Some(OrderedIndexKeyPredicate {
             component_index: key_field.component_index,
             order: key_field.order,
             kind,
@@ -1032,11 +1035,11 @@ fn record_elapsed(name: ProfileStatisticsName, start: Instant) {
 
 fn may_contain_equality_prefix_cached(
     index_location: &str,
-    meta: &BtreeIndexFileMeta,
+    meta: &OrderedIndexFileMeta,
     prefix: &[u8],
 ) -> bool {
     let cache_key = format!("{}#equality_prefix_bloom", index_location);
-    if let Some(cached) = BTREE_DECODED_EQUALITY_PREFIX_BLOOM_CACHE.get(&cache_key) {
+    if let Some(cached) = ORDERED_DECODED_EQUALITY_PREFIX_BLOOM_CACHE.get(&cache_key) {
         return cached
             .filter
             .as_ref()
@@ -1047,9 +1050,9 @@ fn may_contain_equality_prefix_cached(
         .ok()
         .map(|(filter, _)| Arc::new(filter));
     let may_contain = filter.as_ref().is_none_or(|filter| filter.contains(prefix));
-    BTREE_DECODED_EQUALITY_PREFIX_BLOOM_CACHE.insert(
+    ORDERED_DECODED_EQUALITY_PREFIX_BLOOM_CACHE.insert(
         cache_key,
-        BtreeIndexDecodedEqualityPrefixBloom {
+        OrderedIndexDecodedEqualityPrefixBloom {
             filter,
             mem_bytes: meta.filter_block.equality_prefix_bloom.len(),
         },
@@ -1057,7 +1060,10 @@ fn may_contain_equality_prefix_cached(
     may_contain
 }
 
-fn btree_prefix_row_refs<'a>(rows: &'a [BtreeIndexRow], prefix: &[u8]) -> Vec<&'a BtreeIndexRow> {
+fn ordered_prefix_row_refs<'a>(
+    rows: &'a [OrderedIndexRow],
+    prefix: &[u8],
+) -> Vec<&'a OrderedIndexRow> {
     if prefix.is_empty() {
         return rows.iter().collect();
     }
@@ -1070,7 +1076,7 @@ fn btree_prefix_row_refs<'a>(rows: &'a [BtreeIndexRow], prefix: &[u8]) -> Vec<&'
     rows[start..end].iter().collect()
 }
 
-fn truncate_row_refs_before_key(rows: &mut Vec<&BtreeIndexRow>, upper_bound_key: Option<&[u8]>) {
+fn truncate_row_refs_before_key(rows: &mut Vec<&OrderedIndexRow>, upper_bound_key: Option<&[u8]>) {
     let Some(upper_bound_key) = upper_bound_key else {
         return;
     };
@@ -1079,8 +1085,8 @@ fn truncate_row_refs_before_key(rows: &mut Vec<&BtreeIndexRow>, upper_bound_key:
     rows.truncate(end);
 }
 
-fn btree_key_predicate_scan_start(
-    filter: &BtreeIndexFilter,
+fn ordered_key_predicate_scan_start(
+    filter: &OrderedIndexFilter,
     prefix: &[u8],
     prefix_component_count: usize,
 ) -> (usize, usize) {
@@ -1095,7 +1101,7 @@ fn btree_key_predicate_scan_start(
     }
 }
 
-fn clone_row_refs(rows: &[&BtreeIndexRow], limit: Option<usize>) -> Vec<BtreeIndexRow> {
+fn clone_row_refs(rows: &[&OrderedIndexRow], limit: Option<usize>) -> Vec<OrderedIndexRow> {
     rows.iter()
         .take(limit.unwrap_or(usize::MAX))
         .map(|row| (*row).clone())
@@ -1103,10 +1109,10 @@ fn clone_row_refs(rows: &[&BtreeIndexRow], limit: Option<usize>) -> Vec<BtreeInd
 }
 
 fn clone_matching_row_refs(
-    rows: &[&BtreeIndexRow],
+    rows: &[&OrderedIndexRow],
     limit: Option<usize>,
-    mut predicate: impl FnMut(&BtreeIndexRow) -> bool,
-) -> Vec<BtreeIndexRow> {
+    mut predicate: impl FnMut(&OrderedIndexRow) -> bool,
+) -> Vec<OrderedIndexRow> {
     let mut result = Vec::new();
     for row in rows {
         if predicate(row) {
@@ -1119,22 +1125,22 @@ fn clone_matching_row_refs(
     result
 }
 
-fn sort_and_truncate_rows(rows: &mut Vec<BtreeIndexRow>, limit: usize) {
+fn sort_and_truncate_rows(rows: &mut Vec<OrderedIndexRow>, limit: usize) {
     rows.sort_by(|left, right| left.encoded_key.cmp(&right.encoded_key));
     rows.truncate(limit);
 }
 
-fn candidate_blocks_are_disjoint(candidates: &[BtreeIndexCandidateBlock]) -> bool {
+fn candidate_blocks_are_disjoint(candidates: &[OrderedIndexCandidateBlock]) -> bool {
     candidates
         .windows(2)
         .all(|blocks| blocks[0].block_meta.last_key < blocks[1].block_meta.first_key)
 }
 
 fn candidate_block_may_match_key_predicates(
-    block_meta: &BtreeIndexDataBlockMeta,
+    block_meta: &OrderedIndexDataBlockMeta,
     prefix: &[u8],
     prefix_component_count: usize,
-    key_predicates: &[BtreeIndexKeyPredicate],
+    key_predicates: &[OrderedIndexKeyPredicate],
 ) -> bool {
     if key_predicates.is_empty()
         || !block_meta.first_key.starts_with(prefix)
@@ -1194,7 +1200,7 @@ fn candidate_block_may_match_key_predicates(
 }
 
 fn candidate_block_has_constant_prefix_before_component(
-    block_meta: &BtreeIndexDataBlockMeta,
+    block_meta: &OrderedIndexDataBlockMeta,
     known_constant_prefix_component_count: usize,
     component_index: usize,
 ) -> bool {
@@ -1205,17 +1211,17 @@ fn candidate_block_has_constant_prefix_before_component(
         return false;
     }
 
-    let Ok(first_prefix) = btree_equality_prefix(&block_meta.first_key, component_index) else {
+    let Ok(first_prefix) = ordered_equality_prefix(&block_meta.first_key, component_index) else {
         return false;
     };
-    let Ok(last_prefix) = btree_equality_prefix(&block_meta.last_key, component_index) else {
+    let Ok(last_prefix) = ordered_equality_prefix(&block_meta.last_key, component_index) else {
         return false;
     };
     first_prefix == last_prefix
 }
 
 fn key_component_range_may_match_predicate(
-    predicate: &BtreeIndexKeyPredicate,
+    predicate: &OrderedIndexKeyPredicate,
     first_component: &[u8],
     last_component: &[u8],
 ) -> bool {
@@ -1224,14 +1230,14 @@ fn key_component_range_may_match_predicate(
     }
 
     match &predicate.kind {
-        BtreeIndexKeyPredicateKind::IsNull { null_component } => {
+        OrderedIndexKeyPredicateKind::IsNull { null_component } => {
             component_in_range(null_component, first_component, last_component)
         }
-        BtreeIndexKeyPredicateKind::IsNotNull { null_component } => {
+        OrderedIndexKeyPredicateKind::IsNotNull { null_component } => {
             !(first_component == null_component.as_slice()
                 && last_component == null_component.as_slice())
         }
-        BtreeIndexKeyPredicateKind::Compare {
+        OrderedIndexKeyPredicateKind::Compare {
             op,
             constant_component,
             null_component,
@@ -1242,28 +1248,28 @@ fn key_component_range_may_match_predicate(
                 return false;
             }
             match op {
-                BtreeIndexFastCompareOp::Eq => {
+                OrderedIndexFastCompareOp::Eq => {
                     component_in_range(constant_component, first_component, last_component)
                 }
-                BtreeIndexFastCompareOp::NotEq => {
+                OrderedIndexFastCompareOp::NotEq => {
                     first_component != constant_component.as_slice()
                         || last_component != constant_component.as_slice()
                 }
-                BtreeIndexFastCompareOp::Gt => match predicate.order {
-                    BtreeIndexKeyOrder::Asc => last_component > constant_component.as_slice(),
-                    BtreeIndexKeyOrder::Desc => first_component < constant_component.as_slice(),
+                OrderedIndexFastCompareOp::Gt => match predicate.order {
+                    OrderedIndexKeyOrder::Asc => last_component > constant_component.as_slice(),
+                    OrderedIndexKeyOrder::Desc => first_component < constant_component.as_slice(),
                 },
-                BtreeIndexFastCompareOp::Gte => match predicate.order {
-                    BtreeIndexKeyOrder::Asc => last_component >= constant_component.as_slice(),
-                    BtreeIndexKeyOrder::Desc => first_component <= constant_component.as_slice(),
+                OrderedIndexFastCompareOp::Gte => match predicate.order {
+                    OrderedIndexKeyOrder::Asc => last_component >= constant_component.as_slice(),
+                    OrderedIndexKeyOrder::Desc => first_component <= constant_component.as_slice(),
                 },
-                BtreeIndexFastCompareOp::Lt => match predicate.order {
-                    BtreeIndexKeyOrder::Asc => first_component < constant_component.as_slice(),
-                    BtreeIndexKeyOrder::Desc => last_component > constant_component.as_slice(),
+                OrderedIndexFastCompareOp::Lt => match predicate.order {
+                    OrderedIndexKeyOrder::Asc => first_component < constant_component.as_slice(),
+                    OrderedIndexKeyOrder::Desc => last_component > constant_component.as_slice(),
                 },
-                BtreeIndexFastCompareOp::Lte => match predicate.order {
-                    BtreeIndexKeyOrder::Asc => first_component <= constant_component.as_slice(),
-                    BtreeIndexKeyOrder::Desc => last_component >= constant_component.as_slice(),
+                OrderedIndexFastCompareOp::Lte => match predicate.order {
+                    OrderedIndexKeyOrder::Asc => first_component <= constant_component.as_slice(),
+                    OrderedIndexKeyOrder::Desc => last_component >= constant_component.as_slice(),
                 },
             }
         }
@@ -1274,15 +1280,16 @@ fn component_in_range(component: &[u8], first_component: &[u8], last_component: 
     first_component <= component && component <= last_component
 }
 
-fn decode_btree_payload_cached(payload: &[u8]) -> Result<Vec<Scalar>> {
+fn decode_ordered_payload_cached(payload: &[u8]) -> Result<Vec<Scalar>> {
     let cache_key = decoded_payload_cache_key(payload);
-    if let Some(cached) = BTREE_DECODED_PAYLOAD_ROW_CACHE.get(&cache_key) {
+    if let Some(cached) = ORDERED_DECODED_PAYLOAD_ROW_CACHE.get(&cache_key) {
         return Ok(cached.row.clone());
     }
 
-    let row = decode_btree_payload(payload)?;
-    BTREE_DECODED_PAYLOAD_ROW_CACHE
-        .insert(cache_key, BtreeIndexDecodedPayloadRow { row: row.clone() });
+    let row = decode_ordered_payload(payload)?;
+    ORDERED_DECODED_PAYLOAD_ROW_CACHE.insert(cache_key, OrderedIndexDecodedPayloadRow {
+        row: row.clone(),
+    });
     Ok(row)
 }
 
@@ -1308,19 +1315,19 @@ fn scalar_mem_bytes(scalar: &Scalar) -> usize {
         }
 }
 
-fn compile_btree_fast_predicates(
+fn compile_ordered_fast_predicates(
     expr: &Expr<usize>,
     prefix_equalities: &[(usize, Scalar)],
-) -> Option<Vec<BtreeIndexFastPredicate>> {
+) -> Option<Vec<OrderedIndexFastPredicate>> {
     let mut predicates = Vec::new();
-    collect_btree_fast_predicates(expr, prefix_equalities, &mut predicates)?;
+    collect_ordered_fast_predicates(expr, prefix_equalities, &mut predicates)?;
     Some(predicates)
 }
 
-fn collect_btree_fast_predicates(
+fn collect_ordered_fast_predicates(
     expr: &Expr<usize>,
     prefix_equalities: &[(usize, Scalar)],
-    predicates: &mut Vec<BtreeIndexFastPredicate>,
+    predicates: &mut Vec<OrderedIndexFastPredicate>,
 ) -> Option<()> {
     let Expr::FunctionCall(function) = expr else {
         return match expr {
@@ -1336,7 +1343,7 @@ fn collect_btree_fast_predicates(
     match name.as_ref() {
         "and" | "and_filters" => {
             for arg in &function.args {
-                collect_btree_fast_predicates(arg, prefix_equalities, predicates)?;
+                collect_ordered_fast_predicates(arg, prefix_equalities, predicates)?;
             }
             Some(())
         }
@@ -1347,7 +1354,7 @@ fn collect_btree_fast_predicates(
                 {
                     return Some(());
                 }
-                predicates.push(BtreeIndexFastPredicate::IsNull { column });
+                predicates.push(OrderedIndexFastPredicate::IsNull { column });
                 Some(())
             } else {
                 None
@@ -1362,18 +1369,18 @@ fn collect_btree_fast_predicates(
             {
                 return Some(());
             }
-            predicates.push(BtreeIndexFastPredicate::IsNotNull { column: column.id });
+            predicates.push(OrderedIndexFastPredicate::IsNotNull { column: column.id });
             Some(())
         }
         "eq" | "noteq" | "gt" | "gte" | "lt" | "lte" if function.args.len() == 2 => {
             let (column, constant, op) = extract_fast_compare(&function.args, name.as_ref())?;
-            if matches!(op, BtreeIndexFastCompareOp::Eq)
+            if matches!(op, OrderedIndexFastCompareOp::Eq)
                 && prefix_equality_scalar(prefix_equalities, column)
                     .is_some_and(|prefix_scalar| prefix_scalar == &constant)
             {
                 return Some(());
             }
-            predicates.push(BtreeIndexFastPredicate::Compare {
+            predicates.push(OrderedIndexFastPredicate::Compare {
                 column,
                 op,
                 constant,
@@ -1406,7 +1413,7 @@ fn extract_is_not_null_column(expr: &Expr<usize>) -> Option<usize> {
 fn extract_fast_compare(
     args: &[Expr<usize>],
     op_name: &str,
-) -> Option<(usize, Scalar, BtreeIndexFastCompareOp)> {
+) -> Option<(usize, Scalar, OrderedIndexFastCompareOp)> {
     match (&args[0], &args[1]) {
         (Expr::ColumnRef(column), Expr::Constant(constant)) => Some((
             column.id,
@@ -1422,42 +1429,42 @@ fn extract_fast_compare(
     }
 }
 
-fn fast_compare_op(op_name: &str, reverse: bool) -> Option<BtreeIndexFastCompareOp> {
+fn fast_compare_op(op_name: &str, reverse: bool) -> Option<OrderedIndexFastCompareOp> {
     let op = match op_name {
-        "eq" => BtreeIndexFastCompareOp::Eq,
-        "noteq" => BtreeIndexFastCompareOp::NotEq,
-        "gt" if reverse => BtreeIndexFastCompareOp::Lt,
-        "gt" => BtreeIndexFastCompareOp::Gt,
-        "gte" if reverse => BtreeIndexFastCompareOp::Lte,
-        "gte" => BtreeIndexFastCompareOp::Gte,
-        "lt" if reverse => BtreeIndexFastCompareOp::Gt,
-        "lt" => BtreeIndexFastCompareOp::Lt,
-        "lte" if reverse => BtreeIndexFastCompareOp::Gte,
-        "lte" => BtreeIndexFastCompareOp::Lte,
+        "eq" => OrderedIndexFastCompareOp::Eq,
+        "noteq" => OrderedIndexFastCompareOp::NotEq,
+        "gt" if reverse => OrderedIndexFastCompareOp::Lt,
+        "gt" => OrderedIndexFastCompareOp::Gt,
+        "gte" if reverse => OrderedIndexFastCompareOp::Lte,
+        "gte" => OrderedIndexFastCompareOp::Gte,
+        "lt" if reverse => OrderedIndexFastCompareOp::Gt,
+        "lt" => OrderedIndexFastCompareOp::Lt,
+        "lte" if reverse => OrderedIndexFastCompareOp::Gte,
+        "lte" => OrderedIndexFastCompareOp::Lte,
         _ => return None,
     };
     Some(op)
 }
 
-fn evaluate_btree_fast_predicates(
-    predicates: &[BtreeIndexFastPredicate],
+fn evaluate_ordered_fast_predicates(
+    predicates: &[OrderedIndexFastPredicate],
     payload_row: &[Scalar],
 ) -> bool {
     predicates
         .iter()
-        .all(|predicate| evaluate_btree_fast_predicate(predicate, payload_row))
+        .all(|predicate| evaluate_ordered_fast_predicate(predicate, payload_row))
 }
 
 #[cfg(test)]
-fn evaluate_btree_key_predicates(
-    predicates: &[BtreeIndexKeyPredicate],
+fn evaluate_ordered_key_predicates(
+    predicates: &[OrderedIndexKeyPredicate],
     encoded_key: &[u8],
 ) -> bool {
-    evaluate_btree_key_predicates_from(predicates, encoded_key, 0, 0)
+    evaluate_ordered_key_predicates_from(predicates, encoded_key, 0, 0)
 }
 
-fn evaluate_btree_key_predicates_from(
-    predicates: &[BtreeIndexKeyPredicate],
+fn evaluate_ordered_key_predicates_from(
+    predicates: &[OrderedIndexKeyPredicate],
     encoded_key: &[u8],
     mut component_index: usize,
     mut offset: usize,
@@ -1498,7 +1505,7 @@ fn evaluate_btree_key_predicates_from(
             .get(predicate_index)
             .is_some_and(|predicate| predicate.component_index == component_index)
         {
-            if !evaluate_btree_key_predicate_component(&predicates[predicate_index], component) {
+            if !evaluate_ordered_key_predicate_component(&predicates[predicate_index], component) {
                 return false;
             }
             predicate_index += 1;
@@ -1516,14 +1523,14 @@ fn evaluate_btree_key_predicates_from(
     true
 }
 
-fn evaluate_btree_key_predicate_component(
-    predicate: &BtreeIndexKeyPredicate,
+fn evaluate_ordered_key_predicate_component(
+    predicate: &OrderedIndexKeyPredicate,
     component: &[u8],
 ) -> bool {
     match &predicate.kind {
-        BtreeIndexKeyPredicateKind::IsNull { null_component } => component == null_component,
-        BtreeIndexKeyPredicateKind::IsNotNull { null_component } => component != null_component,
-        BtreeIndexKeyPredicateKind::Compare {
+        OrderedIndexKeyPredicateKind::IsNull { null_component } => component == null_component,
+        OrderedIndexKeyPredicateKind::IsNotNull { null_component } => component != null_component,
+        OrderedIndexKeyPredicateKind::Compare {
             op,
             constant_component,
             null_component,
@@ -1532,26 +1539,28 @@ fn evaluate_btree_key_predicate_component(
                 return false;
             }
             let ordering = match predicate.order {
-                BtreeIndexKeyOrder::Asc => component.cmp(constant_component.as_slice()),
-                BtreeIndexKeyOrder::Desc => component.cmp(constant_component.as_slice()).reverse(),
+                OrderedIndexKeyOrder::Asc => component.cmp(constant_component.as_slice()),
+                OrderedIndexKeyOrder::Desc => {
+                    component.cmp(constant_component.as_slice()).reverse()
+                }
             };
-            evaluate_btree_ordering(*op, ordering)
+            evaluate_ordered_ordering(*op, ordering)
         }
     }
 }
 
-fn evaluate_btree_fast_predicate(
-    predicate: &BtreeIndexFastPredicate,
+fn evaluate_ordered_fast_predicate(
+    predicate: &OrderedIndexFastPredicate,
     payload_row: &[Scalar],
 ) -> bool {
     match predicate {
-        BtreeIndexFastPredicate::IsNull { column } => payload_row
+        OrderedIndexFastPredicate::IsNull { column } => payload_row
             .get(*column)
             .is_some_and(|value| matches!(value, Scalar::Null)),
-        BtreeIndexFastPredicate::IsNotNull { column } => payload_row
+        OrderedIndexFastPredicate::IsNotNull { column } => payload_row
             .get(*column)
             .is_some_and(|value| !matches!(value, Scalar::Null)),
-        BtreeIndexFastPredicate::Compare {
+        OrderedIndexFastPredicate::Compare {
             column,
             op,
             constant,
@@ -1562,26 +1571,26 @@ fn evaluate_btree_fast_predicate(
             if matches!(value, Scalar::Null) || matches!(constant, Scalar::Null) {
                 return false;
             }
-            let Some(ordering) = compare_btree_filter_scalars(value, constant) else {
+            let Some(ordering) = compare_ordered_filter_scalars(value, constant) else {
                 return false;
             };
-            evaluate_btree_ordering(*op, ordering)
+            evaluate_ordered_ordering(*op, ordering)
         }
     }
 }
 
-fn evaluate_btree_ordering(op: BtreeIndexFastCompareOp, ordering: Ordering) -> bool {
+fn evaluate_ordered_ordering(op: OrderedIndexFastCompareOp, ordering: Ordering) -> bool {
     match op {
-        BtreeIndexFastCompareOp::Eq => ordering == Ordering::Equal,
-        BtreeIndexFastCompareOp::NotEq => ordering != Ordering::Equal,
-        BtreeIndexFastCompareOp::Gt => ordering == Ordering::Greater,
-        BtreeIndexFastCompareOp::Gte => matches!(ordering, Ordering::Greater | Ordering::Equal),
-        BtreeIndexFastCompareOp::Lt => ordering == Ordering::Less,
-        BtreeIndexFastCompareOp::Lte => matches!(ordering, Ordering::Less | Ordering::Equal),
+        OrderedIndexFastCompareOp::Eq => ordering == Ordering::Equal,
+        OrderedIndexFastCompareOp::NotEq => ordering != Ordering::Equal,
+        OrderedIndexFastCompareOp::Gt => ordering == Ordering::Greater,
+        OrderedIndexFastCompareOp::Gte => matches!(ordering, Ordering::Greater | Ordering::Equal),
+        OrderedIndexFastCompareOp::Lt => ordering == Ordering::Less,
+        OrderedIndexFastCompareOp::Lte => matches!(ordering, Ordering::Less | Ordering::Equal),
     }
 }
 
-fn compare_btree_filter_scalars(left: &Scalar, right: &Scalar) -> Option<Ordering> {
+fn compare_ordered_filter_scalars(left: &Scalar, right: &Scalar) -> Option<Ordering> {
     if let Some(ordering) = left.partial_cmp(right) {
         return Some(ordering);
     }
@@ -1609,12 +1618,12 @@ fn compare_btree_filter_scalars(left: &Scalar, right: &Scalar) -> Option<Orderin
     }
 }
 
-fn encode_key_component_value(scalar: &Scalar, order: BtreeIndexKeyOrder) -> Result<Vec<u8>> {
+fn encode_key_component_value(scalar: &Scalar, order: OrderedIndexKeyOrder) -> Result<Vec<u8>> {
     let mut key = Vec::new();
-    encode_btree_key_component(&mut key, scalar.as_ref(), order)?;
+    encode_ordered_key_component(&mut key, scalar.as_ref(), order)?;
     let Some(component) = encoded_key_component(&key, 0) else {
         return Err(ErrorCode::StorageOther(
-            "failed to encode btree key component".to_string(),
+            "failed to encode ordered key component".to_string(),
         ));
     };
     Ok(component.to_vec())
@@ -1640,19 +1649,19 @@ fn encoded_key_component(encoded_key: &[u8], component_index: usize) -> Option<&
     None
 }
 
-fn encode_prefix(btree_index: &BtreeIndexInfo) -> Result<Vec<u8>> {
+fn encode_prefix(ordered_index: &OrderedIndexInfo) -> Result<Vec<u8>> {
     let mut key = Vec::new();
-    for (scalar, key_column) in btree_index
+    for (scalar, key_column) in ordered_index
         .equality_prefix
         .iter()
-        .zip(btree_index.key_columns.iter())
+        .zip(ordered_index.key_columns.iter())
     {
-        encode_btree_key_component(&mut key, scalar.as_ref(), match key_column.order {
-            BtreeIndexColumnOrder::Asc => BtreeIndexKeyOrder::Asc,
-            BtreeIndexColumnOrder::Desc => BtreeIndexKeyOrder::Desc,
+        encode_ordered_key_component(&mut key, scalar.as_ref(), match key_column.order {
+            OrderedIndexColumnOrder::Asc => OrderedIndexKeyOrder::Asc,
+            OrderedIndexColumnOrder::Desc => OrderedIndexKeyOrder::Desc,
         })?;
     }
-    btree_equality_prefix(&key, btree_index.equality_prefix.len())
+    ordered_equality_prefix(&key, ordered_index.equality_prefix.len())
 }
 
 fn payload_rows_to_block(
@@ -1663,7 +1672,7 @@ fn payload_rows_to_block(
     if payload_fields.is_empty() {
         if rows.iter().any(|row| !row.is_empty()) {
             return Err(ErrorCode::StorageOther(
-                "invalid btree payload width for empty projection".to_string(),
+                "invalid ordered payload width for empty projection".to_string(),
             ));
         }
         return Ok(DataBlock::empty_with_rows(num_rows));
@@ -1675,7 +1684,7 @@ fn payload_rows_to_block(
     for row in rows {
         if row.len() != builders.len() {
             return Err(ErrorCode::StorageOther(format!(
-                "invalid btree payload width {}, expected {}",
+                "invalid ordered payload width {}, expected {}",
                 row.len(),
                 builders.len()
             )));
@@ -1694,7 +1703,7 @@ fn payload_rows_to_block(
 
 #[cfg(test)]
 mod tests {
-    use databend_common_catalog::plan::BtreeIndexKeyColumn;
+    use databend_common_catalog::plan::OrderedIndexKeyColumn;
     use databend_common_expression::ColumnRef;
     use databend_common_expression::Constant;
     use databend_common_expression::FunctionContext;
@@ -1706,10 +1715,10 @@ mod tests {
     use databend_common_expression::types::DecimalSize;
     use databend_common_expression::types::NumberDataType;
     use databend_common_expression::types::NumberScalar;
-    use databend_storages_common_index::BtreeIndexMeta;
-    use databend_storages_common_index::BtreeIndexRow;
-    use databend_storages_common_index::BtreeIndexWriter;
-    use databend_storages_common_index::encode_btree_payload;
+    use databend_storages_common_index::OrderedIndexMeta;
+    use databend_storages_common_index::OrderedIndexRow;
+    use databend_storages_common_index::OrderedIndexWriter;
+    use databend_storages_common_index::encode_ordered_payload;
     use opendal::Operator;
 
     use super::*;
@@ -1758,7 +1767,7 @@ mod tests {
                 DataType::from(balance.data_type()),
             ),
         ]);
-        let source = BtreeIndexSource {
+        let source = OrderedIndexSource {
             operator: Operator::new(opendal::services::Memory::default())
                 .unwrap()
                 .finish(),
@@ -1767,40 +1776,40 @@ mod tests {
             func_ctx: FunctionContext::default(),
             partitions: None,
             receiver: None,
-            btree_index: BtreeIndexInfo {
+            ordered_index: OrderedIndexInfo {
                 index_name: "idx".to_string(),
                 index_version: "1".to_string(),
-                key_columns: vec![BtreeIndexKeyColumn {
+                key_columns: vec![OrderedIndexKeyColumn {
                     field: wallet.clone(),
-                    order: BtreeIndexColumnOrder::Asc,
+                    order: OrderedIndexColumnOrder::Asc,
                 }],
                 payload_fields,
                 equality_prefix: vec![Scalar::String("wallet-a".to_string())],
                 limit: Some(100),
                 filters: None,
-                use_block_btree_index_size_hint: false,
+                use_block_ordered_index_size_hint: false,
             },
             worker_id: 0,
             is_finished: false,
         };
         let rows = vec![
-            BtreeIndexRow {
+            OrderedIndexRow {
                 encoded_key: b"k1".to_vec(),
-                encoded_row_payload: encode_btree_payload(&[
+                encoded_row_payload: encode_ordered_payload(&[
                     Scalar::String("wallet-a".to_string()),
                     Scalar::Number(NumberScalar::UInt64(1)),
                 ])?,
             },
-            BtreeIndexRow {
+            OrderedIndexRow {
                 encoded_key: b"k2".to_vec(),
-                encoded_row_payload: encode_btree_payload(&[
+                encoded_row_payload: encode_ordered_payload(&[
                     Scalar::String("wallet-a".to_string()),
                     Scalar::Number(NumberScalar::UInt64(2)),
                 ])?,
             },
-            BtreeIndexRow {
+            OrderedIndexRow {
                 encoded_key: b"k3".to_vec(),
-                encoded_row_payload: encode_btree_payload(&[
+                encoded_row_payload: encode_ordered_payload(&[
                     Scalar::String("wallet-a".to_string()),
                     Scalar::Number(NumberScalar::UInt64(3)),
                 ])?,
@@ -1825,7 +1834,7 @@ mod tests {
             ],
             &BUILTIN_FUNCTIONS,
         )?;
-        let filter = BtreeIndexFilter {
+        let filter = OrderedIndexFilter {
             expr: Some(expr),
             payload_field_indexes: vec![1],
             payload_fields: vec![balance],
@@ -1868,7 +1877,7 @@ mod tests {
                 DataType::from(tag_black_hole.data_type()),
             ),
         ]);
-        let source = BtreeIndexSource {
+        let source = OrderedIndexSource {
             operator: Operator::new(opendal::services::Memory::default())
                 .unwrap()
                 .finish(),
@@ -1877,60 +1886,60 @@ mod tests {
             func_ctx: FunctionContext::default(),
             partitions: None,
             receiver: None,
-            btree_index: BtreeIndexInfo {
+            ordered_index: OrderedIndexInfo {
                 index_name: "idx".to_string(),
                 index_version: "1".to_string(),
-                key_columns: vec![BtreeIndexKeyColumn {
+                key_columns: vec![OrderedIndexKeyColumn {
                     field: wallet.clone(),
-                    order: BtreeIndexColumnOrder::Asc,
+                    order: OrderedIndexColumnOrder::Asc,
                 }],
                 payload_fields,
                 equality_prefix: vec![Scalar::String("wallet-a".to_string())],
                 limit: Some(100),
                 filters: None,
-                use_block_btree_index_size_hint: false,
+                use_block_ordered_index_size_hint: false,
             },
             worker_id: 0,
             is_finished: false,
         };
         let rows = vec![
-            BtreeIndexRow {
+            OrderedIndexRow {
                 encoded_key: b"k1".to_vec(),
-                encoded_row_payload: encode_btree_payload(&[
+                encoded_row_payload: encode_ordered_payload(&[
                     Scalar::String("wallet-a".to_string()),
                     Scalar::Number(NumberScalar::UInt64(0)),
                     Scalar::Null,
                 ])?,
             },
-            BtreeIndexRow {
+            OrderedIndexRow {
                 encoded_key: b"k2".to_vec(),
-                encoded_row_payload: encode_btree_payload(&[
+                encoded_row_payload: encode_ordered_payload(&[
                     Scalar::String("wallet-a".to_string()),
                     Scalar::Number(NumberScalar::UInt64(2)),
                     Scalar::Number(NumberScalar::UInt64(1)),
                 ])?,
             },
-            BtreeIndexRow {
+            OrderedIndexRow {
                 encoded_key: b"k3".to_vec(),
-                encoded_row_payload: encode_btree_payload(&[
+                encoded_row_payload: encode_ordered_payload(&[
                     Scalar::String("wallet-a".to_string()),
                     Scalar::Number(NumberScalar::UInt64(3)),
                     Scalar::Null,
                 ])?,
             },
         ];
-        let filter = BtreeIndexFilter {
+        let filter = OrderedIndexFilter {
             expr: None,
             payload_field_indexes: vec![1, 2],
             payload_fields: vec![balance, tag_black_hole],
             key_predicates: vec![],
             fast_predicates: Some(vec![
-                BtreeIndexFastPredicate::Compare {
+                OrderedIndexFastPredicate::Compare {
                     column: 0,
-                    op: BtreeIndexFastCompareOp::Gt,
+                    op: OrderedIndexFastCompareOp::Gt,
                     constant: Scalar::Number(NumberScalar::UInt64(0)),
                 },
-                BtreeIndexFastPredicate::IsNull { column: 1 },
+                OrderedIndexFastPredicate::IsNull { column: 1 },
             ]),
         };
 
@@ -1942,7 +1951,7 @@ mod tests {
     }
 
     #[test]
-    fn test_btree_prefix_row_refs_seek_to_prefix_start() {
+    fn test_ordered_prefix_row_refs_seek_to_prefix_start() {
         let rows = vec![
             test_row(b"wallet-0|999"),
             test_row(b"wallet-1|001"),
@@ -1950,7 +1959,7 @@ mod tests {
             test_row(b"wallet-2|001"),
         ];
 
-        let row_refs = btree_prefix_row_refs(&rows, b"wallet-1|");
+        let row_refs = ordered_prefix_row_refs(&rows, b"wallet-1|");
 
         assert_eq!(row_refs.len(), 2);
         assert_eq!(row_refs[0].encoded_key.as_slice(), b"wallet-1|001");
@@ -1958,14 +1967,14 @@ mod tests {
     }
 
     #[test]
-    fn test_btree_prefix_row_refs_handles_missing_prefix() {
+    fn test_ordered_prefix_row_refs_handles_missing_prefix() {
         let rows = vec![
             test_row(b"wallet-0|999"),
             test_row(b"wallet-2|001"),
             test_row(b"wallet-3|001"),
         ];
 
-        let row_refs = btree_prefix_row_refs(&rows, b"wallet-1|");
+        let row_refs = ordered_prefix_row_refs(&rows, b"wallet-1|");
 
         assert!(row_refs.is_empty());
     }
@@ -2035,14 +2044,17 @@ mod tests {
         )?;
 
         let predicates =
-            compile_btree_fast_predicates(&expr, &[(0, Scalar::String("wallet-a".to_string()))])
+            compile_ordered_fast_predicates(&expr, &[(0, Scalar::String("wallet-a".to_string()))])
                 .unwrap();
         assert_eq!(predicates.len(), 1);
-        assert!(matches!(predicates[0], BtreeIndexFastPredicate::Compare {
-            column: 1,
-            op: BtreeIndexFastCompareOp::Gt,
-            ..
-        }));
+        assert!(matches!(
+            predicates[0],
+            OrderedIndexFastPredicate::Compare {
+                column: 1,
+                op: OrderedIndexFastCompareOp::Gt,
+                ..
+            }
+        ));
         Ok(())
     }
 
@@ -2062,7 +2074,8 @@ mod tests {
         )?;
         let tag_is_null = check_function(None, "not", &[], &[tag_is_not_null], &BUILTIN_FUNCTIONS)?;
 
-        let predicates = compile_btree_fast_predicates(&tag_is_null, &[(0, Scalar::Null)]).unwrap();
+        let predicates =
+            compile_ordered_fast_predicates(&tag_is_null, &[(0, Scalar::Null)]).unwrap();
         assert!(predicates.is_empty());
         Ok(())
     }
@@ -2070,7 +2083,7 @@ mod tests {
     #[test]
     fn test_fast_filter_compare_cross_numeric_types() {
         assert_eq!(
-            compare_btree_filter_scalars(
+            compare_ordered_filter_scalars(
                 &Scalar::Number(NumberScalar::UInt8(1)),
                 &Scalar::Number(NumberScalar::Int64(0)),
             ),
@@ -2079,7 +2092,7 @@ mod tests {
 
         let decimal_size = DecimalSize::new(65, 30).unwrap();
         assert_eq!(
-            compare_btree_filter_scalars(
+            compare_ordered_filter_scalars(
                 &Scalar::Decimal(DecimalScalar::Decimal128(1, decimal_size)),
                 &Scalar::Number(NumberScalar::Int64(0)),
             ),
@@ -2088,7 +2101,7 @@ mod tests {
 
         let decimal_zero = DecimalSize::new(1, 0).unwrap();
         assert_eq!(
-            compare_btree_filter_scalars(
+            compare_ordered_filter_scalars(
                 &Scalar::Decimal(DecimalScalar::Decimal128(1, decimal_size)),
                 &Scalar::Decimal(DecimalScalar::Decimal64(0, decimal_zero)),
             ),
@@ -2098,15 +2111,15 @@ mod tests {
 
     #[test]
     fn test_key_predicate_compares_tinyint_suffix() -> Result<()> {
-        let key_field = BtreeIndexKeyField {
+        let key_field = OrderedIndexKeyField {
             component_index: 1,
-            order: BtreeIndexKeyOrder::Asc,
+            order: OrderedIndexKeyOrder::Asc,
             data_type: TableDataType::Number(NumberDataType::Int8),
         };
-        let (key_predicates, payload_predicates) = split_btree_fast_predicates(
-            vec![BtreeIndexFastPredicate::Compare {
+        let (key_predicates, payload_predicates) = split_ordered_fast_predicates(
+            vec![OrderedIndexFastPredicate::Compare {
                 column: 1,
-                op: BtreeIndexFastCompareOp::Gt,
+                op: OrderedIndexFastCompareOp::Gt,
                 constant: Scalar::Number(NumberScalar::Int64(0)),
             }],
             &[None, Some(key_field)],
@@ -2117,40 +2130,40 @@ mod tests {
         let key = encoded_test_key(&[
             (
                 Scalar::String("token-a".to_string()),
-                BtreeIndexKeyOrder::Asc,
+                OrderedIndexKeyOrder::Asc,
             ),
             (
                 Scalar::Number(NumberScalar::Int8(1)),
-                BtreeIndexKeyOrder::Asc,
+                OrderedIndexKeyOrder::Asc,
             ),
         ])?;
-        assert!(evaluate_btree_key_predicates(&key_predicates, &key));
+        assert!(evaluate_ordered_key_predicates(&key_predicates, &key));
 
         let key = encoded_test_key(&[
             (
                 Scalar::String("token-a".to_string()),
-                BtreeIndexKeyOrder::Asc,
+                OrderedIndexKeyOrder::Asc,
             ),
             (
                 Scalar::Number(NumberScalar::Int8(0)),
-                BtreeIndexKeyOrder::Asc,
+                OrderedIndexKeyOrder::Asc,
             ),
         ])?;
-        assert!(!evaluate_btree_key_predicates(&key_predicates, &key));
+        assert!(!evaluate_ordered_key_predicates(&key_predicates, &key));
         Ok(())
     }
 
     #[test]
     fn test_key_predicate_evaluates_from_equality_prefix() -> Result<()> {
-        let key_field = BtreeIndexKeyField {
+        let key_field = OrderedIndexKeyField {
             component_index: 1,
-            order: BtreeIndexKeyOrder::Asc,
+            order: OrderedIndexKeyOrder::Asc,
             data_type: TableDataType::Number(NumberDataType::Int8),
         };
-        let (key_predicates, payload_predicates) = split_btree_fast_predicates(
-            vec![BtreeIndexFastPredicate::Compare {
+        let (key_predicates, payload_predicates) = split_ordered_fast_predicates(
+            vec![OrderedIndexFastPredicate::Compare {
                 column: 1,
-                op: BtreeIndexFastCompareOp::Gt,
+                op: OrderedIndexFastCompareOp::Gt,
                 constant: Scalar::Number(NumberScalar::Int64(0)),
             }],
             &[None, Some(key_field)],
@@ -2161,15 +2174,15 @@ mod tests {
         let key = encoded_test_key(&[
             (
                 Scalar::String("token-a".to_string()),
-                BtreeIndexKeyOrder::Asc,
+                OrderedIndexKeyOrder::Asc,
             ),
             (
                 Scalar::Number(NumberScalar::Int8(1)),
-                BtreeIndexKeyOrder::Asc,
+                OrderedIndexKeyOrder::Asc,
             ),
         ])?;
-        let prefix = btree_equality_prefix(&key, 1)?;
-        assert!(evaluate_btree_key_predicates_from(
+        let prefix = ordered_equality_prefix(&key, 1)?;
+        assert!(evaluate_ordered_key_predicates_from(
             &key_predicates,
             &key,
             1,
@@ -2179,15 +2192,15 @@ mod tests {
         let key = encoded_test_key(&[
             (
                 Scalar::String("token-a".to_string()),
-                BtreeIndexKeyOrder::Asc,
+                OrderedIndexKeyOrder::Asc,
             ),
             (
                 Scalar::Number(NumberScalar::Int8(0)),
-                BtreeIndexKeyOrder::Asc,
+                OrderedIndexKeyOrder::Asc,
             ),
         ])?;
-        let prefix = btree_equality_prefix(&key, 1)?;
-        assert!(!evaluate_btree_key_predicates_from(
+        let prefix = ordered_equality_prefix(&key, 1)?;
+        assert!(!evaluate_ordered_key_predicates_from(
             &key_predicates,
             &key,
             1,
@@ -2198,15 +2211,15 @@ mod tests {
 
     #[test]
     fn test_key_predicate_reverses_desc_compare_order() -> Result<()> {
-        let key_field = BtreeIndexKeyField {
+        let key_field = OrderedIndexKeyField {
             component_index: 0,
-            order: BtreeIndexKeyOrder::Desc,
+            order: OrderedIndexKeyOrder::Desc,
             data_type: TableDataType::Number(NumberDataType::Int64),
         };
-        let (key_predicates, _) = split_btree_fast_predicates(
-            vec![BtreeIndexFastPredicate::Compare {
+        let (key_predicates, _) = split_ordered_fast_predicates(
+            vec![OrderedIndexFastPredicate::Compare {
                 column: 0,
-                op: BtreeIndexFastCompareOp::Gt,
+                op: OrderedIndexFastCompareOp::Gt,
                 constant: Scalar::Number(NumberScalar::Int64(0)),
             }],
             &[Some(key_field)],
@@ -2214,30 +2227,30 @@ mod tests {
 
         let key = encoded_test_key(&[(
             Scalar::Number(NumberScalar::Int64(10)),
-            BtreeIndexKeyOrder::Desc,
+            OrderedIndexKeyOrder::Desc,
         )])?;
-        assert!(evaluate_btree_key_predicates(&key_predicates, &key));
+        assert!(evaluate_ordered_key_predicates(&key_predicates, &key));
 
         let key = encoded_test_key(&[(
             Scalar::Number(NumberScalar::Int64(-1)),
-            BtreeIndexKeyOrder::Desc,
+            OrderedIndexKeyOrder::Desc,
         )])?;
-        assert!(!evaluate_btree_key_predicates(&key_predicates, &key));
+        assert!(!evaluate_ordered_key_predicates(&key_predicates, &key));
         Ok(())
     }
 
     #[test]
     fn test_key_predicate_compares_desc_decimal_from_integer_constant() -> Result<()> {
         let size = DecimalSize::new(20, 2)?;
-        let key_field = BtreeIndexKeyField {
+        let key_field = OrderedIndexKeyField {
             component_index: 0,
-            order: BtreeIndexKeyOrder::Desc,
+            order: OrderedIndexKeyOrder::Desc,
             data_type: TableDataType::Decimal(DecimalDataType::Decimal128(size)),
         };
-        let (key_predicates, payload_predicates) = split_btree_fast_predicates(
-            vec![BtreeIndexFastPredicate::Compare {
+        let (key_predicates, payload_predicates) = split_ordered_fast_predicates(
+            vec![OrderedIndexFastPredicate::Compare {
                 column: 0,
-                op: BtreeIndexFastCompareOp::Gt,
+                op: OrderedIndexFastCompareOp::Gt,
                 constant: Scalar::Number(NumberScalar::Int64(0)),
             }],
             &[Some(key_field)],
@@ -2247,15 +2260,15 @@ mod tests {
 
         let key = encoded_test_key(&[(
             Scalar::Decimal(DecimalScalar::Decimal128(100, size)),
-            BtreeIndexKeyOrder::Desc,
+            OrderedIndexKeyOrder::Desc,
         )])?;
-        assert!(evaluate_btree_key_predicates(&key_predicates, &key));
+        assert!(evaluate_ordered_key_predicates(&key_predicates, &key));
 
         let key = encoded_test_key(&[(
             Scalar::Decimal(DecimalScalar::Decimal128(0, size)),
-            BtreeIndexKeyOrder::Desc,
+            OrderedIndexKeyOrder::Desc,
         )])?;
-        assert!(!evaluate_btree_key_predicates(&key_predicates, &key));
+        assert!(!evaluate_ordered_key_predicates(&key_predicates, &key));
         Ok(())
     }
 
@@ -2273,15 +2286,15 @@ mod tests {
 
     #[test]
     fn test_candidate_block_pruning_uses_first_suffix_desc_range() -> Result<()> {
-        let key_field = BtreeIndexKeyField {
+        let key_field = OrderedIndexKeyField {
             component_index: 2,
-            order: BtreeIndexKeyOrder::Desc,
+            order: OrderedIndexKeyOrder::Desc,
             data_type: TableDataType::Number(NumberDataType::Int64),
         };
-        let (key_predicates, _) = split_btree_fast_predicates(
-            vec![BtreeIndexFastPredicate::Compare {
+        let (key_predicates, _) = split_ordered_fast_predicates(
+            vec![OrderedIndexFastPredicate::Compare {
                 column: 0,
-                op: BtreeIndexFastCompareOp::Gt,
+                op: OrderedIndexFastCompareOp::Gt,
                 constant: Scalar::Number(NumberScalar::Int64(0)),
             }],
             &[Some(key_field)],
@@ -2289,42 +2302,42 @@ mod tests {
         let prefix_key = encoded_test_key(&[
             (
                 Scalar::Number(NumberScalar::Int64(14)),
-                BtreeIndexKeyOrder::Asc,
+                OrderedIndexKeyOrder::Asc,
             ),
             (
                 Scalar::String("token-a".to_string()),
-                BtreeIndexKeyOrder::Asc,
+                OrderedIndexKeyOrder::Asc,
             ),
         ])?;
-        let prefix = btree_equality_prefix(&prefix_key, 2)?;
+        let prefix = ordered_equality_prefix(&prefix_key, 2)?;
 
         let positive_block = candidate_block(
             &encoded_test_key(&[
                 (
                     Scalar::Number(NumberScalar::Int64(14)),
-                    BtreeIndexKeyOrder::Asc,
+                    OrderedIndexKeyOrder::Asc,
                 ),
                 (
                     Scalar::String("token-a".to_string()),
-                    BtreeIndexKeyOrder::Asc,
+                    OrderedIndexKeyOrder::Asc,
                 ),
                 (
                     Scalar::Number(NumberScalar::Int64(10)),
-                    BtreeIndexKeyOrder::Desc,
+                    OrderedIndexKeyOrder::Desc,
                 ),
             ])?,
             &encoded_test_key(&[
                 (
                     Scalar::Number(NumberScalar::Int64(14)),
-                    BtreeIndexKeyOrder::Asc,
+                    OrderedIndexKeyOrder::Asc,
                 ),
                 (
                     Scalar::String("token-a".to_string()),
-                    BtreeIndexKeyOrder::Asc,
+                    OrderedIndexKeyOrder::Asc,
                 ),
                 (
                     Scalar::Number(NumberScalar::Int64(1)),
-                    BtreeIndexKeyOrder::Desc,
+                    OrderedIndexKeyOrder::Desc,
                 ),
             ])?,
         );
@@ -2339,29 +2352,29 @@ mod tests {
             &encoded_test_key(&[
                 (
                     Scalar::Number(NumberScalar::Int64(14)),
-                    BtreeIndexKeyOrder::Asc,
+                    OrderedIndexKeyOrder::Asc,
                 ),
                 (
                     Scalar::String("token-a".to_string()),
-                    BtreeIndexKeyOrder::Asc,
+                    OrderedIndexKeyOrder::Asc,
                 ),
                 (
                     Scalar::Number(NumberScalar::Int64(0)),
-                    BtreeIndexKeyOrder::Desc,
+                    OrderedIndexKeyOrder::Desc,
                 ),
             ])?,
             &encoded_test_key(&[
                 (
                     Scalar::Number(NumberScalar::Int64(14)),
-                    BtreeIndexKeyOrder::Asc,
+                    OrderedIndexKeyOrder::Asc,
                 ),
                 (
                     Scalar::String("token-a".to_string()),
-                    BtreeIndexKeyOrder::Asc,
+                    OrderedIndexKeyOrder::Asc,
                 ),
                 (
                     Scalar::Number(NumberScalar::Int64(-10)),
-                    BtreeIndexKeyOrder::Desc,
+                    OrderedIndexKeyOrder::Desc,
                 ),
             ])?,
         );
@@ -2377,15 +2390,15 @@ mod tests {
             &encoded_test_key(&[
                 (
                     Scalar::Number(NumberScalar::Int64(14)),
-                    BtreeIndexKeyOrder::Asc,
+                    OrderedIndexKeyOrder::Asc,
                 ),
                 (
                     Scalar::String("token-a".to_string()),
-                    BtreeIndexKeyOrder::Asc,
+                    OrderedIndexKeyOrder::Asc,
                 ),
                 (
                     Scalar::Number(NumberScalar::Int64(-10)),
-                    BtreeIndexKeyOrder::Desc,
+                    OrderedIndexKeyOrder::Desc,
                 ),
             ])?,
         );
@@ -2400,62 +2413,62 @@ mod tests {
 
     #[test]
     fn test_candidate_block_pruning_uses_later_suffix_only_when_prefix_is_constant() -> Result<()> {
-        let key_field = BtreeIndexKeyField {
+        let key_field = OrderedIndexKeyField {
             component_index: 3,
-            order: BtreeIndexKeyOrder::Asc,
+            order: OrderedIndexKeyOrder::Asc,
             data_type: TableDataType::Number(NumberDataType::Int8).wrap_nullable(),
         };
-        let (key_predicates, _) =
-            split_btree_fast_predicates(vec![BtreeIndexFastPredicate::IsNull { column: 0 }], &[
-                Some(key_field),
-            ])?;
+        let (key_predicates, _) = split_ordered_fast_predicates(
+            vec![OrderedIndexFastPredicate::IsNull { column: 0 }],
+            &[Some(key_field)],
+        )?;
         let prefix_key = encoded_test_key(&[
             (
                 Scalar::Number(NumberScalar::Int64(14)),
-                BtreeIndexKeyOrder::Asc,
+                OrderedIndexKeyOrder::Asc,
             ),
             (
                 Scalar::String("token-a".to_string()),
-                BtreeIndexKeyOrder::Asc,
+                OrderedIndexKeyOrder::Asc,
             ),
         ])?;
-        let prefix = btree_equality_prefix(&prefix_key, 2)?;
+        let prefix = ordered_equality_prefix(&prefix_key, 2)?;
 
         let same_balance_non_null_tag_block = candidate_block(
             &encoded_test_key(&[
                 (
                     Scalar::Number(NumberScalar::Int64(14)),
-                    BtreeIndexKeyOrder::Asc,
+                    OrderedIndexKeyOrder::Asc,
                 ),
                 (
                     Scalar::String("token-a".to_string()),
-                    BtreeIndexKeyOrder::Asc,
+                    OrderedIndexKeyOrder::Asc,
                 ),
                 (
                     Scalar::Number(NumberScalar::Int64(10)),
-                    BtreeIndexKeyOrder::Desc,
+                    OrderedIndexKeyOrder::Desc,
                 ),
                 (
                     Scalar::Number(NumberScalar::Int8(1)),
-                    BtreeIndexKeyOrder::Asc,
+                    OrderedIndexKeyOrder::Asc,
                 ),
             ])?,
             &encoded_test_key(&[
                 (
                     Scalar::Number(NumberScalar::Int64(14)),
-                    BtreeIndexKeyOrder::Asc,
+                    OrderedIndexKeyOrder::Asc,
                 ),
                 (
                     Scalar::String("token-a".to_string()),
-                    BtreeIndexKeyOrder::Asc,
+                    OrderedIndexKeyOrder::Asc,
                 ),
                 (
                     Scalar::Number(NumberScalar::Int64(10)),
-                    BtreeIndexKeyOrder::Desc,
+                    OrderedIndexKeyOrder::Desc,
                 ),
                 (
                     Scalar::Number(NumberScalar::Int8(1)),
-                    BtreeIndexKeyOrder::Asc,
+                    OrderedIndexKeyOrder::Asc,
                 ),
             ])?,
         );
@@ -2470,35 +2483,35 @@ mod tests {
             &encoded_test_key(&[
                 (
                     Scalar::Number(NumberScalar::Int64(14)),
-                    BtreeIndexKeyOrder::Asc,
+                    OrderedIndexKeyOrder::Asc,
                 ),
                 (
                     Scalar::String("token-a".to_string()),
-                    BtreeIndexKeyOrder::Asc,
+                    OrderedIndexKeyOrder::Asc,
                 ),
                 (
                     Scalar::Number(NumberScalar::Int64(11)),
-                    BtreeIndexKeyOrder::Desc,
+                    OrderedIndexKeyOrder::Desc,
                 ),
                 (
                     Scalar::Number(NumberScalar::Int8(1)),
-                    BtreeIndexKeyOrder::Asc,
+                    OrderedIndexKeyOrder::Asc,
                 ),
             ])?,
             &encoded_test_key(&[
                 (
                     Scalar::Number(NumberScalar::Int64(14)),
-                    BtreeIndexKeyOrder::Asc,
+                    OrderedIndexKeyOrder::Asc,
                 ),
                 (
                     Scalar::String("token-a".to_string()),
-                    BtreeIndexKeyOrder::Asc,
+                    OrderedIndexKeyOrder::Asc,
                 ),
                 (
                     Scalar::Number(NumberScalar::Int64(10)),
-                    BtreeIndexKeyOrder::Desc,
+                    OrderedIndexKeyOrder::Desc,
                 ),
-                (Scalar::Null, BtreeIndexKeyOrder::Asc),
+                (Scalar::Null, OrderedIndexKeyOrder::Asc),
             ])?,
         );
         assert!(candidate_block_may_match_key_predicates(
@@ -2516,15 +2529,15 @@ mod tests {
         let operator = Operator::new(opendal::services::Memory::default())
             .unwrap()
             .finish();
-        let location = "btree-limit-first.sst";
-        let meta = BtreeIndexMeta {
+        let location = "ordered-limit-first.sst";
+        let meta = OrderedIndexMeta {
             columns: vec![],
             metadata: Default::default(),
         };
-        let mut writer = BtreeIndexWriter::new(meta, "schema", "wallet ASC", "none");
+        let mut writer = OrderedIndexWriter::new(meta, "schema", "wallet ASC", "none");
         writer.add_row(
             bytes::Bytes::from_static(b"wallet-1|001"),
-            bytes::Bytes::from(encode_btree_payload(&[Scalar::String(
+            bytes::Bytes::from(encode_ordered_payload(&[Scalar::String(
                 "row-1".to_string(),
             )])?),
         );
@@ -2533,10 +2546,10 @@ mod tests {
             .write(location, data.to_vec())
             .await
             .map_err(|err| {
-                ErrorCode::StorageOther(format!("write btree index test file failed: {err:?}"))
+                ErrorCode::StorageOther(format!("write ordered index test file failed: {err:?}"))
             })?;
 
-        let meta = load_btree_index_meta(operator.clone(), location, None).await?;
+        let meta = load_ordered_index_meta(operator.clone(), location, None).await?;
         let first_block = meta.index_block().data_blocks[0].clone();
         let mut missing_block = first_block.clone();
         missing_block.first_key = b"wallet-2|001".to_vec();
@@ -2547,13 +2560,13 @@ mod tests {
         let rows = source
             .read_candidate_rows(
                 vec![
-                    BtreeIndexCandidateBlock {
+                    OrderedIndexCandidateBlock {
                         index_location: location.to_string(),
                         meta: meta.clone(),
                         block_meta: first_block,
                     },
-                    BtreeIndexCandidateBlock {
-                        index_location: "missing-btree-limit-second.sst".to_string(),
+                    OrderedIndexCandidateBlock {
+                        index_location: "missing-ordered-limit-second.sst".to_string(),
                         meta,
                         block_meta: missing_block,
                     },
@@ -2574,17 +2587,17 @@ mod tests {
         let operator = Operator::new(opendal::services::Memory::default())
             .unwrap()
             .finish();
-        let location = "btree-overlap-limit-first.sst";
-        let meta = BtreeIndexMeta {
+        let location = "ordered-overlap-limit-first.sst";
+        let meta = OrderedIndexMeta {
             columns: vec![],
             metadata: Default::default(),
         };
-        let mut writer = BtreeIndexWriter::new(meta, "schema", "wallet ASC", "none")
+        let mut writer = OrderedIndexWriter::new(meta, "schema", "wallet ASC", "none")
             .with_data_block_size(usize::MAX);
         for key in ["wallet-1|001", "wallet-1|002", "wallet-1|003"] {
             writer.add_row(
                 bytes::Bytes::from(key.as_bytes().to_vec()),
-                bytes::Bytes::from(encode_btree_payload(&[Scalar::String(key.to_string())])?),
+                bytes::Bytes::from(encode_ordered_payload(&[Scalar::String(key.to_string())])?),
             );
         }
         let data = writer.finish()?;
@@ -2592,10 +2605,10 @@ mod tests {
             .write(location, data.to_vec())
             .await
             .map_err(|err| {
-                ErrorCode::StorageOther(format!("write btree index test file failed: {err:?}"))
+                ErrorCode::StorageOther(format!("write ordered index test file failed: {err:?}"))
             })?;
 
-        let meta = load_btree_index_meta(operator.clone(), location, None).await?;
+        let meta = load_ordered_index_meta(operator.clone(), location, None).await?;
         let first_block = meta.index_block().data_blocks[0].clone();
         let mut overlapping_missing_block = first_block.clone();
         overlapping_missing_block.first_key = b"wallet-1|003".to_vec();
@@ -2606,13 +2619,13 @@ mod tests {
         let rows = source
             .read_candidate_rows(
                 vec![
-                    BtreeIndexCandidateBlock {
+                    OrderedIndexCandidateBlock {
                         index_location: location.to_string(),
                         meta: meta.clone(),
                         block_meta: first_block,
                     },
-                    BtreeIndexCandidateBlock {
-                        index_location: "missing-btree-overlap-limit-second.sst".to_string(),
+                    OrderedIndexCandidateBlock {
+                        index_location: "missing-ordered-overlap-limit-second.sst".to_string(),
                         meta,
                         block_meta: overlapping_missing_block,
                     },
@@ -2634,17 +2647,18 @@ mod tests {
         let operator = Operator::new(opendal::services::Memory::default())
             .unwrap()
             .finish();
-        let first_location = "btree-overlap-limit-one.sst";
-        let second_location = "btree-overlap-limit-two.sst";
-        let meta = BtreeIndexMeta {
+        let first_location = "ordered-overlap-limit-one.sst";
+        let second_location = "ordered-overlap-limit-two.sst";
+        let meta = OrderedIndexMeta {
             columns: vec![],
             metadata: Default::default(),
         };
-        let mut first_writer = BtreeIndexWriter::new(meta.clone(), "schema", "wallet ASC", "none")
-            .with_data_block_size(usize::MAX);
+        let mut first_writer =
+            OrderedIndexWriter::new(meta.clone(), "schema", "wallet ASC", "none")
+                .with_data_block_size(usize::MAX);
         first_writer.add_row(
             bytes::Bytes::from_static(b"wallet-1|001"),
-            bytes::Bytes::from(encode_btree_payload(&[Scalar::String(
+            bytes::Bytes::from(encode_ordered_payload(&[Scalar::String(
                 "row-1".to_string(),
             )])?),
         );
@@ -2652,26 +2666,26 @@ mod tests {
             .write(first_location, first_writer.finish()?.to_vec())
             .await
             .map_err(|err| {
-                ErrorCode::StorageOther(format!("write btree index test file failed: {err:?}"))
+                ErrorCode::StorageOther(format!("write ordered index test file failed: {err:?}"))
             })?;
 
-        let mut second_writer = BtreeIndexWriter::new(meta, "schema", "wallet ASC", "none")
+        let mut second_writer = OrderedIndexWriter::new(meta, "schema", "wallet ASC", "none")
             .with_data_block_size(usize::MAX);
         for key in ["wallet-1|002", "wallet-1|003"] {
             second_writer.add_row(
                 bytes::Bytes::from(key.as_bytes().to_vec()),
-                bytes::Bytes::from(encode_btree_payload(&[Scalar::String(key.to_string())])?),
+                bytes::Bytes::from(encode_ordered_payload(&[Scalar::String(key.to_string())])?),
             );
         }
         operator
             .write(second_location, second_writer.finish()?.to_vec())
             .await
             .map_err(|err| {
-                ErrorCode::StorageOther(format!("write btree index test file failed: {err:?}"))
+                ErrorCode::StorageOther(format!("write ordered index test file failed: {err:?}"))
             })?;
 
-        let first_meta = load_btree_index_meta(operator.clone(), first_location, None).await?;
-        let second_meta = load_btree_index_meta(operator.clone(), second_location, None).await?;
+        let first_meta = load_ordered_index_meta(operator.clone(), first_location, None).await?;
+        let second_meta = load_ordered_index_meta(operator.clone(), second_location, None).await?;
         let mut first_block = first_meta.index_block().data_blocks[0].clone();
         first_block.last_key = b"wallet-1|002".to_vec();
         let second_block = second_meta.index_block().data_blocks[0].clone();
@@ -2684,18 +2698,18 @@ mod tests {
         let rows = source
             .read_candidate_rows(
                 vec![
-                    BtreeIndexCandidateBlock {
+                    OrderedIndexCandidateBlock {
                         index_location: first_location.to_string(),
                         meta: first_meta,
                         block_meta: first_block,
                     },
-                    BtreeIndexCandidateBlock {
+                    OrderedIndexCandidateBlock {
                         index_location: second_location.to_string(),
                         meta: second_meta.clone(),
                         block_meta: second_block,
                     },
-                    BtreeIndexCandidateBlock {
-                        index_location: "missing-btree-overlap-limit-third.sst".to_string(),
+                    OrderedIndexCandidateBlock {
+                        index_location: "missing-ordered-overlap-limit-third.sst".to_string(),
                         meta: second_meta,
                         block_meta: later_missing_block,
                     },
@@ -2711,31 +2725,31 @@ mod tests {
         Ok(())
     }
 
-    fn candidate_block(first_key: &[u8], last_key: &[u8]) -> BtreeIndexCandidateBlock {
-        BtreeIndexCandidateBlock {
+    fn candidate_block(first_key: &[u8], last_key: &[u8]) -> OrderedIndexCandidateBlock {
+        OrderedIndexCandidateBlock {
             index_location: "unused".to_string(),
-            meta: Arc::new(BtreeIndexFileMeta {
-                footer: databend_storages_common_index::BtreeIndexFooter {
-                    version: databend_storages_common_index::BTREE_INDEX_FILE_VERSION,
+            meta: Arc::new(OrderedIndexFileMeta {
+                footer: databend_storages_common_index::OrderedIndexFooter {
+                    version: databend_storages_common_index::ORDERED_INDEX_FILE_VERSION,
                     schema: String::new(),
                     key_order: String::new(),
                     compression: "none".to_string(),
-                    meta: BtreeIndexMeta {
+                    meta: OrderedIndexMeta {
                         columns: vec![],
                         metadata: Default::default(),
                     },
                     checksum: 0,
                     sections: vec![],
                 },
-                index_block: databend_storages_common_index::BtreeIndexIndexBlock {
+                index_block: databend_storages_common_index::OrderedIndexIndexBlock {
                     data_blocks: vec![],
                 },
-                filter_block: databend_storages_common_index::BtreeIndexFilterBlock {
+                filter_block: databend_storages_common_index::OrderedIndexFilterBlock {
                     equality_prefix_bloom: vec![],
                     equality_prefix_count: 0,
                 },
             }),
-            block_meta: BtreeIndexDataBlockMeta {
+            block_meta: OrderedIndexDataBlockMeta {
                 first_key: first_key.to_vec(),
                 last_key: last_key.to_vec(),
                 offset: 0,
@@ -2747,8 +2761,8 @@ mod tests {
         }
     }
 
-    fn test_row(encoded_key: &[u8]) -> BtreeIndexRow {
-        BtreeIndexRow {
+    fn test_row(encoded_key: &[u8]) -> OrderedIndexRow {
+        OrderedIndexRow {
             encoded_key: encoded_key.to_vec(),
             encoded_row_payload: Vec::new(),
         }
@@ -2758,40 +2772,40 @@ mod tests {
         operator: Operator,
         field: TableField,
         limit: Option<usize>,
-    ) -> BtreeIndexSource {
+    ) -> OrderedIndexSource {
         let payload_schema = DataSchema::new(vec![databend_common_expression::DataField::new(
             field.name(),
             DataType::from(field.data_type()),
         )]);
-        BtreeIndexSource {
+        OrderedIndexSource {
             operator,
             output_schema: payload_schema.clone(),
             payload_schema,
             func_ctx: FunctionContext::default(),
             partitions: None,
             receiver: None,
-            btree_index: BtreeIndexInfo {
+            ordered_index: OrderedIndexInfo {
                 index_name: "idx".to_string(),
                 index_version: "1".to_string(),
-                key_columns: vec![BtreeIndexKeyColumn {
+                key_columns: vec![OrderedIndexKeyColumn {
                     field: field.clone(),
-                    order: BtreeIndexColumnOrder::Asc,
+                    order: OrderedIndexColumnOrder::Asc,
                 }],
                 payload_fields: vec![field],
                 equality_prefix: vec![],
                 limit,
                 filters: None,
-                use_block_btree_index_size_hint: false,
+                use_block_ordered_index_size_hint: false,
             },
             worker_id: 0,
             is_finished: false,
         }
     }
 
-    fn encoded_test_key(values: &[(Scalar, BtreeIndexKeyOrder)]) -> Result<Vec<u8>> {
+    fn encoded_test_key(values: &[(Scalar, OrderedIndexKeyOrder)]) -> Result<Vec<u8>> {
         let mut key = Vec::new();
         for (scalar, order) in values {
-            encode_btree_key_component(&mut key, scalar.as_ref(), *order)?;
+            encode_ordered_key_component(&mut key, scalar.as_ref(), *order)?;
         }
         Ok(key)
     }

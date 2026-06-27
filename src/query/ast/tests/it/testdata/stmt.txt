@@ -2382,27 +2382,27 @@ CreateTableIndex(
 
 
 ---------- Input ----------
-CREATE BTREE INDEX IF NOT EXISTS idx_w ON t1 (wallet_address, platform_id, last_active_time DESC) INCLUDE (balance, tag_black_hole) WITH (COMPRESSION='ZSTD');
+CREATE ORDERED INDEX IF NOT EXISTS idx_w ON t1 (wallet_address, platform_id, last_active_time DESC) INCLUDE (balance, tag_black_hole) WITH (COMPRESSION='ZSTD');
 ---------- Output ---------
-CREATE BTREE INDEX IF NOT EXISTS idx_w ON t1 (wallet_address, platform_id, last_active_time DESC) INCLUDE (balance, tag_black_hole) WITH (compression = 'ZSTD')
+CREATE ORDERED INDEX IF NOT EXISTS idx_w ON t1 (wallet_address, platform_id, last_active_time DESC) INCLUDE (balance, tag_black_hole) WITH (compression = 'ZSTD')
 ---------- AST ------------
 CreateTableIndex(
     CreateTableIndexStmt {
         create_option: CreateIfNotExists,
         index_name: Identifier {
             span: Some(
-                33..38,
+                35..40,
             ),
             name: "idx_w",
             quote: None,
             ident_type: None,
         },
-        index_type: Btree,
+        index_type: Ordered,
         catalog: None,
         database: None,
         table: Identifier {
             span: Some(
-                42..44,
+                44..46,
             ),
             name: "t1",
             quote: None,
@@ -2412,7 +2412,7 @@ CreateTableIndex(
             TableIndexColumn {
                 name: Identifier {
                     span: Some(
-                        46..60,
+                        48..62,
                     ),
                     name: "wallet_address",
                     quote: None,
@@ -2423,7 +2423,7 @@ CreateTableIndex(
             TableIndexColumn {
                 name: Identifier {
                     span: Some(
-                        62..73,
+                        64..75,
                     ),
                     name: "platform_id",
                     quote: None,
@@ -2434,7 +2434,7 @@ CreateTableIndex(
             TableIndexColumn {
                 name: Identifier {
                     span: Some(
-                        75..91,
+                        77..93,
                     ),
                     name: "last_active_time",
                     quote: None,
@@ -2448,7 +2448,7 @@ CreateTableIndex(
         include_columns: [
             Identifier {
                 span: Some(
-                    107..114,
+                    109..116,
                 ),
                 name: "balance",
                 quote: None,
@@ -2456,7 +2456,7 @@ CreateTableIndex(
             },
             Identifier {
                 span: Some(
-                    116..130,
+                    118..132,
                 ),
                 name: "tag_black_hole",
                 quote: None,

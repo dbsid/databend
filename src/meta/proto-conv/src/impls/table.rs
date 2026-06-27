@@ -384,7 +384,7 @@ impl FromToProto for mt::TableStatistics {
             bloom_index_size: p.bloom_index_size,
             ngram_index_size: p.ngram_index_size,
             inverted_index_size: p.inverted_index_size,
-            btree_index_size: p.btree_index_size,
+            ordered_index_size: p.ordered_index_size,
             vector_index_size: p.vector_index_size,
             virtual_column_size: p.virtual_column_size,
         };
@@ -405,7 +405,7 @@ impl FromToProto for mt::TableStatistics {
             bloom_index_size: self.bloom_index_size,
             ngram_index_size: self.ngram_index_size,
             inverted_index_size: self.inverted_index_size,
-            btree_index_size: self.btree_index_size,
+            ordered_index_size: self.ordered_index_size,
             vector_index_size: self.vector_index_size,
             virtual_column_size: self.virtual_column_size,
         };

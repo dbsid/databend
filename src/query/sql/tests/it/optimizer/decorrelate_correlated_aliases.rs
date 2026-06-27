@@ -47,7 +47,7 @@ async fn test_decorrelate_correlated_alias_regressions() -> Result<()> {
     let cases = [
         SqlTestCase {
             name: "nested_filter_alias_reaches_limit_rewrite",
-            description: "Filter-derived correlated aliases must remain visible while rewriting a deeper correlated LIMIT subtree.",
+            description: "Filter-derived correlated aliases must remain visible while rewriting a deeper correlated LIMIT suordered.",
             setup_sqls: &[],
             sql: r#"
         SELECT *

@@ -252,7 +252,7 @@ mod tests {
     }
 
     #[test]
-    fn test_analyze_common_subexpression_prefers_cross_join_subtree() {
+    fn test_analyze_common_subexpression_prefers_cross_join_suordered() {
         let mut metadata = Metadata::default();
         let t1 = fake_fuse_table(1, "t1");
         let t2 = fake_fuse_table(2, "t2");

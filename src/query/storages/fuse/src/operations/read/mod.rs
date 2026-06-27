@@ -13,11 +13,11 @@
 // limitations under the License.
 
 mod block_format;
-mod btree_index_source;
 mod fuse_rows_fetcher;
 pub mod fuse_source;
 mod native_data_source;
 mod native_data_source_deserializer;
+mod ordered_index_source;
 mod parquet_data_source;
 mod parquet_data_source_deserializer;
 mod parquet_rows_fetcher;
@@ -33,10 +33,10 @@ mod data_source_with_meta;
 mod partition_stream;
 mod util;
 
-pub use btree_index_source::build_btree_index_source_pipeline;
 pub use fuse_rows_fetcher::row_fetch_processor;
 pub use fuse_source::build_fuse_source_pipeline;
 pub use native_data_source_deserializer::NativeDeserializeDataTransform;
+pub use ordered_index_source::build_ordered_index_source_pipeline;
 pub use parquet_data_source_deserializer::DeserializeDataTransform;
 pub use read_state::ReadState;
 pub use util::need_reserve_block_info;

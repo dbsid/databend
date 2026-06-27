@@ -3118,45 +3118,45 @@ pub struct CacheConfig {
     )]
     pub inverted_index_filter_memory_ratio: u64,
 
-    /// Max number of cached btree index meta objects. Set it to 0 to disable it.
+    /// Max number of cached ordered index meta objects. Set it to 0 to disable it.
     #[clap(
-        long = "cache-btree-index-meta-count",
+        long = "cache-ordered-index-meta-count",
         value_name = "VALUE",
         default_value = "30000"
     )]
-    pub btree_index_meta_count: u64,
+    pub ordered_index_meta_count: u64,
 
-    /// Max bytes of cached btree index metadata on disk. Set it to 0 to disable it.
+    /// Max bytes of cached ordered index metadata on disk. Set it to 0 to disable it.
     #[clap(
-        long = "disk-cache-btree-index-meta-size",
+        long = "disk-cache-ordered-index-meta-size",
         value_name = "VALUE",
         default_value = "0"
     )]
-    pub disk_cache_btree_index_meta_size: u64,
+    pub disk_cache_ordered_index_meta_size: u64,
 
-    /// Max bytes of cached btree index files. Set it to 0 to disable it.
+    /// Max bytes of cached ordered index files. Set it to 0 to disable it.
     #[clap(
-        long = "cache-btree-index-filter-size",
+        long = "cache-ordered-index-filter-size",
         value_name = "VALUE",
         default_value = "64424509440"
     )]
-    pub btree_index_filter_size: u64,
+    pub ordered_index_filter_size: u64,
 
-    /// Max bytes of cached btree index files on disk. Set it to 0 to disable it.
+    /// Max bytes of cached ordered index files on disk. Set it to 0 to disable it.
     #[clap(
-        long = "disk-cache-btree-index-data-size",
+        long = "disk-cache-ordered-index-data-size",
         value_name = "VALUE",
         default_value = "0"
     )]
-    pub disk_cache_btree_index_data_size: u64,
+    pub disk_cache_ordered_index_data_size: u64,
 
-    /// Max percentage of in memory btree index file cache relative to whole memory. By default it is 0 (disabled).
+    /// Max percentage of in memory ordered index file cache relative to whole memory. By default it is 0 (disabled).
     #[clap(
-        long = "cache-btree-index-filter-memory-ratio",
+        long = "cache-ordered-index-filter-memory-ratio",
         value_name = "VALUE",
         default_value = "0"
     )]
-    pub btree_index_filter_memory_ratio: u64,
+    pub ordered_index_filter_memory_ratio: u64,
 
     /// Max number of cached vector index meta objects. Set it to 0 to disable it.
     #[clap(
@@ -3375,11 +3375,11 @@ impl Default for CacheConfig {
             inverted_index_filter_size: 64424509440,
             disk_cache_inverted_index_data_size: 0,
             inverted_index_filter_memory_ratio: 0,
-            btree_index_meta_count: 30000,
-            disk_cache_btree_index_meta_size: 0,
-            btree_index_filter_size: 64424509440,
-            disk_cache_btree_index_data_size: 0,
-            btree_index_filter_memory_ratio: 0,
+            ordered_index_meta_count: 30000,
+            disk_cache_ordered_index_meta_size: 0,
+            ordered_index_filter_size: 64424509440,
+            disk_cache_ordered_index_data_size: 0,
+            ordered_index_filter_memory_ratio: 0,
             vector_index_meta_count: 30000,
             disk_cache_vector_index_meta_size: 0,
             vector_index_filter_size: 64424509440,

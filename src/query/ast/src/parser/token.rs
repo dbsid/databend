@@ -835,8 +835,8 @@ pub enum TokenKind {
     INFORMATION,
     #[token("INITIALIZE", ignore(ascii_case))]
     INITIALIZE,
-    #[token("BTREE", ignore(ascii_case))]
-    BTREE,
+    #[token("ORDERED", ignore(ascii_case))]
+    ORDERED,
     #[token("INNER", ignore(ascii_case))]
     INNER,
     #[token("INSERT", ignore(ascii_case))]

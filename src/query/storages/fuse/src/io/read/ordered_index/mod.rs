@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod btree_index_loader;
+mod ordered_index_loader;
 
-pub use btree_index_loader::load_btree_index_data_block;
-pub use btree_index_loader::load_btree_index_file;
-pub use btree_index_loader::load_btree_index_meta;
+pub use ordered_index_loader::load_ordered_index_data_block;
+pub use ordered_index_loader::load_ordered_index_file;
+pub use ordered_index_loader::load_ordered_index_meta;

@@ -87,7 +87,7 @@ impl Interpreter for RefreshTableIndexInterpreter {
             )));
         }
         let index_version = index.version.clone();
-        let index_schema = if matches!(self.plan.index_type, ast::TableIndexType::Btree) {
+        let index_schema = if matches!(self.plan.index_type, ast::TableIndexType::Ordered) {
             table_schema.remove_virtual_computed_fields()
         } else {
             table_schema.project(&field_indices)
@@ -100,7 +100,7 @@ impl Interpreter for RefreshTableIndexInterpreter {
             ast::TableIndexType::Ngram => TableIndexType::Ngram,
             ast::TableIndexType::Vector => TableIndexType::Vector,
             ast::TableIndexType::Spatial => TableIndexType::Spatial,
-            ast::TableIndexType::Btree => TableIndexType::Btree,
+            ast::TableIndexType::Ordered => TableIndexType::Ordered,
             ast::TableIndexType::Aggregating => unreachable!(),
         };
 
@@ -120,7 +120,7 @@ impl Interpreter for RefreshTableIndexInterpreter {
                     )
                     .await?
             }
-            ast::TableIndexType::Btree => {
+            ast::TableIndexType::Ordered => {
                 do_refresh_table_index(
                     fuse_table,
                     self.ctx.clone(),

@@ -173,7 +173,7 @@ message TableIndex {
     NGRAM = 1;
     VECTOR = 2;
     SPATIAL = 3;
-    BTREE = 4;
+    ORDERED = 4;
   }
 
   string name = 1;
@@ -191,7 +191,7 @@ message TableIndex {
   // index options specify the index configs, like tokenizer.
   map<string, string> options = 5;
 
-  // Type of table index: inverted, ngram
+  // Type of table index.
   IndexType index_type = 6;
 
   repeated TableIndexColumn key_columns = 7;
@@ -255,8 +255,8 @@ message TableStatistics {
   optional uint64 vector_index_size = 10;
   // Size of virtual column in bytes
   optional uint64 virtual_column_size = 11;
-  // Size of btree index in bytes
-  optional uint64 btree_index_size = 12;
+  // Size of ordered index in bytes
+  optional uint64 ordered_index_size = 12;
 }
 
 message DatabaseIdTableName {

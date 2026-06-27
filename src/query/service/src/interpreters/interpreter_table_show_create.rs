@@ -247,7 +247,7 @@ impl ShowCreateTableInterpreter {
                 } else {
                     "ASYNC "
                 };
-                let column_names = if index_field.index_type == TableIndexType::Btree
+                let column_names = if index_field.index_type == TableIndexType::Ordered
                     && !index_field.key_columns.is_empty()
                 {
                     index_field
@@ -272,7 +272,7 @@ impl ShowCreateTableInterpreter {
                         .collect::<Result<Vec<_>>>()?
                 };
                 let column_names_str = column_names.join(", ").to_string();
-                let include_columns = if index_field.index_type == TableIndexType::Btree
+                let include_columns = if index_field.index_type == TableIndexType::Ordered
                     && !index_field.include_column_ids.is_empty()
                 {
                     Some(

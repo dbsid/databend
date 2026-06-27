@@ -24,12 +24,12 @@ use databend_common_expression::TableSchemaRef;
 use databend_common_meta_app::schema::TableIndexColumnOrder;
 use databend_common_meta_app::schema::TableIndexType;
 use databend_common_meta_app::schema::TableMeta;
-use databend_storages_common_index::BtreeIndexKeyOrder;
-use databend_storages_common_index::BtreeIndexMeta;
-use databend_storages_common_index::BtreeIndexWriter;
-use databend_storages_common_index::btree_equality_prefix;
-use databend_storages_common_index::encode_btree_key_component;
-use databend_storages_common_index::encode_btree_payload;
+use databend_storages_common_index::OrderedIndexKeyOrder;
+use databend_storages_common_index::OrderedIndexMeta;
+use databend_storages_common_index::OrderedIndexWriter;
+use databend_storages_common_index::encode_ordered_key_component;
+use databend_storages_common_index::encode_ordered_payload;
+use databend_storages_common_index::ordered_equality_prefix;
 use databend_storages_common_table_meta::meta::Location;
 use databend_storages_common_table_meta::meta::SingleColumnMeta;
 use databend_storages_common_table_meta::table::TableCompression;
@@ -37,13 +37,13 @@ use log::debug;
 
 use crate::io::TableMetaLocationGenerator;
 
-const BTREE_INDEX_OPTION_COMPRESSION: &str = "compression";
-const BTREE_INDEX_OPTION_COVERED_TYPE: &str = "index_covered_type";
-const BTREE_INDEX_OPTION_DATA_BLOCK_SIZE: &str = "data_block_size";
-const BTREE_INDEX_COVERED_ALL_COLUMNS: &str = "covered_all_columns_in_schema";
+const ORDERED_INDEX_OPTION_COMPRESSION: &str = "compression";
+const ORDERED_INDEX_OPTION_COVERED_TYPE: &str = "index_covered_type";
+const ORDERED_INDEX_OPTION_DATA_BLOCK_SIZE: &str = "data_block_size";
+const ORDERED_INDEX_COVERED_ALL_COLUMNS: &str = "covered_all_columns_in_schema";
 
 #[derive(Clone)]
-pub struct BtreeIndexBuilder {
+pub struct OrderedIndexBuilder {
     pub(crate) name: String,
     pub(crate) version: String,
     pub(crate) key_fields: Vec<(TableField, TableIndexColumnOrder)>,
@@ -51,9 +51,9 @@ pub struct BtreeIndexBuilder {
     pub(crate) options: BTreeMap<String, String>,
 }
 
-impl BtreeIndexBuilder {
-    pub fn gen_btree_index_location(&self, block_location: &Location) -> String {
-        TableMetaLocationGenerator::gen_btree_index_location_from_block_location(
+impl OrderedIndexBuilder {
+    pub fn gen_ordered_index_location(&self, block_location: &Location) -> String {
+        TableMetaLocationGenerator::gen_ordered_index_location_from_block_location(
             &block_location.0,
             &self.name,
             &self.version,
@@ -61,10 +61,10 @@ impl BtreeIndexBuilder {
     }
 }
 
-pub fn create_btree_index_builders(table_meta: &TableMeta) -> Vec<BtreeIndexBuilder> {
-    let mut btree_index_builders = Vec::with_capacity(table_meta.indexes.len());
+pub fn create_ordered_index_builders(table_meta: &TableMeta) -> Vec<OrderedIndexBuilder> {
+    let mut ordered_index_builders = Vec::with_capacity(table_meta.indexes.len());
     for index in table_meta.indexes.values() {
-        if !matches!(index.index_type, TableIndexType::Btree) {
+        if !matches!(index.index_type, TableIndexType::Ordered) {
             continue;
         }
         if !index.sync_creation {
@@ -91,7 +91,7 @@ pub fn create_btree_index_builders(table_meta: &TableMeta) -> Vec<BtreeIndexBuil
                 Ok(field) => key_fields.push((field.clone(), key_column.order.clone())),
                 Err(_) => {
                     debug!(
-                        "Ignoring invalid btree index: {}, missing key column id {}",
+                        "Ignoring invalid ordered index: {}, missing key column id {}",
                         index.name, key_column.column_id
                     );
                     key_fields.clear();
@@ -134,7 +134,7 @@ pub fn create_btree_index_builders(table_meta: &TableMeta) -> Vec<BtreeIndexBuil
                     Ok(field) => payload_fields.push(field.clone()),
                     Err(_) => {
                         debug!(
-                            "Ignoring invalid btree index: {}, missing include column id {}",
+                            "Ignoring invalid ordered index: {}, missing include column id {}",
                             index.name, column_id
                         );
                         payload_fields.clear();
@@ -148,7 +148,7 @@ pub fn create_btree_index_builders(table_meta: &TableMeta) -> Vec<BtreeIndexBuil
             payload_fields
         };
 
-        btree_index_builders.push(BtreeIndexBuilder {
+        ordered_index_builders.push(OrderedIndexBuilder {
             name: index.name.clone(),
             version: index.version.clone(),
             key_fields,
@@ -156,17 +156,17 @@ pub fn create_btree_index_builders(table_meta: &TableMeta) -> Vec<BtreeIndexBuil
             options: index.options.clone(),
         });
     }
-    btree_index_builders
+    ordered_index_builders
 }
 
 #[derive(Debug)]
-pub struct BtreeIndexState {
+pub struct OrderedIndexState {
     pub(crate) data: Vec<u8>,
     pub(crate) size: u64,
     pub(crate) location: Location,
 }
 
-impl BtreeIndexState {
+impl OrderedIndexState {
     pub fn try_create(data: Vec<u8>, location: String) -> Result<Self> {
         let size = data.len() as u64;
         Ok(Self {
@@ -180,34 +180,35 @@ impl BtreeIndexState {
         source_schema: &TableSchemaRef,
         block: &DataBlock,
         block_location: &Location,
-        btree_index_builder: &BtreeIndexBuilder,
+        ordered_index_builder: &OrderedIndexBuilder,
     ) -> Result<Self> {
-        let location = btree_index_builder.gen_btree_index_location(block_location);
-        let data = build_btree_index(source_schema, block, btree_index_builder)?;
+        let location = ordered_index_builder.gen_ordered_index_location(block_location);
+        let data = build_ordered_index(source_schema, block, ordered_index_builder)?;
         Self::try_create(data, location)
     }
 }
 
-pub fn build_btree_index(
+pub fn build_ordered_index(
     source_schema: &TableSchemaRef,
     block: &DataBlock,
-    btree_index_builder: &BtreeIndexBuilder,
+    ordered_index_builder: &OrderedIndexBuilder,
 ) -> Result<Vec<u8>> {
-    let compression = btree_index_builder
+    let compression = ordered_index_builder
         .options
-        .get(BTREE_INDEX_OPTION_COMPRESSION)
+        .get(ORDERED_INDEX_OPTION_COMPRESSION)
         .cloned()
         .unwrap_or_else(|| "zstd".to_string());
     // Validate early so invalid DDL options fail before producing index bytes.
     let _ = TableCompression::try_from(compression.as_str())?;
 
     let full_block = block.convert_to_full();
-    let key_field_indexes = key_field_indexes(source_schema, &btree_index_builder.key_fields)?;
-    let payload_field_indexes = field_indexes(source_schema, &btree_index_builder.payload_fields)?;
-    let schema = serde_json::to_string(&btree_index_builder.payload_fields).map_err(|e| {
-        ErrorCode::StorageOther(format!("failed to encode btree payload schema: {e:?}"))
+    let key_field_indexes = key_field_indexes(source_schema, &ordered_index_builder.key_fields)?;
+    let payload_field_indexes =
+        field_indexes(source_schema, &ordered_index_builder.payload_fields)?;
+    let schema = serde_json::to_string(&ordered_index_builder.payload_fields).map_err(|e| {
+        ErrorCode::StorageOther(format!("failed to encode ordered payload schema: {e:?}"))
     })?;
-    let key_order = btree_index_builder
+    let key_order = ordered_index_builder
         .key_fields
         .iter()
         .map(|(field, order)| match order {
@@ -216,8 +217,8 @@ pub fn build_btree_index(
         })
         .collect::<Vec<_>>()
         .join(",");
-    let meta = BtreeIndexMeta {
-        columns: btree_index_builder
+    let meta = OrderedIndexMeta {
+        columns: ordered_index_builder
             .payload_fields
             .iter()
             .map(|field| {
@@ -228,16 +229,19 @@ pub fn build_btree_index(
             })
             .collect(),
         metadata: BTreeMap::from([
-            ("index_name".to_string(), btree_index_builder.name.clone()),
+            ("index_name".to_string(), ordered_index_builder.name.clone()),
             (
                 "index_version".to_string(),
-                btree_index_builder.version.clone(),
+                ordered_index_builder.version.clone(),
             ),
-            ("encoding".to_string(), "databend-btree-sst-v1".to_string()),
+            (
+                "encoding".to_string(),
+                "databend-ordered-sst-v1".to_string(),
+            ),
         ]),
     };
-    let mut writer = BtreeIndexWriter::new(meta, schema, key_order, compression);
-    if let Some(data_block_size) = btree_index_data_block_size(&btree_index_builder.options)? {
+    let mut writer = OrderedIndexWriter::new(meta, schema, key_order, compression);
+    if let Some(data_block_size) = ordered_index_data_block_size(&ordered_index_builder.options)? {
         writer = writer.with_data_block_size(data_block_size);
     }
     let key_column_count = key_field_indexes.len();
@@ -245,12 +249,12 @@ pub fn build_btree_index(
         let mut key = Vec::new();
         for (field_index, order) in &key_field_indexes {
             let scalar = unsafe { full_block.get_by_offset(*field_index).index_unchecked(row) };
-            encode_btree_key_component(&mut key, scalar, *order)?;
+            encode_ordered_key_component(&mut key, scalar, *order)?;
         }
 
         for prefix_column_count in 1..=key_column_count {
             writer.add_equality_prefix(Bytes::copy_from_slice(
-                btree_equality_prefix(&key, prefix_column_count)?.as_slice(),
+                ordered_equality_prefix(&key, prefix_column_count)?.as_slice(),
             ));
         }
 
@@ -259,7 +263,7 @@ pub fn build_btree_index(
             let scalar = unsafe { full_block.get_by_offset(*field_index).index_unchecked(row) };
             payload.push(scalar.to_owned());
         }
-        let payload = encode_btree_payload(&payload)?;
+        let payload = encode_ordered_payload(&payload)?;
         writer.add_row(Bytes::from(key), Bytes::from(payload));
     }
     writer.finish().map(|bytes| bytes.to_vec())
@@ -267,22 +271,22 @@ pub fn build_btree_index(
 
 fn is_covered_all_columns(options: &BTreeMap<String, String>) -> bool {
     options
-        .get(BTREE_INDEX_OPTION_COVERED_TYPE)
-        .is_some_and(|value| value.eq_ignore_ascii_case(BTREE_INDEX_COVERED_ALL_COLUMNS))
+        .get(ORDERED_INDEX_OPTION_COVERED_TYPE)
+        .is_some_and(|value| value.eq_ignore_ascii_case(ORDERED_INDEX_COVERED_ALL_COLUMNS))
 }
 
-fn btree_index_data_block_size(options: &BTreeMap<String, String>) -> Result<Option<usize>> {
+fn ordered_index_data_block_size(options: &BTreeMap<String, String>) -> Result<Option<usize>> {
     options
-        .get(BTREE_INDEX_OPTION_DATA_BLOCK_SIZE)
+        .get(ORDERED_INDEX_OPTION_DATA_BLOCK_SIZE)
         .map(|value| {
             let data_block_size = value.parse::<usize>().map_err(|_| {
                 ErrorCode::StorageOther(format!(
-                    "invalid btree index data_block_size option: {value}"
+                    "invalid ordered index data_block_size option: {value}"
                 ))
             })?;
             if data_block_size == 0 {
                 return Err(ErrorCode::StorageOther(
-                    "invalid btree index data_block_size option: 0".to_string(),
+                    "invalid ordered index data_block_size option: 0".to_string(),
                 ));
             }
             Ok(data_block_size)
@@ -300,17 +304,17 @@ fn field_indexes(schema: &TableSchemaRef, fields: &[TableField]) -> Result<Vec<u
 fn key_field_indexes(
     schema: &TableSchemaRef,
     fields: &[(TableField, TableIndexColumnOrder)],
-) -> Result<Vec<(usize, BtreeIndexKeyOrder)>> {
+) -> Result<Vec<(usize, OrderedIndexKeyOrder)>> {
     fields
         .iter()
-        .map(|(field, order)| Ok((schema.index_of(field.name())?, to_btree_key_order(order))))
+        .map(|(field, order)| Ok((schema.index_of(field.name())?, to_ordered_key_order(order))))
         .collect()
 }
 
-fn to_btree_key_order(order: &TableIndexColumnOrder) -> BtreeIndexKeyOrder {
+fn to_ordered_key_order(order: &TableIndexColumnOrder) -> OrderedIndexKeyOrder {
     match order {
-        TableIndexColumnOrder::Asc => BtreeIndexKeyOrder::Asc,
-        TableIndexColumnOrder::Desc => BtreeIndexKeyOrder::Desc,
+        TableIndexColumnOrder::Asc => OrderedIndexKeyOrder::Asc,
+        TableIndexColumnOrder::Desc => OrderedIndexKeyOrder::Desc,
     }
 }
 
@@ -328,12 +332,12 @@ mod tests {
     use databend_common_expression::types::NumberDataType;
     use databend_common_expression::types::StringType;
     use databend_common_expression::types::number::UInt64Type;
-    use databend_storages_common_index::BtreeIndexFileView;
+    use databend_storages_common_index::OrderedIndexFileView;
 
     use super::*;
 
     #[test]
-    fn test_build_btree_index_sst_from_block() -> Result<()> {
+    fn test_build_ordered_index_sst_from_block() -> Result<()> {
         let wallet = TableField::new_from_column_id("wallet_address", TableDataType::String, 0);
         let platform = TableField::new_from_column_id(
             "platform_id",
@@ -352,7 +356,7 @@ mod tests {
             UInt64Type::from_data(vec![14, 14, 14]),
             UInt64Type::from_data(vec![20, 30, 40]),
         ]);
-        let builder = BtreeIndexBuilder {
+        let builder = OrderedIndexBuilder {
             name: "idx_wallet".to_string(),
             version: "123456789".to_string(),
             key_fields: vec![
@@ -364,19 +368,19 @@ mod tests {
             options: BTreeMap::from([("compression".to_string(), "none".to_string())]),
         };
 
-        let data = build_btree_index(&schema, &block, &builder)?;
-        let view = Arc::new(BtreeIndexFileView::open(data.into())?);
+        let data = build_ordered_index(&schema, &block, &builder)?;
+        let view = Arc::new(OrderedIndexFileView::open(data.into())?);
 
         let mut prefix = Vec::new();
-        encode_btree_key_component(
+        encode_ordered_key_component(
             &mut prefix,
             ScalarRef::String("wallet-a"),
-            BtreeIndexKeyOrder::Asc,
+            OrderedIndexKeyOrder::Asc,
         )?;
-        encode_btree_key_component(
+        encode_ordered_key_component(
             &mut prefix,
             ScalarRef::Number(databend_common_expression::types::NumberScalar::UInt64(14)),
-            BtreeIndexKeyOrder::Asc,
+            OrderedIndexKeyOrder::Asc,
         )?;
 
         assert!(view.may_contain_equality_prefix(&prefix));
@@ -405,13 +409,13 @@ mod tests {
     }
 
     #[test]
-    fn test_build_btree_index_sst_with_data_block_size_option() -> Result<()> {
+    fn test_build_ordered_index_sst_with_data_block_size_option() -> Result<()> {
         let wallet = TableField::new_from_column_id("wallet_address", TableDataType::String, 0);
         let schema = TableSchemaRefExt::create(vec![wallet.clone()]);
         let block = DataBlock::new_from_columns(vec![StringType::from_data(vec![
             "wallet-a", "wallet-b", "wallet-c",
         ])]);
-        let builder = BtreeIndexBuilder {
+        let builder = OrderedIndexBuilder {
             name: "idx_wallet".to_string(),
             version: "123456789".to_string(),
             key_fields: vec![(wallet.clone(), TableIndexColumnOrder::Asc)],
@@ -422,13 +426,13 @@ mod tests {
             ]),
         };
 
-        let data = build_btree_index(&schema, &block, &builder)?;
-        let view = BtreeIndexFileView::open(data.into())?;
+        let data = build_ordered_index(&schema, &block, &builder)?;
+        let view = OrderedIndexFileView::open(data.into())?;
         assert_eq!(view.index_block().data_blocks.len(), 3);
         Ok(())
     }
 
     fn decode_payload_for_test(payload: &[u8]) -> Result<Vec<Scalar>> {
-        databend_storages_common_index::decode_btree_payload(payload)
+        databend_storages_common_index::decode_ordered_payload(payload)
     }
 }

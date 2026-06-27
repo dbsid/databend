@@ -119,7 +119,7 @@ impl DeduplicateJoinConditionOptimizer {
     fn optimize_filtering_join(&mut self, s_expr: &SExpr, join: &Join) -> Result<SExpr> {
         debug_assert!(join.join_type.is_filtering_join());
 
-        // Recursively optimize left and right subtrees
+        // Recursively optimize left and right suordereds
         let left = self.deduplicate(s_expr.child(0)?)?;
         let right = self.deduplicate(s_expr.child(1)?)?;
 

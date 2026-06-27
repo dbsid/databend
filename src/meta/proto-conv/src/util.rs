@@ -206,7 +206,7 @@ const META_CHANGE_LOG: &[(u64, &str)] = &[
     (174, "2026-04-28: Add: AuthInfo::KeyPair for key-pair authentication"),
     (175, "2026-05-08: Add: field_stats_truncate_len per-column string stats truncation in TableMeta"),
     (176, "2026-05-25: Add: task.proto/Task.script_sql"),
-    (177, "2026-06-26: Add: table.proto/TableIndex BTREE type and TableStatistics.btree_index_size")
+    (177, "2026-06-26: Add: table.proto/TableIndex ORDERED type and TableStatistics.ordered_index_size")
     // Dear developer:
     //      If you're gonna add a new metadata version, you'll have to add a test for it.
     //      You could just copy an existing test file(e.g., `../tests/it/v024_table_meta.rs`)

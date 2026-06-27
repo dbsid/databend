@@ -2109,7 +2109,7 @@ impl Binder {
             let (index_type, column_ids, key_columns, include_column_ids, options) =
                 match table_index_def.index_type {
                     AstTableIndexType::Inverted => {
-                        super::index::validate_no_btree_column_features(
+                        super::index::validate_no_ordered_column_features(
                             &table_index_def.index_type,
                             &table_index_def.columns,
                             &table_index_def.include_columns,
@@ -2130,7 +2130,7 @@ impl Binder {
                         )
                     }
                     AstTableIndexType::Ngram => {
-                        super::index::validate_no_btree_column_features(
+                        super::index::validate_no_ordered_column_features(
                             &table_index_def.index_type,
                             &table_index_def.columns,
                             &table_index_def.include_columns,
@@ -2151,7 +2151,7 @@ impl Binder {
                         )
                     }
                     AstTableIndexType::Vector => {
-                        super::index::validate_no_btree_column_features(
+                        super::index::validate_no_ordered_column_features(
                             &table_index_def.index_type,
                             &table_index_def.columns,
                             &table_index_def.include_columns,
@@ -2172,7 +2172,7 @@ impl Binder {
                         )
                     }
                     AstTableIndexType::Spatial => {
-                        super::index::validate_no_btree_column_features(
+                        super::index::validate_no_ordered_column_features(
                             &table_index_def.index_type,
                             &table_index_def.columns,
                             &table_index_def.include_columns,
@@ -2192,8 +2192,8 @@ impl Binder {
                             options,
                         )
                     }
-                    AstTableIndexType::Btree => {
-                        let key_columns = self.validate_btree_index_columns(
+                    AstTableIndexType::Ordered => {
+                        let key_columns = self.validate_ordered_index_columns(
                             table_schema.clone(),
                             &table_index_def.columns,
                         )?;
@@ -2201,14 +2201,14 @@ impl Binder {
                             .iter()
                             .map(|column| column.column_id)
                             .collect::<Vec<_>>();
-                        let include_column_ids = self.validate_btree_index_include_columns(
+                        let include_column_ids = self.validate_ordered_index_include_columns(
                             table_schema.clone(),
                             &table_index_def.include_columns,
                         )?;
                         let options =
-                            self.validate_btree_index_options(&table_index_def.index_options)?;
+                            self.validate_ordered_index_options(&table_index_def.index_options)?;
                         (
-                            TableIndexType::Btree,
+                            TableIndexType::Ordered,
                             column_ids,
                             key_columns,
                             include_column_ids,

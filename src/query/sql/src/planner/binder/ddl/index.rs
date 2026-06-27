@@ -100,7 +100,7 @@ pub(in crate::planner::binder) fn asc_key_columns(
         .collect()
 }
 
-pub(in crate::planner::binder) fn validate_no_btree_column_features(
+pub(in crate::planner::binder) fn validate_no_ordered_column_features(
     index_type: &AstTableIndexType,
     columns: &[AstTableIndexColumn],
     include_columns: &[Identifier],
@@ -515,7 +515,7 @@ impl Binder {
         let (column_ids, key_columns, include_column_ids, index_options, meta_index_type) =
             match index_type {
                 AstTableIndexType::Inverted => {
-                    validate_no_btree_column_features(index_type, columns, include_columns)?;
+                    validate_no_ordered_column_features(index_type, columns, include_columns)?;
                     let columns = table_index_column_names(columns);
                     let column_ids =
                         self.validate_inverted_index_columns(table_schema.clone(), &columns)?;
@@ -530,7 +530,7 @@ impl Binder {
                     )
                 }
                 AstTableIndexType::Ngram => {
-                    validate_no_btree_column_features(index_type, columns, include_columns)?;
+                    validate_no_ordered_column_features(index_type, columns, include_columns)?;
                     let columns = table_index_column_names(columns);
                     let column_ids =
                         self.validate_ngram_index_columns(table_schema.clone(), &columns)?;
@@ -545,7 +545,7 @@ impl Binder {
                     )
                 }
                 AstTableIndexType::Vector => {
-                    validate_no_btree_column_features(index_type, columns, include_columns)?;
+                    validate_no_ordered_column_features(index_type, columns, include_columns)?;
                     let columns = table_index_column_names(columns);
                     let column_ids =
                         self.validate_vector_index_columns(table_schema.clone(), &columns)?;
@@ -560,7 +560,7 @@ impl Binder {
                     )
                 }
                 AstTableIndexType::Spatial => {
-                    validate_no_btree_column_features(index_type, columns, include_columns)?;
+                    validate_no_ordered_column_features(index_type, columns, include_columns)?;
                     let columns = table_index_column_names(columns);
                     let column_ids =
                         self.validate_spatial_index_columns(table_schema.clone(), &columns)?;
@@ -574,24 +574,24 @@ impl Binder {
                         TableIndexType::Spatial,
                     )
                 }
-                AstTableIndexType::Btree => {
+                AstTableIndexType::Ordered => {
                     let key_columns =
-                        self.validate_btree_index_columns(table_schema.clone(), columns)?;
+                        self.validate_ordered_index_columns(table_schema.clone(), columns)?;
                     let column_ids = key_columns
                         .iter()
                         .map(|column| column.column_id)
                         .collect::<Vec<_>>();
-                    let include_column_ids = self.validate_btree_index_include_columns(
+                    let include_column_ids = self.validate_ordered_index_include_columns(
                         table_schema.clone(),
                         include_columns,
                     )?;
-                    let index_options = self.validate_btree_index_options(index_options)?;
+                    let index_options = self.validate_ordered_index_options(index_options)?;
                     (
                         column_ids,
                         key_columns,
                         include_column_ids,
                         index_options,
-                        TableIndexType::Btree,
+                        TableIndexType::Ordered,
                     )
                 }
                 AstTableIndexType::Aggregating => unreachable!(),
@@ -615,7 +615,7 @@ impl Binder {
             if meta_index_type != table_index.index_type {
                 continue;
             }
-            if matches!(meta_index_type, TableIndexType::Btree)
+            if matches!(meta_index_type, TableIndexType::Ordered)
                 && table_index.key_columns == key_columns
                 && table_index.include_column_ids == include_column_ids
                 && table_index.options == index_options
@@ -625,7 +625,7 @@ impl Binder {
                     index_type
                 )));
             }
-            if matches!(meta_index_type, TableIndexType::Btree) {
+            if matches!(meta_index_type, TableIndexType::Ordered) {
                 continue;
             }
             let old_column_ids_set = table_index
@@ -1000,7 +1000,7 @@ impl Binder {
         Ok(options)
     }
 
-    pub(in crate::planner::binder) fn validate_btree_index_columns(
+    pub(in crate::planner::binder) fn validate_ordered_index_columns(
         &self,
         table_schema: TableSchemaRef,
         columns: &[AstTableIndexColumn],
@@ -1012,7 +1012,7 @@ impl Binder {
                 Ok(field) => {
                     if column_set.contains(&field.column_id) {
                         return Err(ErrorCode::UnsupportedIndex(format!(
-                            "Btree index column must be unique, but column {} is duplicate",
+                            "Ordered index column must be unique, but column {} is duplicate",
                             column.name.name
                         )));
                     }
@@ -1036,7 +1036,7 @@ impl Binder {
         Ok(key_columns)
     }
 
-    pub(in crate::planner::binder) fn validate_btree_index_include_columns(
+    pub(in crate::planner::binder) fn validate_ordered_index_include_columns(
         &self,
         table_schema: TableSchemaRef,
         columns: &[Identifier],
@@ -1048,7 +1048,7 @@ impl Binder {
                 Ok(field) => {
                     if column_set.contains(&field.column_id) {
                         return Err(ErrorCode::UnsupportedIndex(format!(
-                            "Btree index include column must be unique, but column {} is duplicate",
+                            "Ordered index include column must be unique, but column {} is duplicate",
                             column.name
                         )));
                     }
@@ -1066,7 +1066,7 @@ impl Binder {
         Ok(column_ids)
     }
 
-    pub(in crate::planner::binder) fn validate_btree_index_options(
+    pub(in crate::planner::binder) fn validate_ordered_index_options(
         &self,
         index_options: &BTreeMap<String, String>,
     ) -> Result<BTreeMap<String, String>> {
@@ -1096,7 +1096,7 @@ impl Binder {
                 }
                 _ => {
                     return Err(ErrorCode::IndexOptionInvalid(format!(
-                        "index option `{key}` is invalid key for create btree index statement",
+                        "index option `{key}` is invalid key for create ordered index statement",
                     )));
                 }
             }
@@ -1163,7 +1163,7 @@ impl Binder {
                 | AstTableIndexType::Ngram
                 | AstTableIndexType::Vector
                 | AstTableIndexType::Spatial
-                | AstTableIndexType::Btree
+                | AstTableIndexType::Ordered
         ) {
             return Err(ErrorCode::UnsupportedIndex(format!(
                 "Table index {} does not support refresh",

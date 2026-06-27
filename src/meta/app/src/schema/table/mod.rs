@@ -140,8 +140,8 @@ pub struct TableStatistics {
     pub ngram_index_size: Option<u64>,
     /// Size of inverted index in bytes
     pub inverted_index_size: Option<u64>,
-    /// Size of btree index in bytes
-    pub btree_index_size: Option<u64>,
+    /// Size of ordered index in bytes
+    pub ordered_index_size: Option<u64>,
     /// Size of vector index in bytes
     pub vector_index_size: Option<u64>,
     /// Size of virtual column in bytes
@@ -266,7 +266,7 @@ pub enum TableIndexType {
     Ngram = 1,
     Vector = 2,
     Spatial = 3,
-    Btree = 4,
+    Ordered = 4,
 }
 
 #[derive(
@@ -497,8 +497,8 @@ impl Display for TableIndexType {
             TableIndexType::Spatial => {
                 write!(f, "SPATIAL")
             }
-            TableIndexType::Btree => {
-                write!(f, "BTREE")
+            TableIndexType::Ordered => {
+                write!(f, "ORDERED")
             }
         }
     }
