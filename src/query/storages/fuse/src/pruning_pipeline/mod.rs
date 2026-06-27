@@ -41,6 +41,7 @@ pub use sample_block_metas_transform::SampleBlockMetasTransform;
 pub use segment_prune_transform::SegmentPruneTransform;
 pub use send_part_info_sink::SendPartInfoSink;
 pub use send_part_info_sink::SendPartState;
+pub use sync_block_prune_transform::AttachBlockMetaIndexTransform;
 pub use sync_block_prune_transform::SyncBlockPruneTransform;
 pub use topn_prune_transform::TopNPruneTransform;
 pub use vector_index_prune_transform::VectorIndexPruneTransform;

@@ -65,3 +65,43 @@ impl BlockMetaAccumulatingTransform<BlockMetasMeta> for SyncBlockPruneTransform 
         ))))
     }
 }
+
+pub struct AttachBlockMetaIndexTransform {
+    block_pruner: Arc<BlockPruner>,
+}
+
+impl AttachBlockMetaIndexTransform {
+    pub fn create(
+        input: Arc<InputPort>,
+        output: Arc<OutputPort>,
+        block_pruner: Arc<BlockPruner>,
+    ) -> Result<ProcessorPtr> {
+        Ok(ProcessorPtr::create(
+            BlockMetaAccumulatingTransformer::create(
+                input,
+                output,
+                AttachBlockMetaIndexTransform { block_pruner },
+            ),
+        ))
+    }
+}
+
+impl BlockMetaAccumulatingTransform<BlockMetasMeta> for AttachBlockMetaIndexTransform {
+    const NAME: &'static str = "AttachBlockMetaIndexTransform";
+
+    fn transform(&mut self, data: BlockMetasMeta) -> Result<Option<DataBlock>> {
+        let block_meta_indexes = self.block_pruner.internal_column_pruning(&data.block_metas);
+        let result = BlockPruner::attach_block_meta_indexes_without_pruning(
+            data.segment_location,
+            data.block_metas,
+            block_meta_indexes,
+        );
+        if result.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(DataBlock::empty_with_meta(BlockPruneResult::create(
+            result,
+        ))))
+    }
+}
