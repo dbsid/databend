@@ -83,23 +83,13 @@ pub async fn load_ordered_index_file(
             .read_with(location)
             .range(0..len)
             .await
-            .map_err(|err| {
-                ErrorCode::StorageOther(format!(
-                    "read ordered index file failed, {}, {:?}",
-                    location, err
-                ))
-            })?
+            .map_err(ErrorCode::from)?
             .to_bytes()
     } else {
         operator
             .read(location)
             .await
-            .map_err(|err| {
-                ErrorCode::StorageOther(format!(
-                    "read ordered index file failed, {}, {:?}",
-                    location, err
-                ))
-            })?
+            .map_err(ErrorCode::from)?
             .to_bytes()
     };
     let file = OrderedIndexFile::create(location.to_string(), data);
@@ -156,12 +146,7 @@ pub async fn load_ordered_index_meta(
         operator
             .stat(location)
             .await
-            .map_err(|err| {
-                ErrorCode::StorageOther(format!(
-                    "stat ordered index file failed, {}, {:?}",
-                    location, err
-                ))
-            })?
+            .map_err(ErrorCode::from)?
             .content_length()
     };
     if file_len < ORDERED_INDEX_FOOTER_TAIL_SIZE as u64 {
@@ -281,8 +266,9 @@ async fn read_range(
         .read_with(location)
         .range(range)
         .await
-        .map_err(|err| {
-            ErrorCode::StorageOther(format!("read {label} failed, {}, {:?}", location, err))
+        .map_err(|err| match ErrorCode::from(err) {
+            err if err.code() == ErrorCode::STORAGE_NOT_FOUND => err,
+            err => ErrorCode::StorageOther(format!("read {label} failed, {}, {}", location, err)),
         })
         .map(|data| data.to_bytes())
 }

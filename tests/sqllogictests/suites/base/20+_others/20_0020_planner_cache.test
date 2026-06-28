@@ -61,6 +61,197 @@ SELECT * FROM t1 ORDER BY a;
 3 s
 
 statement ok
+CREATE TABLE IF NOT EXISTS t_insert_invalidate (a INT not null);
+
+statement ok
+INSERT INTO t_insert_invalidate VALUES (1);
+
+query I
+SELECT sum(a) FROM t_insert_invalidate;
+----
+1
+
+query I
+SELECT sum(a) FROM t_insert_invalidate;
+----
+1
+
+statement ok
+INSERT INTO t_insert_invalidate VALUES (2);
+
+query I
+SELECT sum(a) FROM t_insert_invalidate;
+----
+3
+
+query I
+SELECT sum(a) FROM t_insert_invalidate;
+----
+3
+
+statement ok
+CREATE TABLE IF NOT EXISTS t_recreate_invalidate (a INT not null);
+
+statement ok
+INSERT INTO t_recreate_invalidate VALUES (10);
+
+query I
+SELECT sum(a) FROM t_recreate_invalidate;
+----
+10
+
+query I
+SELECT sum(a) FROM t_recreate_invalidate;
+----
+10
+
+statement ok
+DROP TABLE t_recreate_invalidate;
+
+statement ok
+CREATE TABLE t_recreate_invalidate (a INT not null);
+
+statement ok
+INSERT INTO t_recreate_invalidate VALUES (20);
+
+query I
+SELECT sum(a) FROM t_recreate_invalidate;
+----
+20
+
+statement ok
+CREATE TABLE IF NOT EXISTS t_rename_invalidate (a INT not null);
+
+statement ok
+INSERT INTO t_rename_invalidate VALUES (100);
+
+query I
+SELECT sum(a) FROM t_rename_invalidate;
+----
+100
+
+query I
+SELECT sum(a) FROM t_rename_invalidate;
+----
+100
+
+statement ok
+RENAME TABLE t_rename_invalidate TO t_rename_invalidate_old;
+
+statement ok
+CREATE TABLE t_rename_invalidate (a INT not null);
+
+statement ok
+INSERT INTO t_rename_invalidate VALUES (200);
+
+query I
+SELECT sum(a) FROM t_rename_invalidate;
+----
+200
+
+statement ok
+CREATE DATABASE db20_20_cache_other;
+
+statement ok
+USE db20_20_cache_other;
+
+statement ok
+CREATE TABLE t_cross_db (a INT not null);
+
+statement ok
+INSERT INTO t_cross_db VALUES (900);
+
+query I
+SELECT sum(a) FROM t_cross_db;
+----
+900
+
+query I
+SELECT sum(a) FROM t_cross_db;
+----
+900
+
+statement ok
+USE db20_20;
+
+statement ok
+CREATE TABLE t_cross_db (a INT not null);
+
+statement ok
+INSERT INTO t_cross_db VALUES (300);
+
+query I
+SELECT sum(a) FROM t_cross_db;
+----
+300
+
+query I
+SELECT sum(a) FROM t_cross_db;
+----
+300
+
+statement ok
+USE db20_20_cache_other;
+
+query I
+SELECT sum(a) FROM t_cross_db;
+----
+900
+
+statement ok
+USE db20_20;
+
+statement ok
+CREATE DATABASE db20_20_cache_rename_src;
+
+statement ok
+USE db20_20_cache_rename_src;
+
+statement ok
+CREATE TABLE t_db_rename (a INT not null);
+
+statement ok
+INSERT INTO t_db_rename VALUES (400);
+
+query I
+SELECT sum(a) FROM t_db_rename;
+----
+400
+
+query I
+SELECT sum(a) FROM t_db_rename;
+----
+400
+
+statement ok
+ALTER DATABASE db20_20_cache_rename_src RENAME TO db20_20_cache_rename_dst;
+
+statement ok
+CREATE DATABASE db20_20_cache_rename_src;
+
+statement ok
+USE db20_20_cache_rename_src;
+
+statement ok
+CREATE TABLE t_db_rename (a INT not null);
+
+statement ok
+INSERT INTO t_db_rename VALUES (500);
+
+query I
+SELECT sum(a) FROM t_db_rename;
+----
+500
+
+query I
+SELECT sum(a) FROM db20_20_cache_rename_dst.t_db_rename;
+----
+400
+
+statement ok
+USE db20_20;
+
+statement ok
 SET enable_planner_cache = 0;
 
 query IT
@@ -79,3 +270,12 @@ SELECT * FROM t1 ORDER BY a;
 
 statement ok
 DROP DATABASE db20_20;
+
+statement ok
+DROP DATABASE db20_20_cache_other;
+
+statement ok
+DROP DATABASE db20_20_cache_rename_src;
+
+statement ok
+DROP DATABASE db20_20_cache_rename_dst;

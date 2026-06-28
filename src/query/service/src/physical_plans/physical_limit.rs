@@ -30,6 +30,7 @@ use databend_common_sql::Symbol;
 use databend_common_sql::optimizer::ir::SExpr;
 
 use crate::physical_plans::PhysicalPlanBuilder;
+use crate::physical_plans::Sort;
 use crate::physical_plans::explain::PlanStatsInfo;
 use crate::physical_plans::format::LimitFormatter;
 use crate::physical_plans::format::PhysicalFormat;
@@ -168,6 +169,12 @@ impl PhysicalPlanBuilder {
         }
         if let Some(count) = limit.limit {
             self.try_apply_presorted_merge_for_limit(&mut input_plan, count + limit.offset);
+        }
+        if limit.offset == 0
+            && let Some(count) = limit.limit
+            && let Some(input) = redundant_ordered_index_limit_input(&input_plan, count)
+        {
+            return Ok(input);
         }
         if limit.before_exchange || lazy_columns.is_empty() || !support_lazy_materialize {
             return Ok(PhysicalPlan::new(Limit {
@@ -319,6 +326,12 @@ impl PhysicalPlanBuilder {
 
         Ok(plan)
     }
+}
+
+fn redundant_ordered_index_limit_input(plan: &PhysicalPlan, limit: usize) -> Option<PhysicalPlan> {
+    let sort = Sort::from_physical_plan(plan)?;
+    sort.redundant_ordered_index_limit(limit)
+        .then(|| sort.input.clone())
 }
 
 fn plan_contains_ordered_index(plan: &PhysicalPlan) -> bool {

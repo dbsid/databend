@@ -33,6 +33,7 @@ use uuid::Version;
 use crate::FUSE_TBL_AGG_INDEX_PREFIX;
 use crate::FUSE_TBL_INVERTED_INDEX_PREFIX;
 use crate::FUSE_TBL_LAST_SNAPSHOT_HINT_V2;
+use crate::FUSE_TBL_LEGACY_ORDERED_INDEX_PREFIX;
 use crate::FUSE_TBL_ORDERED_INDEX_PREFIX;
 use crate::FUSE_TBL_SEGMENT_STATISTICS_PREFIX;
 use crate::FUSE_TBL_SPATIAL_INDEX_PREFIX;
@@ -334,6 +335,33 @@ impl TableMetaLocationGenerator {
         index_name: &str,
         index_version: &str,
     ) -> String {
+        Self::gen_ordered_index_location_from_block_location_with_prefix(
+            loc,
+            FUSE_TBL_ORDERED_INDEX_PREFIX,
+            index_name,
+            index_version,
+        )
+    }
+
+    pub fn gen_legacy_ordered_index_location_from_block_location(
+        loc: &str,
+        index_name: &str,
+        index_version: &str,
+    ) -> String {
+        Self::gen_ordered_index_location_from_block_location_with_prefix(
+            loc,
+            FUSE_TBL_LEGACY_ORDERED_INDEX_PREFIX,
+            index_name,
+            index_version,
+        )
+    }
+
+    fn gen_ordered_index_location_from_block_location_with_prefix(
+        loc: &str,
+        index_prefix: &str,
+        index_name: &str,
+        index_version: &str,
+    ) -> String {
         let splits = loc.split('/').collect::<Vec<_>>();
         let len = splits.len();
         let prefix = splits[..len - 2].join("/");
@@ -342,12 +370,7 @@ impl TableMetaLocationGenerator {
         let short_ver: String = index_version.chars().take(7).collect();
         format!(
             "{}/{}/{}/{}/{}_v{}.sst",
-            prefix,
-            FUSE_TBL_ORDERED_INDEX_PREFIX,
-            index_name,
-            short_ver,
-            id,
-            ORDERED_INDEX_FILE_VERSION,
+            prefix, index_prefix, index_name, short_ver, id, ORDERED_INDEX_FILE_VERSION,
         )
     }
 

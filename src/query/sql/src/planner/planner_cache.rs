@@ -32,6 +32,7 @@ use databend_common_functions::is_cacheable_function;
 use databend_common_meta_app::schema::SecurityPolicyColumnMap;
 use databend_common_meta_app::schema::TableMeta;
 use databend_common_settings::ChangeValue;
+use databend_meta_client::types::MetaId;
 use databend_storages_common_cache::CacheAccessor;
 use databend_storages_common_cache::CacheValue;
 use databend_storages_common_cache::InMemoryLruCache;
@@ -51,6 +52,7 @@ use crate::plans::Plan;
 #[derive(Clone)]
 pub struct PlanCacheItem {
     pub(crate) plan: Plan,
+    table_snapshots: Vec<TableSnapshot>,
     pub(crate) setting_changes: Vec<(String, ChangeValue)>,
     pub(crate) variables: HashMap<String, Scalar>,
 }
@@ -101,20 +103,51 @@ impl Planner {
         }))
     }
 
+    pub(crate) async fn get_cache_for_stmt(
+        &self,
+        stmt: &Statement,
+    ) -> Result<Option<PlanCacheItem>> {
+        if !matches!(stmt, Statement::Query(_))
+            || !self.ctx.get_settings().get_enable_planner_cache()?
+        {
+            return Ok(None);
+        }
+
+        let plain_key = self.planner_cache_key_for_stmt(stmt, false)?;
+        if let Some(item) = self.get_cache_by_key(&plain_key).await? {
+            return Ok(Some(item));
+        }
+
+        Ok(None)
+    }
+
     fn planner_cache_key_for_stmt(
         &self,
         stmt: &Statement,
         has_security_policy: bool,
     ) -> Result<String> {
+        let context_prefix = self.planner_cache_context_prefix();
         if has_security_policy {
             return Ok(Self::planner_cache_key(&format!(
-                "{}\0{}",
+                "{}\0{}\0{}",
+                context_prefix,
                 self.security_policy_cache_key_prefix()?,
                 stmt
             )));
         }
 
-        Ok(Self::planner_cache_key(&stmt.to_string()))
+        Ok(Self::planner_cache_key(&format!(
+            "{context_prefix}\0{stmt}"
+        )))
+    }
+
+    fn planner_cache_context_prefix(&self) -> String {
+        format!(
+            "ctx\0{}\0{}\0{}",
+            self.ctx.get_tenant().tenant_name(),
+            self.ctx.get_current_catalog(),
+            self.ctx.get_current_database()
+        )
     }
 
     fn security_policy_cache_key_prefix(&self) -> Result<String> {
@@ -157,11 +190,7 @@ impl Planner {
         let cache = LazyLock::force(&PLAN_CACHE);
         let plan_item = cache.get(&cache_ctx.cache_key)?;
 
-        let settings = self.ctx.get_settings();
-        if settings.changes().len() != plan_item.setting_changes.len()
-            || self.setting_changes() != plan_item.setting_changes
-            || self.ctx.get_all_variables() != plan_item.variables
-        {
+        if !self.plan_cache_item_matches_env(plan_item.as_ref()) {
             return None;
         }
 
@@ -175,9 +204,90 @@ impl Planner {
             .then(|| plan_item.as_ref().clone())
     }
 
+    async fn get_cache_by_key(&self, cache_key: &str) -> Result<Option<PlanCacheItem>> {
+        let cache = LazyLock::force(&PLAN_CACHE);
+        let Some(plan_item) = cache.get(cache_key) else {
+            return Ok(None);
+        };
+        let plan_item = plan_item.as_ref();
+
+        if !self.plan_cache_item_matches_env(plan_item) {
+            return Ok(None);
+        }
+
+        let Plan::Query { metadata, .. } = &plan_item.plan else {
+            return Ok(None);
+        };
+
+        let matches_cached_metadata = {
+            let metadata = metadata.read();
+            PlanCacheContext::matches_snapshots_with_metadata_tables(
+                &plan_item.table_snapshots,
+                metadata.tables(),
+            )
+        };
+        if !matches_cached_metadata {
+            return Ok(None);
+        }
+
+        if !self
+            .matches_current_tables(&plan_item.table_snapshots)
+            .await?
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(plan_item.clone()))
+    }
+
+    fn plan_cache_item_matches_env(&self, plan_item: &PlanCacheItem) -> bool {
+        let settings = self.ctx.get_settings();
+        settings.changes().len() == plan_item.setting_changes.len()
+            && self.setting_changes() == plan_item.setting_changes
+            && self.ctx.get_all_variables() == plan_item.variables
+    }
+
+    async fn matches_current_tables(&self, snapshots: &[TableSnapshot]) -> Result<bool> {
+        if snapshots.is_empty() {
+            return Ok(false);
+        }
+
+        for snapshot in snapshots {
+            let Ok(catalog) = self.ctx.get_catalog(&snapshot.catalog_name).await else {
+                return Ok(false);
+            };
+
+            let Some(table_meta) = catalog.get_table_meta_by_id(snapshot.table_id).await? else {
+                return Ok(false);
+            };
+
+            if !snapshot.matches_table_meta(table_meta.seq, &table_meta.data) {
+                return Ok(false);
+            }
+
+            let Ok(current_table) = catalog
+                .get_table(
+                    &self.ctx.get_tenant(),
+                    &snapshot.database_name,
+                    &snapshot.table_name,
+                )
+                .await
+            else {
+                return Ok(false);
+            };
+
+            if !snapshot.matches_table(current_table.as_ref()) {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
     pub(crate) fn set_cache(&self, cache_ctx: PlanCacheContext, plan: Plan) {
         let plan_item = PlanCacheItem {
             plan,
+            table_snapshots: cache_ctx.table_snapshots,
             setting_changes: self.setting_changes(),
             variables: self.ctx.get_all_variables(),
         };
@@ -213,7 +323,14 @@ pub(crate) struct PlanCacheContext {
 
 impl PlanCacheContext {
     fn matches_metadata_tables(&self, tables: &[TableEntry]) -> bool {
-        self.table_snapshots.iter().all(|snapshot| {
+        Self::matches_snapshots_with_metadata_tables(&self.table_snapshots, tables)
+    }
+
+    fn matches_snapshots_with_metadata_tables(
+        table_snapshots: &[TableSnapshot],
+        tables: &[TableEntry],
+    ) -> bool {
+        table_snapshots.iter().all(|snapshot| {
             tables
                 .iter()
                 .any(|table| snapshot.matches_table_entry(table))
@@ -223,22 +340,38 @@ impl PlanCacheContext {
 
 #[derive(Clone)]
 struct TableSnapshot {
+    catalog_name: String,
+    database_name: String,
+    table_name: String,
+    table_id: MetaId,
+    table_seq: u64,
     schema: TableSchemaRef,
     snapshot_location: String,
     security_policy: SecurityPolicySnapshot,
 }
 
 impl TableSnapshot {
-    fn from_resolved_table(table: &dyn Table) -> Option<Self> {
+    fn from_resolved_table(
+        table: &dyn Table,
+        catalog_name: String,
+        database_name: String,
+        table_name: String,
+    ) -> Option<Self> {
         if table.is_temp() || table.is_stage_table() || table.is_stream() {
             return None;
         }
 
+        let table_info = table.get_table_info();
         let snapshot_location = table.options().get(OPT_KEY_SNAPSHOT_LOCATION)?.clone();
         Some(Self {
+            catalog_name,
+            database_name,
+            table_name,
+            table_id: table_info.ident.table_id,
+            table_seq: table_info.ident.seq,
             schema: table.schema(),
             snapshot_location,
-            security_policy: SecurityPolicySnapshot::from(&table.get_table_info().meta),
+            security_policy: SecurityPolicySnapshot::from(&table_info.meta),
         })
     }
 
@@ -252,12 +385,26 @@ impl TableSnapshot {
     }
 
     fn matches_table(&self, table: &dyn Table) -> bool {
-        if table.is_temp() || table.schema().ne(&self.schema) {
+        let table_info = table.get_table_info();
+        if table.is_temp()
+            || table_info.catalog() != self.catalog_name
+            || table_info.database_name().ok() != Some(self.database_name.as_str())
+            || table_info.name != self.table_name
+            || table_info.ident.table_id != self.table_id
+            || table_info.ident.seq != self.table_seq
+            || table.schema().ne(&self.schema)
+        {
             return false;
         }
 
-        table.options().get(OPT_KEY_SNAPSHOT_LOCATION) == Some(&self.snapshot_location)
-            && SecurityPolicySnapshot::from(&table.get_table_info().meta) == self.security_policy
+        self.matches_table_meta(table_info.ident.seq, &table_info.meta)
+    }
+
+    fn matches_table_meta(&self, table_seq: u64, meta: &TableMeta) -> bool {
+        table_seq == self.table_seq
+            && meta.schema.eq(&self.schema)
+            && meta.options.get(OPT_KEY_SNAPSHOT_LOCATION) == Some(&self.snapshot_location)
+            && SecurityPolicySnapshot::from(meta) == self.security_policy
     }
 }
 
@@ -345,7 +492,12 @@ impl TableRefVisitor {
                     )
                     .await
                 {
-                    if let Some(snapshot) = TableSnapshot::from_resolved_table(table.as_ref()) {
+                    if let Some(snapshot) = TableSnapshot::from_resolved_table(
+                        table.as_ref(),
+                        catalog_name,
+                        database_name,
+                        table_name,
+                    ) {
                         self.has_security_policy |= snapshot.has_security_policy();
                         self.table_snapshots.push(snapshot);
                         return;

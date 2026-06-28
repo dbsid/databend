@@ -452,13 +452,28 @@ impl PhysicalPlanBuilder {
             }
         }
 
-        if !name_mapping.contains_key(ROW_ID_COL_NAME) {
-            let metadata = self.metadata.read();
-            if metadata
-                .get_table_lazy_columns(&scan.table_index)
-                .is_some_and(|columns| !columns.is_empty())
-                && let Some(index) = metadata.row_id_index_by_table_index(scan.table_index)
+        if !name_mapping.contains_key(ROW_ID_COL_NAME)
+            && let Some(index) = metadata.row_id_index_by_table_index(scan.table_index)
+        {
+            let ordered_user_filters = if let Some(predicates) = scan
+                .push_down_predicates
+                .as_ref()
+                .filter(|preds| !preds.is_empty())
             {
+                let predicates = predicates.iter().collect::<Vec<_>>();
+                self.create_scan_push_down_filters(&metadata, &predicates)?
+                    .0
+            } else {
+                None
+            };
+            let table_schema = metadata
+                .table(scan.table_index)
+                .table()
+                .schema_with_stream();
+            let scan_uses_ordered_index = self
+                .try_build_ordered_index_info(&scan, &table_schema, ordered_user_filters)?
+                .is_some();
+            if !scan_uses_ordered_index {
                 let internal_column = INTERNAL_COLUMN_FACTORY
                     .get_internal_column(ROW_ID_COL_NAME)
                     .unwrap();

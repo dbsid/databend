@@ -13,11 +13,14 @@ CREATE TABLE t_include (
     wallet_address VARCHAR,
     last_active_time BIGINT,
     balance DECIMAL(10, 2),
-    tag_black_hole TINYINT,
-    ORDERED INDEX idx_wallet_recent (platform_id, wallet_address, last_active_time DESC)
-        INCLUDE (balance, tag_black_hole)
-        WITH (compression = 'zstd')
+    tag_black_hole TINYINT
 ) ENGINE = FUSE
+
+statement ok
+CREATE ORDERED INDEX idx_wallet_recent
+ON t_include(platform_id, wallet_address, last_active_time DESC)
+INCLUDE (balance, tag_black_hole)
+WITH (compression = 'zstd')
 
 query TT
 SHOW CREATE TABLE t_include
@@ -128,9 +131,17 @@ WHERE platform_id = 14 AND wallet_address = 'wallet-a' AND tag_whale > 0
 ORDER BY last_active_time DESC
 LIMIT 1
 ----
-Sort(PresortedMerge)
+TableScan
+<slt:ignore>table: default.test_ordered_index.t_plan_order_choice
+<slt:ignore>scan id: 0
+<slt:ignore>output columns: [platform_id (#0), wallet_address (#1), last_active_time (#2), balance (#3), tag_whale (#4), payload (#5)]
+<slt:ignore>read rows: 0
+<slt:ignore>read size: 0
+<slt:ignore>partitions total: 0
+<slt:ignore>partitions scanned: 0
 <slt:ignore>push downs: [filters: [t_plan_order_choice.platform_id (#0) = 14 and t_plan_order_choice.tag_whale (#4) > 0 and t_plan_order_choice.wallet_address (#1) = 'wallet-a'], limit: 1]
 <slt:ignore>ordered index: [idx_plan_ordered_all@<slt:ignore>]
+<slt:ignore>estimated rows: 0.00
 
 statement ok
 CREATE TABLE t_plan_filter_only (

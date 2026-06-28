@@ -460,10 +460,27 @@ impl PhysicalPlanBuilder {
 
         let Some(after_exchange) = sort.after_exchange else {
             let mut input_plan = self.build(s_expr.unary_child(), required).await?;
-            if sort.limit.is_some()
-                && (self.prove_ordered_index_ordering(&mut input_plan, &order_by)
-                    || self.prove_cluster_key_ordering(&mut input_plan, &order_by))
+            if let Some(limit) = sort.limit
+                && self.prove_ordered_index_ordering(&mut input_plan, &order_by)
             {
+                let limit = if ordered_index_scan_limit(&input_plan) == Some(limit) {
+                    None
+                } else {
+                    sort.limit
+                };
+                return Ok(PhysicalPlan::new(Sort {
+                    input: input_plan,
+                    order_by,
+                    limit,
+                    step: SortStep::PresortedMerge,
+                    pre_projection,
+                    broadcast_id: None,
+                    enable_fixed_rows,
+                    stat_info: Some(stat_info),
+                    meta: PhysicalPlanMeta::new("Sort"),
+                }));
+            }
+            if sort.limit.is_some() && self.prove_cluster_key_ordering(&mut input_plan, &order_by) {
                 return Ok(PhysicalPlan::new(Sort {
                     input: input_plan,
                     order_by,
@@ -582,9 +599,15 @@ impl PhysicalPlanBuilder {
         }
 
         let order_by = sort.order_by.clone();
-        if self.prove_ordered_index_ordering(&mut sort.input, &order_by)
-            || self.prove_cluster_key_ordering(&mut sort.input, &order_by)
-        {
+        if self.prove_ordered_index_ordering(&mut sort.input, &order_by) {
+            let limit = sort.limit.map_or(limit, |v| cmp::max(v, limit));
+            sort.limit = if ordered_index_scan_limit(&sort.input) == Some(limit) {
+                None
+            } else {
+                Some(limit)
+            };
+            sort.step = SortStep::PresortedMerge;
+        } else if self.prove_cluster_key_ordering(&mut sort.input, &order_by) {
             sort.limit = Some(sort.limit.map_or(limit, |v| cmp::max(v, limit)));
             sort.step = SortStep::PresortedMerge;
         }
@@ -818,6 +841,25 @@ fn compare_cluster_values(
     left.iter()
         .map(databend_common_expression::Scalar::as_ref)
         .cmp(right.iter().map(databend_common_expression::Scalar::as_ref))
+}
+
+impl Sort {
+    pub(super) fn redundant_ordered_index_limit(&self, limit: usize) -> bool {
+        self.step == SortStep::PresortedMerge
+            && self.limit.is_none()
+            && self.pre_projection.is_none()
+            && ordered_index_scan_limit(&self.input) == Some(limit)
+    }
+}
+
+fn ordered_index_scan_limit(plan: &PhysicalPlan) -> Option<usize> {
+    ordered_table_scan(plan)?
+        .source
+        .push_downs
+        .as_ref()?
+        .ordered_index
+        .as_ref()?
+        .limit
 }
 
 fn ordered_table_scan(plan: &PhysicalPlan) -> Option<&TableScan> {

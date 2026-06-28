@@ -80,6 +80,7 @@ use databend_storages_common_table_meta::meta::column_oriented_segment::stat_nam
 use databend_storages_common_table_meta::table::ChangeType;
 use databend_storages_common_table_meta::table::ClusterType;
 use itertools::Itertools;
+use log::debug;
 use log::info;
 use opendal::Operator;
 use sha2::Digest;
@@ -252,7 +253,7 @@ impl FuseTable {
 
         let read_info = self.read_snapshot_info(&ctx).await?;
 
-        info!(
+        debug!(
             "Reading partitions for table {}, push downs: {:?}, snapshot: {:?}",
             self.name(),
             push_downs,

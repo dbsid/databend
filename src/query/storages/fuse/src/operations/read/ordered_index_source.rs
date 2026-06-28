@@ -77,6 +77,7 @@ use crate::io::load_ordered_index_meta;
 const ORDERED_INDEX_DATA_BLOCK_READ_BATCH_SIZE: usize = 32;
 const ORDERED_DECODED_PAYLOAD_ROW_CACHE_ITEMS: usize = 65536;
 const ORDERED_DECODED_EQUALITY_PREFIX_BLOOM_CACHE_ITEMS: usize = 8192;
+const ORDERED_RESOLVED_INDEX_LOCATION_CACHE_ITEMS: usize = 65536;
 
 static ORDERED_DECODED_PAYLOAD_ROW_CACHE: LazyLock<
     InMemoryLruCache<OrderedIndexDecodedPayloadRow>,
@@ -96,6 +97,15 @@ static ORDERED_DECODED_EQUALITY_PREFIX_BLOOM_CACHE: LazyLock<
     )
 });
 
+static ORDERED_RESOLVED_INDEX_LOCATION_CACHE: LazyLock<
+    InMemoryLruCache<OrderedIndexResolvedLocation>,
+> = LazyLock::new(|| {
+    InMemoryLruCache::with_items_capacity(
+        "ordered_index_resolved_location".to_string(),
+        ORDERED_RESOLVED_INDEX_LOCATION_CACHE_ITEMS,
+    )
+});
+
 #[derive(Clone)]
 struct OrderedIndexDecodedPayloadRow {
     row: Vec<Scalar>,
@@ -105,6 +115,18 @@ impl From<OrderedIndexDecodedPayloadRow> for CacheValue<OrderedIndexDecodedPaylo
     fn from(value: OrderedIndexDecodedPayloadRow) -> Self {
         let mem_bytes = std::mem::size_of::<OrderedIndexDecodedPayloadRow>()
             + scalar_rows_mem_bytes(&value.row);
+        CacheValue::new(value, mem_bytes)
+    }
+}
+
+#[derive(Clone)]
+struct OrderedIndexResolvedLocation {
+    location: String,
+}
+
+impl From<OrderedIndexResolvedLocation> for CacheValue<OrderedIndexResolvedLocation> {
+    fn from(value: OrderedIndexResolvedLocation) -> Self {
+        let mem_bytes = std::mem::size_of::<OrderedIndexResolvedLocation>() + value.location.len();
         CacheValue::new(value, mem_bytes)
     }
 }
@@ -188,6 +210,7 @@ struct OrderedIndexSource {
     ordered_index: OrderedIndexInfo,
     worker_id: usize,
     is_finished: bool,
+    location_preference: OrderedIndexLocationPreference,
 }
 
 impl OrderedIndexSource {
@@ -214,6 +237,7 @@ impl OrderedIndexSource {
             ordered_index,
             worker_id,
             is_finished: false,
+            location_preference: OrderedIndexLocationPreference::Unknown,
         })
     }
 }
@@ -285,6 +309,13 @@ struct OrderedIndexCandidateBlock {
     index_location: String,
     meta: Arc<OrderedIndexFileMeta>,
     block_meta: OrderedIndexDataBlockMeta,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrderedIndexLocationPreference {
+    Unknown,
+    CurrentFirst,
+    LegacyFirst,
 }
 
 struct OrderedIndexFilter {
@@ -555,7 +586,7 @@ impl OrderedIndexSource {
     }
 
     async fn load_candidate_blocks(
-        &self,
+        &mut self,
         parts: Vec<PartInfoPtr>,
         prefix: &[u8],
         filter: Option<&OrderedIndexFilter>,
@@ -565,20 +596,48 @@ impl OrderedIndexSource {
             .map(|filter| filter.key_predicates.clone())
             .unwrap_or_default();
         let prefix_component_count = self.ordered_index.equality_prefix.len();
-        let futures = parts.into_iter().map(|part| {
+        let mut candidates = Vec::new();
+        let mut parts = parts.into_iter();
+        if self.location_preference == OrderedIndexLocationPreference::Unknown
+            && let Some(part) = parts.next()
+        {
+            let (mut part_candidates, preference) = Self::load_candidate_blocks_for_part(
+                self.operator.clone(),
+                part,
+                self.ordered_index.index_name.clone(),
+                self.ordered_index.index_version.clone(),
+                self.ordered_index.use_block_ordered_index_size_hint,
+                self.location_preference,
+                prefix.to_vec(),
+                prefix_component_count,
+                key_predicates.clone(),
+            )
+            .await?;
+            if self.location_preference != preference {
+                self.location_preference = preference;
+            }
+            candidates.append(&mut part_candidates);
+        }
+        let futures = parts.map(|part| {
             Self::load_candidate_blocks_for_part(
                 self.operator.clone(),
                 part,
                 self.ordered_index.index_name.clone(),
                 self.ordered_index.index_version.clone(),
                 self.ordered_index.use_block_ordered_index_size_hint,
+                self.location_preference,
                 prefix.to_vec(),
                 prefix_component_count,
                 key_predicates.clone(),
             )
         });
         let candidate_batches = future::try_join_all(futures).await?;
-        let candidates = candidate_batches.into_iter().flatten().collect::<Vec<_>>();
+        for (mut part_candidates, preference) in candidate_batches {
+            if self.location_preference != preference {
+                self.location_preference = preference;
+            }
+            candidates.append(&mut part_candidates);
+        }
         Profile::record_usize_profile(
             ProfileStatisticsName::OrderedIndexCandidateBlocks,
             candidates.len(),
@@ -592,10 +651,14 @@ impl OrderedIndexSource {
         index_name: String,
         index_version: String,
         use_block_ordered_index_size_hint: bool,
+        location_preference: OrderedIndexLocationPreference,
         prefix: Vec<u8>,
         prefix_component_count: usize,
         key_predicates: Vec<OrderedIndexKeyPredicate>,
-    ) -> Result<Vec<OrderedIndexCandidateBlock>> {
+    ) -> Result<(
+        Vec<OrderedIndexCandidateBlock>,
+        OrderedIndexLocationPreference,
+    )> {
         let fuse_part = FuseBlockPartInfo::from_part(&part)?;
         let index_location =
             TableMetaLocationGenerator::gen_ordered_index_location_from_block_location(
@@ -606,11 +669,29 @@ impl OrderedIndexSource {
         let len_hint = use_block_ordered_index_size_hint
             .then_some(fuse_part.ordered_index_size)
             .flatten();
-        let meta = load_ordered_index_meta(operator, &index_location, len_hint).await?;
+        let legacy_location =
+            TableMetaLocationGenerator::gen_legacy_ordered_index_location_from_block_location(
+                &fuse_part.location,
+                &index_name,
+                &index_version,
+            );
+        let (index_location, meta) = load_ordered_index_meta_with_legacy_fallback(
+            operator.clone(),
+            &index_location,
+            &legacy_location,
+            len_hint,
+            location_preference,
+        )
+        .await?;
+        let preference = if index_location == legacy_location {
+            OrderedIndexLocationPreference::LegacyFirst
+        } else {
+            OrderedIndexLocationPreference::CurrentFirst
+        };
         if !may_contain_equality_prefix_cached(&index_location, &meta, &prefix) {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), preference));
         }
-        Ok(meta
+        let candidates = meta
             .blocks_for_prefix(&prefix)
             .into_iter()
             .filter(|block_meta| {
@@ -626,7 +707,8 @@ impl OrderedIndexSource {
                 meta: meta.clone(),
                 block_meta,
             })
-            .collect())
+            .collect();
+        Ok((candidates, preference))
     }
 
     async fn read_candidate_rows(
@@ -811,6 +893,63 @@ impl OrderedIndexSource {
         );
         Profile::record_usize_profile(ProfileStatisticsName::OrderedIndexRowsMatched, rows.len());
         Ok(rows)
+    }
+}
+
+async fn load_ordered_index_meta_with_legacy_fallback(
+    operator: Operator,
+    index_location: &str,
+    legacy_location: &str,
+    len_hint: Option<u64>,
+    preference: OrderedIndexLocationPreference,
+) -> Result<(String, Arc<OrderedIndexFileMeta>)> {
+    if let Some(resolved) = ORDERED_RESOLVED_INDEX_LOCATION_CACHE.get(index_location) {
+        match load_ordered_index_meta(operator.clone(), &resolved.location, len_hint).await {
+            Ok(meta) => return Ok((resolved.location.clone(), meta)),
+            Err(err) if err.code() == ErrorCode::STORAGE_NOT_FOUND => {
+                ORDERED_RESOLVED_INDEX_LOCATION_CACHE.evict(index_location);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    if preference == OrderedIndexLocationPreference::LegacyFirst {
+        match load_ordered_index_meta(operator.clone(), legacy_location, len_hint).await {
+            Ok(meta) => {
+                ORDERED_RESOLVED_INDEX_LOCATION_CACHE.insert(
+                    index_location.to_string(),
+                    OrderedIndexResolvedLocation {
+                        location: legacy_location.to_string(),
+                    },
+                );
+                return Ok((legacy_location.to_string(), meta));
+            }
+            Err(err) if err.code() == ErrorCode::STORAGE_NOT_FOUND => {}
+            Err(err) => return Err(err),
+        }
+    }
+
+    match load_ordered_index_meta(operator.clone(), index_location, len_hint).await {
+        Ok(meta) => {
+            ORDERED_RESOLVED_INDEX_LOCATION_CACHE.insert(
+                index_location.to_string(),
+                OrderedIndexResolvedLocation {
+                    location: index_location.to_string(),
+                },
+            );
+            Ok((index_location.to_string(), meta))
+        }
+        Err(err) if err.code() == ErrorCode::STORAGE_NOT_FOUND => {
+            let meta = load_ordered_index_meta(operator, legacy_location, len_hint).await?;
+            ORDERED_RESOLVED_INDEX_LOCATION_CACHE.insert(
+                index_location.to_string(),
+                OrderedIndexResolvedLocation {
+                    location: legacy_location.to_string(),
+                },
+            );
+            Ok((legacy_location.to_string(), meta))
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -1791,6 +1930,7 @@ mod tests {
             },
             worker_id: 0,
             is_finished: false,
+            location_preference: OrderedIndexLocationPreference::Unknown,
         };
         let rows = vec![
             OrderedIndexRow {
@@ -1901,6 +2041,7 @@ mod tests {
             },
             worker_id: 0,
             is_finished: false,
+            location_preference: OrderedIndexLocationPreference::Unknown,
         };
         let rows = vec![
             OrderedIndexRow {
@@ -2582,6 +2723,220 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ordered_index_location_cache_skips_repeated_legacy_probe() -> Result<()> {
+        crate::test_utils::init_test_globals()?;
+        let operator = Operator::new(opendal::services::Memory::default())
+            .unwrap()
+            .finish();
+        let block_location = "test/_b/0123456789abcdef0123456789abcdef_v4.parquet";
+        let index_name = "idx_location_cache";
+        let index_version = "1234567890abcdef";
+        let index_location =
+            TableMetaLocationGenerator::gen_ordered_index_location_from_block_location(
+                block_location,
+                index_name,
+                index_version,
+            );
+        let legacy_location =
+            TableMetaLocationGenerator::gen_legacy_ordered_index_location_from_block_location(
+                block_location,
+                index_name,
+                index_version,
+            );
+
+        let meta = OrderedIndexMeta {
+            columns: vec![],
+            metadata: Default::default(),
+        };
+        let mut writer = OrderedIndexWriter::new(meta, "schema", "wallet ASC", "none");
+        writer.add_equality_prefix(bytes::Bytes::from_static(b"wallet-1|"));
+        operator
+            .write(&legacy_location, writer.finish()?.to_vec())
+            .await
+            .map_err(|err| {
+                ErrorCode::StorageOther(format!("write ordered index test file failed: {err:?}"))
+            })?;
+
+        let (resolved_location, _) = load_ordered_index_meta_with_legacy_fallback(
+            operator.clone(),
+            &index_location,
+            &legacy_location,
+            None,
+            OrderedIndexLocationPreference::Unknown,
+        )
+        .await?;
+        assert_eq!(resolved_location, legacy_location);
+
+        operator
+            .write(&index_location, b"not an ordered index".to_vec())
+            .await
+            .map_err(|err| {
+                ErrorCode::StorageOther(format!("write ordered index test file failed: {err:?}"))
+            })?;
+        let (resolved_location, _) = load_ordered_index_meta_with_legacy_fallback(
+            operator,
+            &index_location,
+            &legacy_location,
+            None,
+            OrderedIndexLocationPreference::LegacyFirst,
+        )
+        .await?;
+        assert_eq!(resolved_location, legacy_location);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_first_preference_skips_current_probe_for_batch() -> Result<()> {
+        crate::test_utils::init_test_globals()?;
+        let operator = Operator::new(opendal::services::Memory::default())
+            .unwrap()
+            .finish();
+        let index_name = "idx_batch_location_cache";
+        let index_version = "1234567890abcdef";
+        let block_locations = [
+            "test/_b/11111111111111111111111111111111_v4.parquet",
+            "test/_b/22222222222222222222222222222222_v4.parquet",
+        ];
+        for (idx, block_location) in block_locations.iter().enumerate() {
+            let legacy_location =
+                TableMetaLocationGenerator::gen_legacy_ordered_index_location_from_block_location(
+                    block_location,
+                    index_name,
+                    index_version,
+                );
+            let meta = OrderedIndexMeta {
+                columns: vec![],
+                metadata: Default::default(),
+            };
+            let mut writer = OrderedIndexWriter::new(meta, "schema", "wallet ASC", "none");
+            let key = encoded_test_key(&[(
+                Scalar::String("wallet-1".to_string()),
+                OrderedIndexKeyOrder::Asc,
+            )])?;
+            writer.add_equality_prefix(bytes::Bytes::from(ordered_equality_prefix(&key, 1)?));
+            writer.add_row(
+                bytes::Bytes::from(key),
+                bytes::Bytes::from(encode_ordered_payload(&[Scalar::String(format!(
+                    "row-{}",
+                    idx + 1
+                ))])?),
+            );
+            operator
+                .write(&legacy_location, writer.finish()?.to_vec())
+                .await
+                .map_err(|err| {
+                    ErrorCode::StorageOther(format!(
+                        "write ordered index test file failed: {err:?}"
+                    ))
+                })?;
+        }
+
+        let second_current_location =
+            TableMetaLocationGenerator::gen_ordered_index_location_from_block_location(
+                block_locations[1],
+                index_name,
+                index_version,
+            );
+        operator
+            .write(&second_current_location, b"not an ordered index".to_vec())
+            .await
+            .map_err(|err| {
+                ErrorCode::StorageOther(format!("write ordered index test file failed: {err:?}"))
+            })?;
+
+        let field = TableField::new_from_column_id("wallet_address", TableDataType::String, 0);
+        let mut source = test_source(operator, field, Some(10));
+        source.ordered_index.index_name = index_name.to_string();
+        source.ordered_index.index_version = index_version.to_string();
+        source.ordered_index.equality_prefix = vec![Scalar::String("wallet-1".to_string())];
+        let prefix = encode_prefix(&source.ordered_index)?;
+        let candidates = source
+            .load_candidate_blocks(
+                block_locations
+                    .iter()
+                    .map(|location| test_part(location))
+                    .collect(),
+                &prefix,
+                None,
+            )
+            .await?;
+
+        assert_eq!(
+            source.location_preference,
+            OrderedIndexLocationPreference::LegacyFirst
+        );
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.index_location.contains("/_i_bt/"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_legacy_first_preference_falls_back_to_current_for_mixed_batch() -> Result<()> {
+        crate::test_utils::init_test_globals()?;
+        let operator = Operator::new(opendal::services::Memory::default())
+            .unwrap()
+            .finish();
+        let index_name = "idx_mixed_location_cache";
+        let index_version = "1234567890abcdef";
+        let legacy_block_location = "test/_b/33333333333333333333333333333333_v4.parquet";
+        let current_block_location = "test/_b/44444444444444444444444444444444_v4.parquet";
+        let key = encoded_test_key(&[(
+            Scalar::String("wallet-1".to_string()),
+            OrderedIndexKeyOrder::Asc,
+        )])?;
+
+        let legacy_location =
+            TableMetaLocationGenerator::gen_legacy_ordered_index_location_from_block_location(
+                legacy_block_location,
+                index_name,
+                index_version,
+            );
+        write_ordered_test_file(operator.clone(), &legacy_location, &key, "legacy-row").await?;
+
+        let current_location =
+            TableMetaLocationGenerator::gen_ordered_index_location_from_block_location(
+                current_block_location,
+                index_name,
+                index_version,
+            );
+        write_ordered_test_file(operator.clone(), &current_location, &key, "current-row").await?;
+
+        let field = TableField::new_from_column_id("wallet_address", TableDataType::String, 0);
+        let mut source = test_source(operator, field, Some(10));
+        source.ordered_index.index_name = index_name.to_string();
+        source.ordered_index.index_version = index_version.to_string();
+        source.ordered_index.equality_prefix = vec![Scalar::String("wallet-1".to_string())];
+        let prefix = encode_prefix(&source.ordered_index)?;
+        let candidates = source
+            .load_candidate_blocks(
+                vec![
+                    test_part(legacy_block_location),
+                    test_part(current_block_location),
+                ],
+                &prefix,
+                None,
+            )
+            .await?;
+
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.index_location.contains("/_i_bt/"))
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.index_location.contains("/_i_o/"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_overlapped_candidate_rows_stop_after_topk_boundary() -> Result<()> {
         crate::test_utils::init_test_globals()?;
         let operator = Operator::new(opendal::services::Memory::default())
@@ -2768,6 +3123,33 @@ mod tests {
         }
     }
 
+    async fn write_ordered_test_file(
+        operator: Operator,
+        location: &str,
+        key: &[u8],
+        payload: &str,
+    ) -> Result<()> {
+        let meta = OrderedIndexMeta {
+            columns: vec![],
+            metadata: Default::default(),
+        };
+        let mut writer = OrderedIndexWriter::new(meta, "schema", "wallet ASC", "none");
+        writer.add_equality_prefix(bytes::Bytes::from(ordered_equality_prefix(key, 1)?));
+        writer.add_row(
+            bytes::Bytes::from(key.to_vec()),
+            bytes::Bytes::from(encode_ordered_payload(&[Scalar::String(
+                payload.to_string(),
+            )])?),
+        );
+        operator
+            .write(location, writer.finish()?.to_vec())
+            .await
+            .map_err(|err| {
+                ErrorCode::StorageOther(format!("write ordered index test file failed: {err:?}"))
+            })?;
+        Ok(())
+    }
+
     fn test_source(
         operator: Operator,
         field: TableField,
@@ -2799,7 +3181,28 @@ mod tests {
             },
             worker_id: 0,
             is_finished: false,
+            location_preference: OrderedIndexLocationPreference::Unknown,
         }
+    }
+
+    fn test_part(block_location: &str) -> PartInfoPtr {
+        FuseBlockPartInfo::create(
+            block_location.to_string(),
+            None,
+            0,
+            None,
+            0,
+            None,
+            1,
+            Default::default(),
+            None,
+            None,
+            databend_storages_common_table_meta::meta::Compression::None,
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     fn encoded_test_key(values: &[(Scalar, OrderedIndexKeyOrder)]) -> Result<Vec<u8>> {

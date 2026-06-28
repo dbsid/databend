@@ -38,6 +38,7 @@ use databend_common_catalog::table_context::TableContext;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use derive_visitor::DriveMut;
+use log::debug;
 use log::info;
 use log::warn;
 use parking_lot::RwLock;
@@ -250,12 +251,22 @@ impl Planner {
         // Step 3: Bind AST with catalog, and generate a pure logical SExpr
         let name_resolution_ctx = NameResolutionContext::try_from(settings.as_ref())?;
 
+        if let Some(plan) = self.get_cache_for_stmt(stmt).await? {
+            debug!(
+                "Logical plan retrieved from cache, elapsed: {:?}",
+                start.elapsed()
+            );
+            // update for clickhouse handler
+            self.ctx.attach_query_str(query_kind, stmt.to_mask_sql());
+            return Ok(plan.plan);
+        }
+
         let plan_cache_context =
             self.build_plan_cache_context(name_resolution_ctx.clone(), stmt)?;
 
         if let Some(cache_ctx) = &plan_cache_context {
             if let Some(plan) = self.get_cache(cache_ctx) {
-                info!(
+                debug!(
                     "Logical plan retrieved from cache, elapsed: {:?}",
                     start.elapsed()
                 );

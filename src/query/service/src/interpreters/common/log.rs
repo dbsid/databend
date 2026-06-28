@@ -19,6 +19,7 @@ use std::time::SystemTime;
 use databend_common_base::runtime::profile::ProfileDesc;
 use databend_common_base::runtime::profile::ProfileStatisticsName;
 use databend_common_base::runtime::profile::get_statistics_desc;
+use databend_common_config::GlobalConfig;
 use databend_common_exception::ErrorCode;
 use databend_common_pipeline::core::PlanProfile;
 use log::error;
@@ -73,30 +74,39 @@ pub fn log_query_finished(ctx: &QueryContext, error: Option<ErrorCode>) {
     info!(memory:? = ctx.get_node_peek_memory_usage(); "total memory usage");
 
     // databend::log::profile
-    let query_profiles = ctx.get_query_profiles();
-    let has_profiles = !query_profiles.is_empty();
+    let profile_log_enabled = GlobalConfig::try_get_instance()
+        .map(|conf| conf.log.profile.on)
+        .unwrap_or(false);
+    let has_profiles = if profile_log_enabled {
+        let query_profiles = ctx.get_query_profiles();
+        let has_profiles = !query_profiles.is_empty();
 
-    if has_profiles {
-        #[derive(serde::Serialize)]
-        struct QueryProfiles {
-            query_id: String,
-            profiles: Vec<PlanProfile>,
-            statistics_desc: Arc<BTreeMap<ProfileStatisticsName, ProfileDesc>>,
+        if has_profiles {
+            #[derive(serde::Serialize)]
+            struct QueryProfiles {
+                query_id: String,
+                profiles: Vec<PlanProfile>,
+                statistics_desc: Arc<BTreeMap<ProfileStatisticsName, ProfileDesc>>,
+            }
+
+            match serde_json::to_string(&QueryProfiles {
+                query_id: ctx.get_id(),
+                profiles: query_profiles,
+                statistics_desc: get_statistics_desc(),
+            }) {
+                Ok(profile_json) => {
+                    info!(target: "databend::log::profile", "{}", profile_json);
+                }
+                Err(err) => {
+                    error!("Failed to serialize query profiles: {:?}", err);
+                }
+            }
         }
 
-        match serde_json::to_string(&QueryProfiles {
-            query_id: ctx.get_id(),
-            profiles: query_profiles.clone(),
-            statistics_desc: get_statistics_desc(),
-        }) {
-            Ok(profile_json) => {
-                info!(target: "databend::log::profile", "{}", profile_json);
-            }
-            Err(err) => {
-                error!("Failed to serialize query profiles: {:?}", err);
-            }
-        }
-    }
+        has_profiles
+    } else {
+        false
+    };
 
     // databend::log::query
     if let Err(error) = InterpreterQueryLog::log_finish(ctx, now, error, has_profiles) {

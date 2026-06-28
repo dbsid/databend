@@ -102,6 +102,7 @@ async fn gen_recluster_segments(
                 None,
                 None,
                 None,
+                None,
                 meta::Compression::Lz4Raw,
                 Some(Utc::now()),
             )));
@@ -161,6 +162,7 @@ async fn gen_recluster_segments_by_level(
                 None,
                 None,
                 None,
+                None,
                 meta::Compression::Lz4Raw,
                 Some(Utc::now()),
             ));
@@ -208,6 +210,7 @@ async fn gen_recluster_segments_by_ranges(
                 location,
                 None,
                 0,
+                None,
                 None,
                 None,
                 None,

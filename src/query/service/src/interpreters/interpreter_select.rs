@@ -43,6 +43,7 @@ use databend_common_storages_basic::ResultCacheReader;
 use databend_common_storages_basic::WriteResultCacheSink;
 use databend_common_storages_basic::gen_result_cache_key;
 use databend_common_users::UserApiProvider;
+use log::debug;
 use log::error;
 use log::info;
 
@@ -301,14 +302,15 @@ impl Interpreter for SelectInterpreter {
         // 0. Need to build physical plan first to get the partitions.
         let physical_plan = self.build_physical_plan().await?;
 
-        let query_plan = {
-            let metadata = self.metadata.read();
-            physical_plan
-                .format(&metadata, Default::default())?
-                .format_pretty()?
-        };
-
-        info!("Query physical plan:\n{}", query_plan);
+        if log::log_enabled!(log::Level::Debug) {
+            let query_plan = {
+                let metadata = self.metadata.read();
+                physical_plan
+                    .format(&metadata, Default::default())?
+                    .format_pretty()?
+            };
+            debug!("Query physical plan:\n{}", query_plan);
+        }
 
         if self.ctx.get_settings().get_enable_query_result_cache()?
             && self.ctx.result_cache_state().cacheable()
